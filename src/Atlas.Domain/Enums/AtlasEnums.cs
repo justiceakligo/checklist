@@ -134,3 +134,35 @@ public enum AdminSettingScope : short
     System = 1,
     Organization = 2
 }
+
+public enum PlatformStaffRole : short
+{
+    Owner = 1,
+    Admin = 2,
+    Support = 3,
+    Finance = 4
+}
+
+public enum PlatformStaffStatus : short
+{
+    Active = 1,
+    Disabled = 2
+}
+
+public enum OrganizationInterestStatus : short
+{
+    New = 1,
+    Qualified = 2,
+    Approved = 3,
+    Rejected = 4,
+    Archived = 5
+}
+
+public enum PlatformRevenueEventType : short
+{
+    Subscription = 1,
+    Usage = 2,
+    Credit = 3,
+    Refund = 4,
+    Adjustment = 5
+}

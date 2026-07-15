@@ -6,7 +6,7 @@ alerts:
 services:
   - name: api
     github:
-      repo: your-org/atlas-checklist
+      repo: justiceakligo/checklist
       branch: main
       deploy_on_push: true
     dockerfile_path: Dockerfile
@@ -58,6 +58,10 @@ services:
         scope: RUN_TIME
         type: SECRET
         value: ${ATLAS_HASH_PEPPER}
+      - key: PlatformAdmin__BootstrapKey
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_PLATFORM_BOOTSTRAP_KEY}
       - key: RESEND_API_KEY
         scope: RUN_TIME
         type: SECRET

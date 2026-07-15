@@ -1,4 +1,5 @@
 using Atlas.Application.Abstractions;
+using Atlas.Api.Endpoints;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -96,6 +97,11 @@ public static class TenantContextMiddleware
         RequestDelegate next)
     {
         if (context.User.Identity?.IsAuthenticated != true)
+        {
+            return false;
+        }
+
+        if (context.User.FindFirstValue(PlatformEndpoints.ActorKindClaim) == "platform")
         {
             return false;
         }

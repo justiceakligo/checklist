@@ -91,5 +91,6 @@ app.MapAtlasEndpoints();
 app.MapAtlasSecurityEndpoints();
 app.MapAtlasRecipientEndpoints();
 app.MapAtlasSubmissionEndpoints();
+app.MapAtlasPlatformEndpoints();
 
 app.Run();

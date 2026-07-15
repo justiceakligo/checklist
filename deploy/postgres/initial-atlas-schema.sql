@@ -1119,3 +1119,181 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE TABLE platform_staff (
+        id uuid NOT NULL,
+        email citext NOT NULL,
+        password_hash character varying(500),
+        full_name character varying(160) NOT NULL,
+        role smallint NOT NULL,
+        status smallint NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL,
+        last_login_at timestamptz,
+        disabled_at timestamptz,
+        CONSTRAINT pk_platform_staff PRIMARY KEY (id)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE TABLE platform_audit_events (
+        id uuid NOT NULL,
+        staff_id uuid,
+        event_type character varying(120) NOT NULL,
+        event_data jsonb NOT NULL,
+        ip_address inet,
+        user_agent text,
+        correlation_id uuid,
+        created_at timestamptz NOT NULL,
+        CONSTRAINT pk_platform_audit_events PRIMARY KEY (id),
+        CONSTRAINT fk_platform_audit_events_platform_staff_staff_id FOREIGN KEY (staff_id) REFERENCES platform_staff (id) ON DELETE SET NULL
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE TABLE platform_organization_interests (
+        id uuid NOT NULL,
+        organization_name character varying(200) NOT NULL,
+        contact_name character varying(160) NOT NULL,
+        contact_email citext NOT NULL,
+        contact_phone character varying(40),
+        source character varying(80),
+        region character varying(80),
+        expected_volume character varying(120),
+        message character varying(4000),
+        status smallint NOT NULL,
+        assigned_staff_id uuid,
+        approved_organization_id uuid,
+        notes character varying(4000),
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL,
+        approved_at timestamptz,
+        rejected_at timestamptz,
+        CONSTRAINT pk_platform_organization_interests PRIMARY KEY (id),
+        CONSTRAINT fk_platform_organization_interests_organizations_approved_orga FOREIGN KEY (approved_organization_id) REFERENCES organizations (id) ON DELETE SET NULL,
+        CONSTRAINT fk_platform_organization_interests_platform_staff_assigned_sta FOREIGN KEY (assigned_staff_id) REFERENCES platform_staff (id) ON DELETE SET NULL
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE TABLE platform_revenue_events (
+        id uuid NOT NULL,
+        organization_id uuid,
+        type smallint NOT NULL,
+        amount numeric(18,2) NOT NULL,
+        currency character varying(3) NOT NULL,
+        source character varying(80) NOT NULL,
+        external_reference character varying(200),
+        occurred_at timestamptz NOT NULL,
+        period_start timestamptz,
+        period_end timestamptz,
+        metadata_json jsonb NOT NULL,
+        recorded_by_staff_id uuid,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL,
+        CONSTRAINT pk_platform_revenue_events PRIMARY KEY (id),
+        CONSTRAINT fk_platform_revenue_events_organizations_organization_id FOREIGN KEY (organization_id) REFERENCES organizations (id) ON DELETE SET NULL,
+        CONSTRAINT fk_platform_revenue_events_platform_staff_recorded_by_staff_id FOREIGN KEY (recorded_by_staff_id) REFERENCES platform_staff (id) ON DELETE SET NULL
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_audit_created ON platform_audit_events (created_at);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_audit_staff_created ON platform_audit_events (staff_id, created_at);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_interests_contact_email ON platform_organization_interests (contact_email);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_interests_status_created ON platform_organization_interests (status, created_at);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_organization_interests_approved_organization_id ON platform_organization_interests (approved_organization_id);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_organization_interests_assigned_staff_id ON platform_organization_interests (assigned_staff_id);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_revenue_events_recorded_by_staff_id ON platform_revenue_events (recorded_by_staff_id);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_revenue_external_reference ON platform_revenue_events (external_reference);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_revenue_occurred ON platform_revenue_events (occurred_at);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE INDEX ix_platform_revenue_org_occurred ON platform_revenue_events (organization_id, occurred_at);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    CREATE UNIQUE INDEX uq_platform_staff_email ON platform_staff (email);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715182840_PlatformAdministration') THEN
+    INSERT INTO "__EFMigrationsHistory" (migration_id, product_version)
+    VALUES ('20260715182840_PlatformAdministration', '10.0.4');
+    END IF;
+END $EF$;
+COMMIT;
+

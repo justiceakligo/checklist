@@ -196,6 +196,68 @@ public sealed class AtlasDbContextTests
         }
     }
 
+    [Fact]
+    public async Task Platform_administration_records_are_not_tenant_filtered()
+    {
+        var staffId = Guid.NewGuid();
+        var tenant = new TestTenantContext { OrganizationId = Guid.NewGuid() };
+        var databaseRoot = new InMemoryDatabaseRoot();
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            dbContext.PlatformStaff.Add(new PlatformStaff
+            {
+                Id = staffId,
+                Email = "platform@example.com",
+                FullName = "Platform Owner",
+                Role = PlatformStaffRole.Owner,
+                Status = PlatformStaffStatus.Active
+            });
+            dbContext.PlatformOrganizationInterests.Add(new PlatformOrganizationInterest
+            {
+                OrganizationName = "Interested Org",
+                ContactName = "Jamie",
+                ContactEmail = "jamie@example.com",
+                Status = OrganizationInterestStatus.New,
+                AssignedStaffId = staffId
+            });
+            dbContext.PlatformRevenueEvents.Add(new PlatformRevenueEvent
+            {
+                Type = PlatformRevenueEventType.Subscription,
+                Amount = 99,
+                Currency = "USD",
+                Source = "manual",
+                OccurredAt = DateTimeOffset.UtcNow,
+                MetadataJson = "{}",
+                RecordedByStaffId = staffId
+            });
+            dbContext.PlatformAuditEvents.Add(new PlatformAuditEvent
+            {
+                StaffId = staffId,
+                EventType = "platform.test",
+                EventData = "{}"
+            });
+            await dbContext.SaveChangesAsync();
+        }
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            Assert.Single(await dbContext.PlatformStaff.ToListAsync());
+            Assert.Single(await dbContext.PlatformOrganizationInterests.ToListAsync());
+            Assert.Single(await dbContext.PlatformRevenueEvents.ToListAsync());
+            Assert.Single(await dbContext.PlatformAuditEvents.ToListAsync());
+        }
+
+        tenant.OrganizationId = null;
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            Assert.Single(await dbContext.PlatformStaff.ToListAsync());
+            Assert.Single(await dbContext.PlatformOrganizationInterests.ToListAsync());
+            Assert.Single(await dbContext.PlatformRevenueEvents.ToListAsync());
+            Assert.Single(await dbContext.PlatformAuditEvents.ToListAsync());
+        }
+    }
+
     private static AtlasDbContext CreateContext(TestTenantContext tenantContext, InMemoryDatabaseRoot databaseRoot)
     {
         var options = new DbContextOptionsBuilder<AtlasDbContext>()

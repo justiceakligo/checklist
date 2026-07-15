@@ -34,6 +34,10 @@ public sealed class AtlasDbContext(
     public DbSet<UsageEvent> UsageEvents => Set<UsageEvent>();
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
     public DbSet<AdminSetting> AdminSettings => Set<AdminSetting>();
+    public DbSet<PlatformStaff> PlatformStaff => Set<PlatformStaff>();
+    public DbSet<PlatformOrganizationInterest> PlatformOrganizationInterests => Set<PlatformOrganizationInterest>();
+    public DbSet<PlatformRevenueEvent> PlatformRevenueEvents => Set<PlatformRevenueEvent>();
+    public DbSet<PlatformAuditEvent> PlatformAuditEvents => Set<PlatformAuditEvent>();
 
     private Guid? CurrentOrganizationId => tenantContext.OrganizationId;
 
@@ -49,6 +53,7 @@ public sealed class AtlasDbContext(
         ConfigureFilesAndNotifications(modelBuilder);
         ConfigureDeveloperAndAudit(modelBuilder);
         ConfigureAdminSettings(modelBuilder);
+        ConfigurePlatform(modelBuilder);
         ConfigureQueryFilters(modelBuilder);
         ConfigureIds(modelBuilder);
     }
@@ -707,6 +712,95 @@ public sealed class AtlasDbContext(
         });
     }
 
+    private static void ConfigurePlatform(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<PlatformStaff>(entity =>
+        {
+            entity.ToTable("platform_staff");
+            entity.HasIndex(e => e.Email).IsUnique().HasDatabaseName("uq_platform_staff_email");
+            entity.Property(e => e.Email).HasColumnType("citext").IsRequired();
+            entity.Property(e => e.PasswordHash).HasMaxLength(500);
+            entity.Property(e => e.FullName).HasMaxLength(160).IsRequired();
+            entity.Property(e => e.Role).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastLoginAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DisabledAt).HasColumnType("timestamptz");
+        });
+
+        modelBuilder.Entity<PlatformOrganizationInterest>(entity =>
+        {
+            entity.ToTable("platform_organization_interests");
+            entity.HasIndex(e => new { e.Status, e.CreatedAt }).HasDatabaseName("ix_platform_interests_status_created");
+            entity.HasIndex(e => e.ContactEmail).HasDatabaseName("ix_platform_interests_contact_email");
+            entity.Property(e => e.OrganizationName).HasMaxLength(200).IsRequired();
+            entity.Property(e => e.ContactName).HasMaxLength(160).IsRequired();
+            entity.Property(e => e.ContactEmail).HasColumnType("citext").IsRequired();
+            entity.Property(e => e.ContactPhone).HasMaxLength(40);
+            entity.Property(e => e.Source).HasMaxLength(80);
+            entity.Property(e => e.Region).HasMaxLength(80);
+            entity.Property(e => e.ExpectedVolume).HasMaxLength(120);
+            entity.Property(e => e.Message).HasMaxLength(4000);
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Notes).HasMaxLength(4000);
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ApprovedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.RejectedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.AssignedStaff)
+                .WithMany()
+                .HasForeignKey(e => e.AssignedStaffId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.ApprovedOrganization)
+                .WithMany()
+                .HasForeignKey(e => e.ApprovedOrganizationId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<PlatformRevenueEvent>(entity =>
+        {
+            entity.ToTable("platform_revenue_events");
+            entity.HasIndex(e => new { e.OrganizationId, e.OccurredAt }).HasDatabaseName("ix_platform_revenue_org_occurred");
+            entity.HasIndex(e => e.OccurredAt).HasDatabaseName("ix_platform_revenue_occurred");
+            entity.HasIndex(e => e.ExternalReference).HasDatabaseName("ix_platform_revenue_external_reference");
+            entity.Property(e => e.Type).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Amount).HasPrecision(18, 2);
+            entity.Property(e => e.Currency).HasMaxLength(3).IsRequired();
+            entity.Property(e => e.Source).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.ExternalReference).HasMaxLength(200);
+            entity.Property(e => e.OccurredAt).HasColumnType("timestamptz");
+            entity.Property(e => e.PeriodStart).HasColumnType("timestamptz");
+            entity.Property(e => e.PeriodEnd).HasColumnType("timestamptz");
+            entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.RecordedByStaff)
+                .WithMany()
+                .HasForeignKey(e => e.RecordedByStaffId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<PlatformAuditEvent>(entity =>
+        {
+            entity.ToTable("platform_audit_events");
+            entity.HasIndex(e => new { e.StaffId, e.CreatedAt }).HasDatabaseName("ix_platform_audit_staff_created");
+            entity.HasIndex(e => e.CreatedAt).HasDatabaseName("ix_platform_audit_created");
+            entity.Property(e => e.EventType).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.EventData).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.IpAddress).HasColumnType("inet");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Staff)
+                .WithMany()
+                .HasForeignKey(e => e.StaffId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+    }
+
     private void ConfigureQueryFilters(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<Organization>()
@@ -844,6 +938,18 @@ public sealed class AtlasDbContext(
                         setting.CreatedAt = setting.CreatedAt == default ? now : setting.CreatedAt;
                         setting.UpdatedAt = now;
                         break;
+                    case PlatformStaff staff:
+                        staff.CreatedAt = staff.CreatedAt == default ? now : staff.CreatedAt;
+                        staff.UpdatedAt = now;
+                        break;
+                    case PlatformOrganizationInterest interest:
+                        interest.CreatedAt = interest.CreatedAt == default ? now : interest.CreatedAt;
+                        interest.UpdatedAt = now;
+                        break;
+                    case PlatformRevenueEvent revenueEvent:
+                        revenueEvent.CreatedAt = revenueEvent.CreatedAt == default ? now : revenueEvent.CreatedAt;
+                        revenueEvent.UpdatedAt = now;
+                        break;
                 }
             }
             else if (entry.State == EntityState.Modified)
@@ -861,6 +967,15 @@ public sealed class AtlasDbContext(
                         break;
                     case AdminSetting setting:
                         setting.UpdatedAt = now;
+                        break;
+                    case PlatformStaff staff:
+                        staff.UpdatedAt = now;
+                        break;
+                    case PlatformOrganizationInterest interest:
+                        interest.UpdatedAt = now;
+                        break;
+                    case PlatformRevenueEvent revenueEvent:
+                        revenueEvent.UpdatedAt = now;
                         break;
                 }
             }
