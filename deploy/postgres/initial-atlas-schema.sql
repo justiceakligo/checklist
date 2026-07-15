@@ -1297,3 +1297,34 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715222135_DigitalOceanSpacesAdminSettings') THEN
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('1f56f6c0-d0b9-4a3d-88d9-9a736e9cf1ad', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', FALSE, 'BucketName', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '""');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('55228888-0a9a-43c3-8760-387a48ad864e', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', FALSE, 'ServiceUrl', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '""');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('a6783782-f779-42ce-afde-f2d857fc19af', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', FALSE, 'Region', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '"nyc3"');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('b99bd470-792f-4dfd-8e91-bcbdf566bd17', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', FALSE, 'QuarantinePrefix', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '"quarantine"');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('c8bf7e7c-a030-4481-8ab2-10dac8984d92', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', TRUE, 'AccessKey', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '""');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('e3a282d6-c69d-40a3-a3f8-77528257be18', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', TRUE, 'SecretKey', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, '""');
+    INSERT INTO admin_settings (id, category, created_at, is_secret, key, organization_id, scope, updated_at, updated_by_user_id, value_json)
+    VALUES ('fb40c9fd-25de-4c6b-83eb-f249c5a64e8f', 'DigitalOceanSpaces', TIMESTAMPTZ '2026-07-15T00:00:00+00:00', FALSE, 'ForcePathStyle', NULL, 1, TIMESTAMPTZ '2026-07-15T00:00:00+00:00', NULL, 'false');
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__EFMigrationsHistory" WHERE "migration_id" = '20260715222135_DigitalOceanSpacesAdminSettings') THEN
+    INSERT INTO "__EFMigrationsHistory" (migration_id, product_version)
+    VALUES ('20260715222135_DigitalOceanSpacesAdminSettings', '10.0.4');
+    END IF;
+END $EF$;
+COMMIT;
+

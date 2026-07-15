@@ -346,6 +346,26 @@ Response: `204 No Content`.
 
 Secret behavior: secret setting values return `"\"***\""` unless an Owner/Admin requests `includeSecrets=true` or `includeSecret=true`.
 
+DigitalOcean Spaces settings are managed here. The storage service reads system settings first and falls back to environment/appsettings values when a DB value is blank.
+
+Use this category and keys:
+
+```text
+Category: DigitalOceanSpaces
+Keys:
+- ServiceUrl
+- Region
+- BucketName
+- AccessKey
+- SecretKey
+- QuarantinePrefix
+- ForcePathStyle
+
+Mark as secret:
+- AccessKey
+- SecretKey
+```
+
 ### GET `/v1/platform/settings`
 
 Query parameters:

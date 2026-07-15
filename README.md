@@ -80,8 +80,17 @@ Admin-configurable product values live in `admin_settings`, not appsettings. The
 - `Email:Resend.From`
 - `Email:Resend.FromName`
 - `Email.ReplyTo`
+- `DigitalOceanSpaces.ServiceUrl`
+- `DigitalOceanSpaces.Region`
+- `DigitalOceanSpaces.BucketName`
+- `DigitalOceanSpaces.AccessKey`
+- `DigitalOceanSpaces.SecretKey`
+- `DigitalOceanSpaces.QuarantinePrefix`
+- `DigitalOceanSpaces.ForcePathStyle`
 
-The Resend API key is intentionally not seeded. Configure it as a secret environment variable or as an admin setting:
+The Resend API key and DigitalOcean Spaces access keys are intentionally seeded as blank/absent secret values. Configure them as secret environment variables or as platform admin settings.
+
+Resend API key:
 
 ```text
 RESEND_API_KEY
@@ -98,6 +107,14 @@ Content-Type: application/json
   "value": "re_...",
   "isSecret": true
 }
+```
+
+DigitalOcean Spaces settings are read from system admin settings first, then fall back to environment/appsettings values. Use platform admin settings CRUD for:
+
+```text
+Category: DigitalOceanSpaces
+Keys: ServiceUrl, Region, BucketName, AccessKey, SecretKey, QuarantinePrefix, ForcePathStyle
+Secret keys: AccessKey, SecretKey
 ```
 
 Recipient emails use `app.baseUrl` or `APP_BASE_URL` and link to `/c/{token}`. The token is generated from 32 CSPRNG bytes, sent only in the email/creation response, and stored only as a hash. The API also accepts `/c/{token}` and `/r/{token}` for recipient session resolution. Opening the link creates a short-lived recipient session; if `otpRequired` is true, the API generates a fresh six-digit OTP, hashes it in the database, sends it through Resend, and requires `/v1/recipient/access/verify` before checklist access.

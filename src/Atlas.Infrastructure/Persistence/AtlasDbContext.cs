@@ -708,6 +708,78 @@ public sealed class AtlasDbContext(
                     ValueJson = "\"https://atlaschecklist.lovable.app\"",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("55228888-0a9a-43c3-8760-387a48ad864e"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "ServiceUrl",
+                    ValueJson = "\"\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("a6783782-f779-42ce-afde-f2d857fc19af"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "Region",
+                    ValueJson = "\"nyc3\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("1f56f6c0-d0b9-4a3d-88d9-9a736e9cf1ad"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "BucketName",
+                    ValueJson = "\"\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("c8bf7e7c-a030-4481-8ab2-10dac8984d92"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "AccessKey",
+                    ValueJson = "\"\"",
+                    IsSecret = true,
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("e3a282d6-c69d-40a3-a3f8-77528257be18"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "SecretKey",
+                    ValueJson = "\"\"",
+                    IsSecret = true,
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("b99bd470-792f-4dfd-8e91-bcbdf566bd17"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "QuarantinePrefix",
+                    ValueJson = "\"quarantine\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("fb40c9fd-25de-4c6b-83eb-f249c5a64e8f"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "DigitalOceanSpaces",
+                    Key = "ForcePathStyle",
+                    ValueJson = "false",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
                 });
         });
     }
