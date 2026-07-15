@@ -1,0 +1,14 @@
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+TestResults/
+*.user
+*.suo
+*.nupkg
+
+# Local secrets and machine-specific settings
+src/Atlas.Api/appsettings.Development.json
+*.Development.json
+.env

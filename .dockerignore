@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+**/.idea/
+.git/
+.gitignore
+tests/
+deploy/postgres/*.sql
+src/Atlas.Api/appsettings.Development.json

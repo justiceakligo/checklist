@@ -1,0 +1,83 @@
+name: atlas-checklist
+region: nyc
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+services:
+  - name: api
+    github:
+      repo: your-org/atlas-checklist
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    source_dir: /
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-1gb
+    health_check:
+      http_path: /v1/health
+      initial_delay_seconds: 10
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    envs:
+      - key: ASPNETCORE_ENVIRONMENT
+        scope: RUN_TIME
+        type: GENERAL
+        value: Production
+      - key: ConnectionStrings__Postgres
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_POSTGRES_CONNECTION}
+      - key: DigitalOceanSpaces__ServiceUrl
+        scope: RUN_TIME
+        type: GENERAL
+        value: https://nyc3.digitaloceanspaces.com
+      - key: DigitalOceanSpaces__Region
+        scope: RUN_TIME
+        type: GENERAL
+        value: nyc3
+      - key: DigitalOceanSpaces__BucketName
+        scope: RUN_TIME
+        type: GENERAL
+        value: ${ATLAS_SPACES_BUCKET}
+      - key: DigitalOceanSpaces__AccessKey
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_SPACES_ACCESS_KEY}
+      - key: DigitalOceanSpaces__SecretKey
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_SPACES_SECRET_KEY}
+      - key: DigitalOceanSpaces__QuarantinePrefix
+        scope: RUN_TIME
+        type: GENERAL
+        value: quarantine
+      - key: Security__HashPepper
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_HASH_PEPPER}
+      - key: RESEND_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: ${ATLAS_RESEND_API_KEY}
+      - key: APP_BASE_URL
+        scope: RUN_TIME
+        type: GENERAL
+        value: https://atlaschecklist.lovable.app
+      - key: EMAIL_FROM
+        scope: RUN_TIME
+        type: GENERAL
+        value: requests@projectatlas.app
+      - key: EMAIL_REPLY_TO
+        scope: RUN_TIME
+        type: GENERAL
+        value: support@projectatlas.app
+ingress:
+  rules:
+    - component:
+        name: api
+      match:
+        path:
+          prefix: /
