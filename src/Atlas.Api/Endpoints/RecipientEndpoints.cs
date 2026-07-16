@@ -1,6 +1,8 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
+using Atlas.Api.Email;
 using Atlas.Api.Filters;
 using Atlas.Application.Abstractions;
 using Atlas.Application.Email;
@@ -222,22 +224,16 @@ public static class RecipientEndpoints
 
         var organizationName = recipient.Action.Organization!.Name;
         var checklistTitle = recipient.Action.Title;
-        var textBody = $"Your Project Atlas access code for \"{checklistTitle}\" is {code}. It expires in {otpMinutes} minutes.";
-        var htmlBody =
-            $"<p>Your Project Atlas access code for <strong>{System.Net.WebUtility.HtmlEncode(checklistTitle)}</strong> is:</p>" +
-            $"<p style=\"font-size:24px;font-weight:700;letter-spacing:4px\">{code}</p>" +
-            $"<p>This code expires in {otpMinutes} minutes.</p>" +
-            $"<p>Organization: {System.Net.WebUtility.HtmlEncode(organizationName)}</p>";
+        var email = TransactionalEmailTemplates.RecipientOtp(organizationName, checklistTitle, code, otpMinutes);
 
         var result = await emailService.SendAsync(
             recipient.Email,
-            "Your Project Atlas access code",
-            textBody,
-            htmlBody,
-            "requests@projectatlas.app",
-            "Project Atlas",
-            cancellationToken,
-            new Dictionary<string, string>
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            cancellationToken: cancellationToken,
+            headers: new Dictionary<string, string>
             {
                 ["X-Atlas-Email-Type"] = "recipient-otp",
                 ["X-Atlas-Recipient-Id"] = recipient.Id.ToString()
@@ -711,6 +707,11 @@ public static class RecipientEndpoints
     private static async Task<IResult> RequestReturnLink(
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -721,11 +722,56 @@ public static class RecipientEndpoints
 
         var recipient = await dbContext.ActionRecipients
             .Include(item => item.Action)
+            .ThenInclude(action => action!.Organization)
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.CreatedByUser)
             .FirstOrDefaultAsync(item => item.Id == recipientId, cancellationToken);
-        if (recipient?.Action is null)
+        if (recipient?.Action?.Organization is null)
         {
             return EndpointHelpers.Problem("recipient_session_required", "A valid recipient session is required.", StatusCodes.Status401Unauthorized);
         }
+
+        if (recipient.Action.Status is ChecklistActionStatus.Cancelled or ChecklistActionStatus.Expired)
+        {
+            return EndpointHelpers.Problem("inactive_link", "Recipient link is no longer active.", StatusCodes.Status410Gone);
+        }
+
+        var graceDaysSetting = await settings.GetAsync(organizationId, "security", "recipientTokenGraceDays", cancellationToken)
+            ?? await settings.GetAsync(organizationId, "security", "recipientTokenDays", cancellationToken);
+        var graceDays = EndpointHelpers.ReadPositiveIntSetting(graceDaysSetting?.ValueJson, 30);
+        recipient.Action.ExpiresAt ??= (recipient.Action.DueAt ?? clock.UtcNow).AddDays(graceDays);
+        if (recipient.Action.ExpiresAt <= clock.UtcNow)
+        {
+            return EndpointHelpers.Problem("expired_link", "Recipient link has expired.", StatusCodes.Status410Gone);
+        }
+
+        var rawToken = EndpointHelpers.NewOpaqueToken();
+        recipient.AccessTokenHash = secretHasher.HashSecret(rawToken);
+        recipient.TokenExpiresAt = recipient.Action.ExpiresAt;
+        recipient.LastActivityAt = clock.UtcNow;
+        var link = await EndpointHelpers.BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        var email = TransactionalEmailTemplates.ReturnLink(
+            FirstName(recipient.Name),
+            recipient.Action.Organization.Name,
+            recipient.Action.Title,
+            FormatDate(recipient.TokenExpiresAt),
+            link);
+        var result = await emailService.SendAsync(
+            recipient.Email,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            cancellationToken: cancellationToken,
+            headers: new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "recipient-return-link",
+                ["X-Atlas-Action-Id"] = recipient.ActionId.ToString(),
+                ["X-Atlas-Recipient-Id"] = recipient.Id.ToString()
+            },
+            replyToEmail: recipient.Action.CreatedByUser?.Email);
 
         dbContext.NotificationDeliveries.Add(new NotificationDelivery
         {
@@ -733,12 +779,26 @@ public static class RecipientEndpoints
             ActionRecipientId = recipient.Id,
             Channel = DeliveryChannel.Email,
             TemplateKey = "recipient_return_link",
-            Status = NotificationDeliveryStatus.Queued
+            ProviderMessageId = result.MessageId,
+            Status = result.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+            ErrorCode = Truncate(result.Error, 100),
+            SentAt = result.Sent ? clock.UtcNow : null,
+            DeliveredAt = result.Sent ? clock.UtcNow : null,
+            CreatedAt = clock.UtcNow
         });
-        SecurityEndpoints.AddAudit(dbContext, organizationId, recipient.ActionId, tenantContext, "recipient.return_link_requested", new { recipient.Id }, httpContext);
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            organizationId,
+            recipient.ActionId,
+            tenantContext,
+            result.Sent ? "recipient.return_link_sent" : "recipient.return_link_send_failed",
+            new { recipient.Id, TokenPrefix = EndpointHelpers.TokenLogPrefix(rawToken), result.Error },
+            httpContext);
         await dbContext.SaveChangesAsync(cancellationToken);
 
-        return Results.Accepted(value: new { queued = true });
+        return result.Sent
+            ? Results.Accepted(value: new { sent = true })
+            : EndpointHelpers.Problem("email_send_failed", "Return link email could not be sent. Please try again later.", StatusCodes.Status503ServiceUnavailable);
     }
 
     private static async Task<IResult> GetReceipt(
@@ -835,6 +895,25 @@ public static class RecipientEndpoints
     private static DateTimeOffset MinDate(DateTimeOffset? left, DateTimeOffset right)
     {
         return left is not null && left < right ? left.Value : right;
+    }
+
+    private static string FirstName(string fullName)
+    {
+        var trimmed = fullName.Trim();
+        var space = trimmed.IndexOf(' ', StringComparison.Ordinal);
+        return space > 0 ? trimmed[..space] : trimmed;
+    }
+
+    private static string FormatDate(DateTimeOffset? value)
+    {
+        return value is null
+            ? "Not set"
+            : value.Value.ToString("MMMM d, yyyy", CultureInfo.InvariantCulture);
+    }
+
+    private static string? Truncate(string? value, int maxLength)
+    {
+        return value is null || value.Length <= maxLength ? value : value[..maxLength];
     }
 
     private static JsonElement ParseJson(string json)

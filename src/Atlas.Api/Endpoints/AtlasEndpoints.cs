@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Atlas.Api.Email;
 using Atlas.Application.Abstractions;
 using Atlas.Application.Email;
 using Atlas.Application.Settings;
@@ -9,7 +10,6 @@ using Atlas.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using System.Globalization;
-using System.Net;
 
 namespace Atlas.Api.Endpoints;
 
@@ -38,6 +38,9 @@ public static class AtlasEndpoints
         group.MapPost("/auth/signup", async (
             SignupRequest request,
             AtlasDbContext dbContext,
+            IAdminSettingService settings,
+            IEmailService emailService,
+            IConfiguration configuration,
             IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
@@ -101,6 +104,47 @@ public static class AtlasEndpoints
             };
 
             dbContext.AddRange(user, organization, membership);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            var welcomeEmail = TransactionalEmailTemplates.AccountCreated(
+                FirstName(user.FullName),
+                organization.Name,
+                await EndpointHelpers.BuildAppBaseUrlAsync(settings, configuration, organization.Id, httpContext, cancellationToken));
+            var welcomeResult = await emailService.SendAsync(
+                user.Email,
+                welcomeEmail.Subject,
+                welcomeEmail.TextBody,
+                welcomeEmail.HtmlBody,
+                "requests@reqara.com",
+                cancellationToken: cancellationToken,
+                headers: new Dictionary<string, string>
+                {
+                    ["X-Atlas-Email-Type"] = "account-created",
+                    ["X-Atlas-Organization-Id"] = organization.Id.ToString(),
+                    ["X-Atlas-User-Id"] = user.Id.ToString()
+                });
+            dbContext.NotificationDeliveries.Add(new NotificationDelivery
+            {
+                OrganizationId = organization.Id,
+                Channel = DeliveryChannel.Email,
+                TemplateKey = "account_created",
+                ProviderMessageId = welcomeResult.MessageId,
+                Status = welcomeResult.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+                ErrorCode = Truncate(welcomeResult.Error, 100),
+                SentAt = welcomeResult.Sent ? clock.UtcNow : null,
+                DeliveredAt = welcomeResult.Sent ? clock.UtcNow : null,
+                CreatedAt = clock.UtcNow
+            });
+            dbContext.AuditEvents.Add(new AuditEvent
+            {
+                OrganizationId = organization.Id,
+                ActorType = ActorType.User,
+                ActorId = user.Id.ToString(),
+                EventType = welcomeResult.Sent ? "auth.signup_email_sent" : "auth.signup_email_failed",
+                EventData = JsonSerializer.Serialize(new { user.Id, user.Email, welcomeResult.MessageId, welcomeResult.Error }, EndpointHelpers.JsonOptions),
+                IpAddress = httpContext.Connection.RemoteIpAddress,
+                UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+            });
             await dbContext.SaveChangesAsync(cancellationToken);
             await SecurityEndpoints.SignInDashboardUserAsync(httpContext, user);
 
@@ -263,21 +307,37 @@ public static class AtlasEndpoints
     {
         var group = v1.MapGroup("/templates").WithTags("Templates");
 
-        group.MapGet("", async (AtlasDbContext dbContext, CancellationToken cancellationToken) =>
+        group.MapGet("", async (
+            string? query,
+            string? category,
+            string? country,
+            string? region,
+            int? limit,
+            AtlasDbContext dbContext,
+            CancellationToken cancellationToken) =>
         {
-            var templates = await dbContext.Templates
+            var templateRows = await dbContext.Templates
                 .AsNoTracking()
-                .OrderByDescending(template => template.CreatedAt)
-                .Select(template => new TemplateResponse(
-                    template.Id,
-                    template.Name,
-                    template.Category,
-                    template.Description,
-                    template.Status,
-                    template.CurrentVersionId,
-                    template.CreatedAt,
-                    template.UpdatedAt))
+                .Include(template => template.CurrentVersion)
+                .OrderBy(template => template.Category)
+                .ThenBy(template => template.Name)
                 .ToListAsync(cancellationToken);
+
+            var terms = SplitSearchTerms(query);
+            var take = limit is > 0 and <= 100 ? limit.Value : 50;
+            var templates = templateRows
+                .Select(template => new TemplateSearchRow(
+                    template,
+                    ToTemplateResponse(template),
+                    TemplateSearchText(template)))
+                .Where(item => MatchesTemplateSearch(item, terms, category, country, region))
+                .OrderByDescending(item => terms.Count == 0 ? 0 : TemplateSearchScore(item, terms))
+                .ThenByDescending(item => item.Response.Rating ?? 0)
+                .ThenBy(item => item.Response.Category)
+                .ThenBy(item => item.Response.Name)
+                .Take(take)
+                .Select(item => item.Response)
+                .ToList();
 
             return Results.Ok(new { items = templates });
         });
@@ -335,15 +395,7 @@ public static class AtlasEndpoints
             dbContext.TemplateVersions.Add(version);
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            return Results.Created($"/v1/templates/{template.Id}", new TemplateResponse(
-                template.Id,
-                template.Name,
-                template.Category,
-                template.Description,
-                template.Status,
-                template.CurrentVersionId,
-                template.CreatedAt,
-                template.UpdatedAt));
+            return Results.Created($"/v1/templates/{template.Id}", ToTemplateResponse(template, version));
         });
 
         group.MapPost("/{id:guid}/publish", async (
@@ -372,15 +424,7 @@ public static class AtlasEndpoints
             template.Status = TemplateStatus.Published;
 
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Ok(new TemplateResponse(
-                template.Id,
-                template.Name,
-                template.Category,
-                template.Description,
-                template.Status,
-                template.CurrentVersionId,
-                template.CreatedAt,
-                template.UpdatedAt));
+            return Results.Ok(ToTemplateResponse(template, version));
         });
     }
 
@@ -560,7 +604,7 @@ public static class AtlasEndpoints
             SecurityEndpoints.AddAudit(dbContext, organizationId, action.Id, tenantContext, "action.created", new { action.Id, action.Title }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            var recipientUrl = await BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
+            var recipientUrl = await EndpointHelpers.BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
             if (request.SendImmediately)
             {
                 var send = await SendChecklistEmailAsync(
@@ -670,7 +714,7 @@ public static class AtlasEndpoints
                 var rawToken = EndpointHelpers.NewOpaqueToken();
                 recipient.AccessTokenHash = secretHasher.HashSecret(rawToken);
                 recipient.TokenExpiresAt = action.ExpiresAt;
-                var recipientLink = await BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
+                var recipientLink = await EndpointHelpers.BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
                 recipientTokens.Add((recipient, rawToken, recipientLink));
             }
             await dbContext.SaveChangesAsync(cancellationToken);
@@ -805,7 +849,7 @@ public static class AtlasEndpoints
                 var rawToken = EndpointHelpers.NewOpaqueToken();
                 recipient.AccessTokenHash = secretHasher.HashSecret(rawToken);
                 recipient.TokenExpiresAt = action.ExpiresAt;
-                var recipientLink = await BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
+                var recipientLink = await EndpointHelpers.BuildRecipientLinkAsync(settings, configuration, organizationId, httpContext, rawToken, cancellationToken);
                 var schedule = new ReminderSchedule
                 {
                     ActionRecipientId = recipient.Id,
@@ -1097,6 +1141,182 @@ public static class AtlasEndpoints
         };
     }
 
+    private static TemplateResponse ToTemplateResponse(Template template, TemplateVersion? version = null)
+    {
+        var effectiveVersion = version ?? template.CurrentVersion;
+        var settings = ParseJsonOrEmpty(effectiveVersion?.SettingsJson);
+        return new TemplateResponse(
+            template.Id,
+            template.Name,
+            template.Category,
+            template.Description,
+            template.Status,
+            template.CurrentVersionId,
+            effectiveVersion?.Title,
+            effectiveVersion?.Instructions,
+            settings,
+            ReadJsonString(settings, "industry"),
+            ReadJsonString(settings, "example"),
+            ReadJsonInt(settings, "rating"),
+            ReadJsonString(settings, "highlight"),
+            ReadJsonString(settings, "country"),
+            ReadJsonString(settings, "region"),
+            ReadJsonStringArray(settings, "tags"),
+            ReadJsonStringArray(settings, "searchTerms"),
+            template.CreatedAt,
+            template.UpdatedAt);
+    }
+
+    private static IReadOnlyList<string> SplitSearchTerms(string? query)
+    {
+        return string.IsNullOrWhiteSpace(query)
+            ? Array.Empty<string>()
+            : query.Trim()
+                .ToLowerInvariant()
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+    }
+
+    private static bool MatchesTemplateSearch(
+        TemplateSearchRow row,
+        IReadOnlyList<string> terms,
+        string? category,
+        string? country,
+        string? region)
+    {
+        if (!string.IsNullOrWhiteSpace(category)
+            && !ContainsNormalized(row.Response.Category, category))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(country)
+            && !ContainsNormalized(row.Response.Country, country))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(region)
+            && !ContainsNormalized(row.Response.Region, region))
+        {
+            return false;
+        }
+
+        return terms.Count == 0 || terms.All(term => row.SearchText.Contains(term, StringComparison.Ordinal));
+    }
+
+    private static int TemplateSearchScore(TemplateSearchRow row, IReadOnlyList<string> terms)
+    {
+        var name = row.Response.Name.ToLowerInvariant();
+        var category = row.Response.Category?.ToLowerInvariant() ?? string.Empty;
+        var tags = row.Response.Tags.Concat(row.Response.SearchTerms)
+            .Select(item => item.ToLowerInvariant())
+            .ToHashSet(StringComparer.Ordinal);
+
+        var score = 0;
+        foreach (var term in terms)
+        {
+            if (name.Equals(term, StringComparison.Ordinal))
+            {
+                score += 100;
+            }
+            if (name.Contains(term, StringComparison.Ordinal))
+            {
+                score += 40;
+            }
+            if (tags.Contains(term))
+            {
+                score += 35;
+            }
+            if (category.Contains(term, StringComparison.Ordinal))
+            {
+                score += 20;
+            }
+            if (row.SearchText.Contains(term, StringComparison.Ordinal))
+            {
+                score += 10;
+            }
+        }
+
+        return score;
+    }
+
+    private static string TemplateSearchText(Template template)
+    {
+        var version = template.CurrentVersion;
+        return string.Join(' ', new[]
+            {
+                template.Name,
+                template.Category,
+                template.Description,
+                version?.Title,
+                version?.Instructions,
+                version?.SettingsJson
+            }
+            .Where(item => !string.IsNullOrWhiteSpace(item)))
+            .ToLowerInvariant();
+    }
+
+    private static bool ContainsNormalized(string? value, string expected)
+    {
+        return !string.IsNullOrWhiteSpace(value)
+            && value.Contains(expected.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static JsonElement ParseJsonOrEmpty(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return JsonSerializer.Deserialize<JsonElement>("{}");
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<JsonElement>(json, EndpointHelpers.JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return JsonSerializer.Deserialize<JsonElement>("{}");
+        }
+    }
+
+    private static string? ReadJsonString(JsonElement json, string propertyName)
+    {
+        return json.ValueKind == JsonValueKind.Object
+            && json.TryGetProperty(propertyName, out var value)
+            && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+    }
+
+    private static int? ReadJsonInt(JsonElement json, string propertyName)
+    {
+        return json.ValueKind == JsonValueKind.Object
+            && json.TryGetProperty(propertyName, out var value)
+            && value.TryGetInt32(out var intValue)
+                ? intValue
+                : null;
+    }
+
+    private static IReadOnlyList<string> ReadJsonStringArray(JsonElement json, string propertyName)
+    {
+        if (json.ValueKind != JsonValueKind.Object
+            || !json.TryGetProperty(propertyName, out var value)
+            || value.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        return value.EnumerateArray()
+            .Where(item => item.ValueKind == JsonValueKind.String)
+            .Select(item => item.GetString())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private static async Task AddRequirementSnapshotsAsync(
         ChecklistAction action,
         CreateActionRequest request,
@@ -1150,24 +1370,6 @@ public static class AtlasEndpoints
         }
     }
 
-    private static async Task<string> BuildRecipientLinkAsync(
-        IAdminSettingService settings,
-        IConfiguration configuration,
-        Guid organizationId,
-        HttpContext httpContext,
-        string rawToken,
-        CancellationToken cancellationToken)
-    {
-        var configuredBaseUrl = ReadStringSetting((await settings.GetAsync(organizationId, "app", "baseUrl", cancellationToken))?.ValueJson)
-            ?? configuration["App:BaseUrl"]
-            ?? configuration["APP_BASE_URL"];
-        var baseUrl = string.IsNullOrWhiteSpace(configuredBaseUrl)
-            ? $"{httpContext.Request.Scheme}://{httpContext.Request.Host}"
-            : configuredBaseUrl.Trim();
-
-        return $"{baseUrl.TrimEnd('/')}/c/{rawToken}";
-    }
-
     private static async Task<ChecklistEmailSendResult> SendChecklistEmailAsync(
         ChecklistAction action,
         ActionRecipient recipient,
@@ -1180,61 +1382,31 @@ public static class AtlasEndpoints
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
-        var subject = kind switch
-        {
-            ChecklistEmailKind.Reminder => $"Reminder: {organization.Name} is waiting on a few items",
-            ChecklistEmailKind.Overdue => $"Your checklist from {organization.Name} is past due",
-            _ => $"{organization.Name} needs a few things from you"
-        };
         var recipientFirstName = FirstName(recipient.Name);
         var dueDate = FormatDate(action.DueAt);
         var expiresAt = FormatDate(recipient.TokenExpiresAt ?? action.ExpiresAt);
-        var encodedLink = WebUtility.HtmlEncode(recipientLink);
-        var encodedRecipient = WebUtility.HtmlEncode(recipientFirstName);
-        var encodedSender = WebUtility.HtmlEncode(sender.FullName);
-        var encodedOrganization = WebUtility.HtmlEncode(organization.Name);
-        var encodedTitle = WebUtility.HtmlEncode(action.Title);
-        var encodedDueDate = WebUtility.HtmlEncode(dueDate);
-        var encodedExpiresAt = WebUtility.HtmlEncode(expiresAt);
-
-        var textBody =
-            $"Hi {recipientFirstName},\n\n" +
-            $"{sender.FullName} at {organization.Name} has requested some information\n" +
-            "and documents from you.\n\n" +
-            $"Request: {action.Title}\n" +
-            $"Due: {dueDate}\n\n" +
-            "Open your secure checklist:\n" +
-            $"{recipientLink}\n\n" +
-            "You don't need an account. The link is private to you - please don't forward it.\n" +
-            $"It expires on {expiresAt}.\n\n" +
-            $"If you have questions, reply to this email to reach {sender.FullName} directly.";
-
-        var htmlBody =
-            $"""
-            <!doctype html>
-            <html>
-            <body style="font-family:Arial,sans-serif;color:#1f2937;line-height:1.5">
-              <p>Hi {encodedRecipient},</p>
-              <p>{encodedSender} at {encodedOrganization} has requested some information and documents from you.</p>
-              <p><strong>Request:</strong> {encodedTitle}<br><strong>Due:</strong> {encodedDueDate}</p>
-              <p>
-                <a href="{encodedLink}" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:6px;font-weight:700">Open your checklist</a>
-              </p>
-              <p>If the button does not work, open this link:<br><a href="{encodedLink}">{encodedLink}</a></p>
-              <p>You don't need an account. This link is private to you - please don't forward it. It expires on {encodedExpiresAt}.</p>
-              <p>If you have questions, reply to this email to reach {encodedSender} directly.</p>
-              <p style="font-size:12px;color:#6b7280">This link is private to you. If you didn't expect this email, you can safely ignore it.</p>
-            </body>
-            </html>
-            """;
+        var email = TransactionalEmailTemplates.Checklist(
+            recipientFirstName,
+            sender.FullName,
+            organization.Name,
+            action.Title,
+            dueDate,
+            expiresAt,
+            recipientLink,
+            kind switch
+            {
+                ChecklistEmailKind.Reminder => ChecklistEmailTemplateKind.Reminder,
+                ChecklistEmailKind.Overdue => ChecklistEmailTemplateKind.Overdue,
+                _ => ChecklistEmailTemplateKind.Invitation
+            });
 
         var result = await emailService.SendAsync(
             recipient.Email,
-            subject,
-            textBody,
-            htmlBody,
-            "requests@projectatlas.app",
-            $"{organization.Name} via Project Atlas",
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            $"{organization.Name} via Reqara",
             cancellationToken,
             new Dictionary<string, string>
             {
@@ -1273,26 +1445,6 @@ public static class AtlasEndpoints
             DeliveredAt = result.Sent ? clock.UtcNow : null,
             CreatedAt = clock.UtcNow
         });
-    }
-
-    private static string? ReadStringSetting(string? valueJson)
-    {
-        if (string.IsNullOrWhiteSpace(valueJson))
-        {
-            return null;
-        }
-
-        try
-        {
-            var value = JsonSerializer.Deserialize<JsonElement>(valueJson, EndpointHelpers.JsonOptions);
-            return value.ValueKind == JsonValueKind.String
-                ? value.GetString()
-                : value.GetRawText();
-        }
-        catch (JsonException)
-        {
-            return valueJson;
-        }
     }
 
     private static string FirstName(string fullName)
@@ -1395,8 +1547,21 @@ public sealed record TemplateResponse(
     string? Description,
     TemplateStatus Status,
     Guid? CurrentVersionId,
+    string? Title,
+    string? Instructions,
+    JsonElement Settings,
+    string? Industry,
+    string? Example,
+    int? Rating,
+    string? Highlight,
+    string? Country,
+    string? Region,
+    IReadOnlyList<string> Tags,
+    IReadOnlyList<string> SearchTerms,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
+
+internal sealed record TemplateSearchRow(Template Template, TemplateResponse Response, string SearchText);
 
 public sealed record CreateActionRequest(
     Guid? TemplateId,

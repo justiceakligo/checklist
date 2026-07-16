@@ -2,7 +2,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Settings;
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.Extensions.Configuration;
 
 namespace Atlas.Api.Endpoints;
 
@@ -140,5 +142,52 @@ internal static class EndpointHelpers
         {
             return fallback;
         }
+    }
+
+    public static string? ReadStringSetting(string? valueJson)
+    {
+        if (string.IsNullOrWhiteSpace(valueJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<JsonElement>(valueJson, JsonOptions);
+            return value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : value.GetRawText();
+        }
+        catch (JsonException)
+        {
+            return valueJson;
+        }
+    }
+
+    public static async Task<string> BuildAppBaseUrlAsync(
+        IAdminSettingService settings,
+        IConfiguration configuration,
+        Guid organizationId,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var configuredBaseUrl = ReadStringSetting((await settings.GetAsync(organizationId, "app", "baseUrl", cancellationToken))?.ValueJson)
+            ?? configuration["App:BaseUrl"]
+            ?? configuration["APP_BASE_URL"];
+        return string.IsNullOrWhiteSpace(configuredBaseUrl)
+            ? $"{httpContext.Request.Scheme}://{httpContext.Request.Host}"
+            : configuredBaseUrl.Trim();
+    }
+
+    public static async Task<string> BuildRecipientLinkAsync(
+        IAdminSettingService settings,
+        IConfiguration configuration,
+        Guid organizationId,
+        HttpContext httpContext,
+        string rawToken,
+        CancellationToken cancellationToken)
+    {
+        var baseUrl = await BuildAppBaseUrlAsync(settings, configuration, organizationId, httpContext, cancellationToken);
+        return $"{baseUrl.TrimEnd('/')}/c/{rawToken}";
     }
 }

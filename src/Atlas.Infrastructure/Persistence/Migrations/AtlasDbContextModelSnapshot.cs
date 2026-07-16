@@ -279,7 +279,7 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                             Key = "From",
                             Scope = (short)1,
                             UpdatedAt = new DateTimeOffset(new DateTime(2026, 7, 15, 0, 0, 0, 0, DateTimeKind.Unspecified), new TimeSpan(0, 0, 0, 0, 0)),
-                            ValueJson = "\"requests@projectatlas.app\""
+                            ValueJson = "\"requests@reqara.com\""
                         },
                         new
                         {
@@ -290,7 +290,7 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                             Key = "FromName",
                             Scope = (short)1,
                             UpdatedAt = new DateTimeOffset(new DateTime(2026, 7, 15, 0, 0, 0, 0, DateTimeKind.Unspecified), new TimeSpan(0, 0, 0, 0, 0)),
-                            ValueJson = "\"Project Atlas\""
+                            ValueJson = "\"Reqara\""
                         },
                         new
                         {
@@ -301,7 +301,7 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                             Key = "ReplyTo",
                             Scope = (short)1,
                             UpdatedAt = new DateTimeOffset(new DateTime(2026, 7, 15, 0, 0, 0, 0, DateTimeKind.Unspecified), new TimeSpan(0, 0, 0, 0, 0)),
-                            ValueJson = "\"support@projectatlas.app\""
+                            ValueJson = "\"support@reqara.com\""
                         },
                         new
                         {
@@ -312,7 +312,7 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                             Key = "baseUrl",
                             Scope = (short)1,
                             UpdatedAt = new DateTimeOffset(new DateTime(2026, 7, 15, 0, 0, 0, 0, DateTimeKind.Unspecified), new TimeSpan(0, 0, 0, 0, 0)),
-                            ValueJson = "\"https://atlaschecklist.lovable.app\""
+                            ValueJson = "\"https://reqara.com\""
                         },
                         new
                         {

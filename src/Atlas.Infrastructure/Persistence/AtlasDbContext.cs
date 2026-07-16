@@ -675,7 +675,7 @@ public sealed class AtlasDbContext(
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "Email:Resend",
                     Key = "From",
-                    ValueJson = "\"requests@projectatlas.app\"",
+                    ValueJson = "\"requests@reqara.com\"",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },
@@ -685,7 +685,7 @@ public sealed class AtlasDbContext(
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "Email:Resend",
                     Key = "FromName",
-                    ValueJson = "\"Project Atlas\"",
+                    ValueJson = "\"Reqara\"",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },
@@ -695,7 +695,7 @@ public sealed class AtlasDbContext(
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "Email",
                     Key = "ReplyTo",
-                    ValueJson = "\"support@projectatlas.app\"",
+                    ValueJson = "\"support@reqara.com\"",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },
@@ -705,7 +705,7 @@ public sealed class AtlasDbContext(
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "app",
                     Key = "baseUrl",
-                    ValueJson = "\"https://atlaschecklist.lovable.app\"",
+                    ValueJson = "\"https://reqara.com\"",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },

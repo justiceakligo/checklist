@@ -1,4 +1,4 @@
-# Project Atlas Platform Admin API Implementation Guide
+# Reqara Platform Admin API Implementation Guide
 
 This guide covers the platform-operator console: platform staff login, staff management, global settings, customer organization management, prospective organization leads, revenue events, metrics, and audit logs.
 
@@ -28,7 +28,7 @@ Current production settings in the database:
 email.provider=resend
 Email:Resend.From=requests@reqara.com
 Email:Resend.FromName=Reqara
-app.baseUrl=https://atlaschecklist.lovable.app
+app.baseUrl=https://reqara.com
 ```
 
 All JSON examples use the actual wire format expected by the API:
@@ -296,7 +296,7 @@ Request:
 
 ```json
 {
-  "email": "support@projectatlas.app",
+  "email": "support@reqara.com",
   "password": "temporary-password",
   "fullName": "Support Staff",
   "role": "Support",
@@ -309,7 +309,7 @@ Response `201`:
 ```json
 {
   "id": "10000000-0000-0000-0000-000000000002",
-  "email": "support@projectatlas.app",
+  "email": "support@reqara.com",
   "fullName": "Support Staff",
   "role": "Support",
   "status": "Active",
@@ -332,7 +332,7 @@ Request:
 
 ```json
 {
-  "email": "support@projectatlas.app",
+  "email": "support@reqara.com",
   "password": null,
   "fullName": "Senior Support Staff",
   "role": "Support",
@@ -345,7 +345,7 @@ Response:
 ```json
 {
   "id": "10000000-0000-0000-0000-000000000002",
-  "email": "support@projectatlas.app",
+  "email": "support@reqara.com",
   "fullName": "Senior Support Staff",
   "role": "Support",
   "status": "Active",
@@ -649,7 +649,7 @@ Request:
   "source": "website",
   "region": "Canada",
   "expectedVolume": "50 checklists/month",
-  "message": "We want to use Project Atlas for onboarding.",
+  "message": "We want to use Reqara for onboarding.",
   "notes": null,
   "status": null,
   "assignedStaffId": null
@@ -687,7 +687,7 @@ Response:
       "source": "website",
       "region": "Canada",
       "expectedVolume": "50 checklists/month",
-      "message": "We want to use Project Atlas for onboarding.",
+      "message": "We want to use Reqara for onboarding.",
       "status": "New",
       "assignedStaffId": null,
       "approvedOrganizationId": null,

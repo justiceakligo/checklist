@@ -51,7 +51,7 @@ builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new()
     {
-        Title = "Project Atlas API",
+        Title = "Reqara API",
         Version = "v1",
         Description = "Checklist, file intake, submission and admin configuration API."
     });
@@ -97,7 +97,7 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI(options =>
     {
-        options.SwaggerEndpoint("/swagger/v1/swagger.json", "Project Atlas API v1");
+        options.SwaggerEndpoint("/swagger/v1/swagger.json", "Reqara API v1");
     });
 }
 

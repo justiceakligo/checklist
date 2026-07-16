@@ -85,7 +85,7 @@ await fetch(`${API_BASE_URL}/v1/me`, {
 Recipient links:
 
 - The backend stores `app.baseUrl` in the database.
-- Today it is `https://atlaschecklist.lovable.app`.
+- Today it is `https://reqara.com`.
 - After the frontend is live on `https://reqara.com`, update `app.baseUrl` to `https://reqara.com`.
 - Email links will then look like `https://reqara.com/c/{token}`.
 - The frontend route `/c/{token}` should call `GET https://api.reqara.com/c/{token}` to resolve the token and set the recipient session cookie.
@@ -445,7 +445,7 @@ SQL
 This changes newly generated checklist email links from:
 
 ```text
-https://atlaschecklist.lovable.app/c/{token}
+https://reqara.com/c/{token}
 ```
 
 to:

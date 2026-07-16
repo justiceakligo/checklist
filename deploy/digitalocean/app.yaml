@@ -69,15 +69,15 @@ services:
       - key: APP_BASE_URL
         scope: RUN_TIME
         type: GENERAL
-        value: https://atlaschecklist.lovable.app
+        value: https://reqara.com
       - key: EMAIL_FROM
         scope: RUN_TIME
         type: GENERAL
-        value: requests@projectatlas.app
+        value: requests@reqara.com
       - key: EMAIL_REPLY_TO
         scope: RUN_TIME
         type: GENERAL
-        value: support@projectatlas.app
+        value: support@reqara.com
 ingress:
   rules:
     - component:

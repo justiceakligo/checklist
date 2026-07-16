@@ -1,4 +1,4 @@
-# Project Atlas Frontend API Implementation Guide
+# Reqara Frontend API Implementation Guide
 
 This guide covers the customer dashboard, recipient checklist portal, public interest intake, and organization-level administration endpoints.
 
@@ -25,7 +25,7 @@ VITE_ATLAS_API_BASE_URL=https://api.reqara.com
 Current recipient-link frontend origin in the database:
 
 ```text
-app.baseUrl=https://atlaschecklist.lovable.app
+app.baseUrl=https://reqara.com
 ```
 
 `app.baseUrl` is not the API origin. The backend uses it only when generating recipient email links like `/c/{token}`. Platform admins can CRUD it through platform settings, and organization admins can override it through organization admin settings.
@@ -358,7 +358,7 @@ Response:
       "scope": "Organization",
       "category": "app",
       "key": "baseUrl",
-      "valueJson": "\"https://atlaschecklist.lovable.app\"",
+      "valueJson": "\"https://reqara.com\"",
       "isSecret": false,
       "updatedAt": "2026-07-15T18:05:00Z"
     }
@@ -374,7 +374,7 @@ Request:
 {
   "scope": "Organization",
   "organizationId": "22222222-2222-2222-2222-222222222222",
-  "value": "https://atlaschecklist.lovable.app",
+  "value": "https://reqara.com",
   "isSecret": false,
   "updatedByUserId": "11111111-1111-1111-1111-111111111111"
 }
@@ -395,7 +395,7 @@ Response:
   "scope": "Organization",
   "category": "app",
   "key": "baseUrl",
-  "valueJson": "\"https://atlaschecklist.lovable.app\"",
+  "valueJson": "\"https://reqara.com\"",
   "isSecret": false,
   "updatedAt": "2026-07-15T19:00:00Z"
 }
@@ -462,18 +462,36 @@ Response: `204 No Content`.
 
 ## Templates
 
-### Template Builder Flow
+### Template Search And Builder Flow
 
 UI scenario:
 
-1. Load templates with `GET /v1/templates`.
-2. Create a draft template with requirements using `POST /v1/templates`.
-3. Publish the latest version with `POST /v1/templates/{id}/publish`.
-4. Use published templates when creating checklist actions.
+1. Show a template search surface first, not a wall of cards.
+2. Prompt: `What are you trying to collect?`
+3. Call `GET /v1/templates?query={term}&limit=12` as the user searches.
+4. Use `category`, `country`, `region`, `pack`, `tags`, `searchTerms`, and `highlight` to group results into practical packs such as HR, Accounting, Healthcare, Government, Education, Logistics, and Hospitality.
+5. Create custom draft templates with requirements using `POST /v1/templates`.
+6. Publish the latest version with `POST /v1/templates/{id}/publish`.
+7. Use published templates when creating checklist actions.
 
 Current backend note: there is no template detail or template-version edit endpoint yet. The current frontend can list, create, and publish templates.
 
 ### GET `/v1/templates`
+
+Query params:
+
+`query`: Optional search text. Search across template name, category, description, instructions, tags, pack metadata, region, and search terms.
+`category`: Optional category filter.
+`country`: Optional country filter, for example `Canada`, `United States`, or `Global`.
+`region`: Optional region filter, for example `Ontario`.
+`limit`: Optional result limit from `1` to `100`. Default `50`.
+
+Example searches:
+
+`GET /v1/templates?query=insurance&limit=8`
+`GET /v1/templates?query=employee&limit=8`
+`GET /v1/templates?country=Canada&query=contractor`
+`GET /v1/templates?category=Healthcare`
 
 Response:
 
@@ -482,17 +500,42 @@ Response:
   "items": [
     {
       "id": "66666666-6666-6666-6666-666666666666",
-      "name": "Employee onboarding",
-      "category": "HR",
-      "description": "Collect identity and payroll documents.",
+      "name": "Healthcare Staffing Onboarding (Ontario)",
+      "category": "HR & Recruitment",
+      "description": "Ontario healthcare staffing intake with ID, credentials, immunization proof, vulnerable sector check, availability, and placement acknowledgements.",
       "status": "Published",
       "currentVersionId": "77777777-7777-7777-7777-777777777777",
+      "title": "Healthcare Staffing Onboarding (Ontario)",
+      "instructions": "Use for Ontario healthcare staffing agencies before placement.",
+      "settings": {
+        "industry": "HR",
+        "example": "Healthcare Staffing Onboarding (Ontario)",
+        "rating": 5,
+        "highlight": "Built for Ontario healthcare staffing workflows.",
+        "country": "Canada",
+        "region": "Ontario",
+        "pack": "Core",
+        "tags": ["healthcare", "staffing", "employee", "ontario", "candidate"],
+        "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization", "availability"]
+      },
+      "industry": "HR",
+      "example": "Healthcare Staffing Onboarding (Ontario)",
+      "rating": 5,
+      "highlight": "Built for Ontario healthcare staffing workflows.",
+      "country": "Canada",
+      "region": "Ontario",
+      "tags": ["healthcare", "staffing", "employee", "ontario", "candidate"],
+      "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization", "availability"],
       "createdAt": "2026-07-15T18:00:00Z",
       "updatedAt": "2026-07-15T18:00:00Z"
     }
   ]
 }
 ```
+
+Recommended UI behavior:
+
+Show the search box first. For example, a search for `insurance` should surface insurance-heavy workflows such as `Vendor Insurance Renewal`, `Vendor Compliance`, `Contractor Registration`, `Insurance Claim Evidence`, and related regional templates. A search for `employee` should surface `Candidate Onboarding`, `New Employee Onboarding`, `Employee Offboarding`, `Reference Check`, and staffing variants.
 
 ### POST `/v1/templates`
 
@@ -550,6 +593,19 @@ Response `201`:
   "description": "Collect identity and payroll documents.",
   "status": "Draft",
   "currentVersionId": null,
+  "title": "Onboarding documents",
+  "instructions": "Please complete each item carefully.",
+  "settings": {
+    "allowPartialSave": true
+  },
+  "industry": null,
+  "example": null,
+  "rating": null,
+  "highlight": null,
+  "country": null,
+  "region": null,
+  "tags": [],
+  "searchTerms": [],
   "createdAt": "2026-07-15T18:00:00Z",
   "updatedAt": "2026-07-15T18:00:00Z"
 }
@@ -569,6 +625,19 @@ Response:
   "description": "Collect identity and payroll documents.",
   "status": "Published",
   "currentVersionId": "77777777-7777-7777-7777-777777777777",
+  "title": "Onboarding documents",
+  "instructions": "Please complete each item carefully.",
+  "settings": {
+    "allowPartialSave": true
+  },
+  "industry": null,
+  "example": null,
+  "rating": null,
+  "highlight": null,
+  "country": null,
+  "region": null,
+  "tags": [],
+  "searchTerms": [],
   "createdAt": "2026-07-15T18:00:00Z",
   "updatedAt": "2026-07-15T18:00:00Z"
 }
@@ -726,7 +795,7 @@ Response `201`:
   "status": "Sent",
   "dueAt": "2026-08-15T00:00:00Z",
   "expiresAt": "2026-09-14T00:00:00Z",
-  "recipientUrl": "https://atlaschecklist.lovable.app/c/9f3kV2qP_hN8mL0aZxYtR7wQeUcJbGdKsMoXnBvIrAs",
+  "recipientUrl": "https://reqara.com/c/9f3kV2qP_hN8mL0aZxYtR7wQeUcJbGdKsMoXnBvIrAs",
   "createdAt": "2026-07-15T18:00:00Z"
 }
 ```
@@ -1321,7 +1390,7 @@ Request:
   "source": "website",
   "region": "Canada",
   "expectedVolume": "50 checklists/month",
-  "message": "We want to use Project Atlas for onboarding.",
+  "message": "We want to use Reqara for onboarding.",
   "notes": null,
   "status": null,
   "assignedStaffId": null
