@@ -813,6 +813,37 @@ public sealed class AtlasDbContext(
                 },
                 new AdminSetting
                 {
+                    Id = Guid.Parse("9dd99ff5-55cb-4f8b-b18a-1b39a437b195"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "turnstile",
+                    Key = "siteKey",
+                    ValueJson = "\"0x4AAAAAAD3PDppjZsCXGkx4\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("395f0214-a89e-4497-85f4-6904a4463cd6"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "turnstile",
+                    Key = "secretKey",
+                    ValueJson = "\"\"",
+                    IsSecret = true,
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("050eb9f7-7445-4e7f-ad37-0c7e9f835257"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "publicContact",
+                    Key = "toEmail",
+                    ValueJson = "\"hello@nextronyx.com\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
                     Id = Guid.Parse("8c967ee1-9233-4edc-aa96-961ea6eca16e"),
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "retention",

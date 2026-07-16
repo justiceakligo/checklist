@@ -24,6 +24,7 @@ Use:
 
 ```text
 VITE_ATLAS_API_BASE_URL=https://api.reqara.com
+VITE_TURNSTILE_SITE_KEY=0x4AAAAAAD3PDppjZsCXGkx4
 ```
 
 `app.baseUrl` is not the API origin. The backend uses it for recipient links in emails: `https://reqara.com/c/{token}`. Platform admins can CRUD it in platform settings. Organization admins can override it with organization admin settings.
@@ -1325,6 +1326,63 @@ GET /v1/developer/webhooks/{id}/deliveries
 ## Public Interest Intake
 
 Use on marketing/contact sales. Self-serve Free signup does not need this flow.
+
+## Public Contact
+
+Use for the website contact form. The frontend must render Cloudflare Turnstile with:
+
+```text
+VITE_TURNSTILE_SITE_KEY=0x4AAAAAAD3PDppjZsCXGkx4
+```
+
+Send the Turnstile response token in `X-Reqara-Captcha-Token`. The backend verifies it before sending email.
+
+### POST `/v1/public/contact`
+
+Headers:
+
+```text
+Content-Type: application/json
+X-Reqara-Captcha-Token: <turnstile-response-token>
+```
+
+Request:
+
+```json
+{
+  "name": "Ollie Ed",
+  "email": "ollie@example.com",
+  "topic": "Sales",
+  "message": "I want to learn more about Reqara for staffing workflows."
+}
+```
+
+The backend also accepts `turnstileToken` in the JSON body for non-browser test clients, but the browser should use the header.
+
+`202`:
+
+```json
+{
+  "accepted": true
+}
+```
+
+Errors:
+
+```text
+422 validation_failed: name, email, topic, or message missing/too long
+422 captcha_required: Turnstile token missing
+403 captcha_failed: Turnstile rejected the token
+503 captcha_not_configured: backend secret missing
+503 captcha_unavailable: Cloudflare verification unavailable
+503 email_send_failed: email provider rejected the message
+```
+
+Email destination is DB-configurable. Current production default:
+
+```text
+publicContact.toEmail = "hello@nextronyx.com"
+```
 
 ### POST `/v1/public/interests`
 

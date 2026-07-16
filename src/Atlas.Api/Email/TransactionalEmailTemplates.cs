@@ -112,6 +112,41 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail("Reset your Reqara password", text, html);
     }
 
+    public static TransactionalEmail PublicContact(
+        string senderName,
+        string senderEmail,
+        string topic,
+        string message)
+    {
+        var safeName = CleanName(senderName, "Website visitor");
+        var safeEmail = CleanName(senderEmail, "unknown");
+        var safeTopic = CleanName(topic, "General");
+        var safeMessage = CleanName(message, "No message provided.");
+
+        var text =
+            "New Reqara website contact message.\n\n" +
+            $"Name: {safeName}\n" +
+            $"Email: {safeEmail}\n" +
+            $"Topic: {safeTopic}\n\n" +
+            $"{safeMessage}";
+
+        var html = BuildLayout(
+            "Website contact",
+            "New Reqara website contact message.",
+            $"<strong>{Html(safeName)}</strong> submitted a contact request.",
+            null,
+            null,
+            new[]
+            {
+                $"<strong>Email:</strong> {Html(safeEmail)}",
+                $"<strong>Topic:</strong> {Html(safeTopic)}",
+                $"<strong>Message:</strong><br><span style=\"white-space:pre-line\">{Html(safeMessage)}</span>"
+            },
+            "Reply directly to this email to reach the sender.");
+
+        return new TransactionalEmail($"Reqara contact: {safeTopic}", text, html);
+    }
+
     public static TransactionalEmail RecipientOtp(
         string organizationName,
         string checklistTitle,

@@ -32,6 +32,7 @@ public static class PlatformEndpoints
             AtlasDbContext dbContext,
             CancellationToken cancellationToken) =>
             await CreatePublicInterest(request, dbContext, cancellationToken)).WithTags("Public");
+        app.MapPost("/v1/public/contact", CreatePublicContact).WithTags("Public");
 
         var group = app.MapGroup("/v1/platform").WithTags("Platform");
 
@@ -1654,6 +1655,182 @@ public static class PlatformEndpoints
         return Results.Accepted($"/v1/public/interests/{interest.Id}", new { interest.Id, interest.Status });
     }
 
+    private static async Task<IResult> CreatePublicContact(
+        CreatePublicContactRequest request,
+        AtlasDbContext dbContext,
+        IEmailService emailService,
+        IHttpClientFactory httpClientFactory,
+        IConfiguration configuration,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var validation = ValidateContactRequest(request);
+        if (validation is not null)
+        {
+            return validation;
+        }
+
+        var captchaToken = httpContext.Request.Headers["X-Reqara-Captcha-Token"].FirstOrDefault()
+            ?? request.TurnstileToken;
+        if (string.IsNullOrWhiteSpace(captchaToken))
+        {
+            return EndpointHelpers.Problem("captcha_required", "Captcha token is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var captcha = await VerifyTurnstileAsync(dbContext, httpClientFactory, configuration, captchaToken.Trim(), httpContext, cancellationToken);
+        if (captcha is not null)
+        {
+            return captcha;
+        }
+
+        var toEmail = await GetSystemSettingAsync(dbContext, "publicContact", "toEmail", cancellationToken)
+            ?? configuration["PublicContact:ToEmail"]
+            ?? "hello@nextronyx.com";
+        var email = TransactionalEmailTemplates.PublicContact(
+            request.Name.Trim(),
+            NormalizeEmail(request.Email),
+            request.Topic.Trim(),
+            request.Message.Trim());
+        var send = await emailService.SendAsync(
+            toEmail,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            "Reqara",
+            cancellationToken,
+            new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "public-contact"
+            },
+            NormalizeEmail(request.Email));
+
+        dbContext.PlatformAuditEvents.Add(new PlatformAuditEvent
+        {
+            EventType = send.Sent ? "public.contact_sent" : "public.contact_send_failed",
+            EventData = JsonSerializer.Serialize(
+                new
+                {
+                    name = request.Name.Trim(),
+                    email = NormalizeEmail(request.Email),
+                    topic = request.Topic.Trim(),
+                    toEmail,
+                    send.MessageId,
+                    send.Error
+                },
+                EndpointHelpers.JsonOptions),
+            IpAddress = httpContext.Connection.RemoteIpAddress,
+            UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+        });
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return send.Sent
+            ? Results.Accepted("/v1/public/contact", new PublicContactResponse(true))
+            : EndpointHelpers.Problem("email_send_failed", "Contact message could not be sent.", StatusCodes.Status503ServiceUnavailable);
+    }
+
+    private static IResult? ValidateContactRequest(CreatePublicContactRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Name)
+            || string.IsNullOrWhiteSpace(request.Email)
+            || string.IsNullOrWhiteSpace(request.Topic)
+            || string.IsNullOrWhiteSpace(request.Message))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Name, email, topic and message are required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.Name.Length > 160)
+        {
+            return EndpointHelpers.Problem("validation_failed", "Name must be 160 characters or fewer.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.Email.Length > 320 || !request.Email.Contains('@', StringComparison.Ordinal))
+        {
+            return EndpointHelpers.Problem("validation_failed", "A valid email address is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.Topic.Length > 120)
+        {
+            return EndpointHelpers.Problem("validation_failed", "Topic must be 120 characters or fewer.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.Message.Length > 4000)
+        {
+            return EndpointHelpers.Problem("validation_failed", "Message must be 4000 characters or fewer.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return null;
+    }
+
+    private static async Task<IResult?> VerifyTurnstileAsync(
+        AtlasDbContext dbContext,
+        IHttpClientFactory httpClientFactory,
+        IConfiguration configuration,
+        string token,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var secret = await GetSystemSettingAsync(dbContext, "turnstile", "secretKey", cancellationToken)
+            ?? configuration["Turnstile:SecretKey"]
+            ?? configuration["TURNSTILE_SECRET_KEY"];
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            return EndpointHelpers.Problem("captcha_not_configured", "Captcha verification is not configured.", StatusCodes.Status503ServiceUnavailable);
+        }
+
+        var remoteIp = httpContext.Request.Headers["CF-Connecting-IP"].FirstOrDefault()
+            ?? httpContext.Request.Headers["X-Forwarded-For"].FirstOrDefault()?.Split(',')[0].Trim()
+            ?? httpContext.Connection.RemoteIpAddress?.ToString();
+        var form = new Dictionary<string, string>
+        {
+            ["secret"] = secret,
+            ["response"] = token
+        };
+        if (!string.IsNullOrWhiteSpace(remoteIp))
+        {
+            form["remoteip"] = remoteIp;
+        }
+
+        using var content = new FormUrlEncodedContent(form);
+        var client = httpClientFactory.CreateClient("Turnstile");
+        using var response = await client.PostAsync("https://challenges.cloudflare.com/turnstile/v0/siteverify", content, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            return EndpointHelpers.Problem("captcha_unavailable", "Captcha verification is temporarily unavailable.", StatusCodes.Status503ServiceUnavailable);
+        }
+
+        try
+        {
+            using var json = JsonDocument.Parse(body);
+            if (json.RootElement.TryGetProperty("success", out var success) && success.ValueKind == JsonValueKind.True)
+            {
+                return null;
+            }
+
+            return EndpointHelpers.Problem("captcha_failed", "Captcha verification failed.", StatusCodes.Status403Forbidden);
+        }
+        catch (JsonException)
+        {
+            return EndpointHelpers.Problem("captcha_unavailable", "Captcha verification returned an invalid response.", StatusCodes.Status503ServiceUnavailable);
+        }
+    }
+
+    private static async Task<string?> GetSystemSettingAsync(
+        AtlasDbContext dbContext,
+        string category,
+        string key,
+        CancellationToken cancellationToken)
+    {
+        var setting = await dbContext.AdminSettings.IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(item => item.OrganizationId == null && item.Category == category && item.Key == key)
+            .OrderByDescending(item => item.UpdatedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+        var value = EndpointHelpers.ReadStringSetting(setting?.ValueJson);
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
+
     private static PlatformOrganizationInterest CreateInterestEntity(CreateOrganizationInterestRequest request, bool includeInternalFields)
     {
         return new PlatformOrganizationInterest
@@ -2077,6 +2254,15 @@ public sealed record PlatformStaffResponse(
     DateTimeOffset? DisabledAt,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
+
+public sealed record CreatePublicContactRequest(
+    string Name,
+    string Email,
+    string Topic,
+    string Message,
+    string? TurnstileToken);
+
+public sealed record PublicContactResponse(bool Accepted);
 
 public sealed record CreatePlatformStaffRequest(
     string Email,
