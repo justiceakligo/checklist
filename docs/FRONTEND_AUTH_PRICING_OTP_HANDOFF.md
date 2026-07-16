@@ -442,6 +442,8 @@ await fetch(`${apiBaseUrl}/c/${token}`, {
 
 If `otpRequired` is `true` and `otpVerified` is `false`, show the OTP screen and do not request checklist details yet.
 
+Repeated calls to `/c/{token}` while an unexpired OTP already exists do not send another email. This prevents React retries, refreshes, or route remounts from producing multiple different codes.
+
 ### POST `/v1/recipient/access/verify`
 
 Use `credentials: "include"` here too. The backend verifies the code against the recipient session created by `/c/{token}`; sending only `{ code }` without the cookie returns `401 recipient_session_required`.
@@ -474,6 +476,30 @@ Then call:
 ```text
 GET /v1/recipient/checklist
 ```
+
+### POST `/v1/recipient/access/resend`
+
+Use only when the recipient clicks "Resend code".
+
+```ts
+await fetch(`${apiBaseUrl}/v1/recipient/access/resend`, {
+  method: "POST",
+  credentials: "include"
+});
+```
+
+`202`:
+
+```json
+{
+  "sent": true,
+  "otpRequired": true,
+  "otpVerified": false,
+  "expiresAt": "2026-07-16T21:10:00Z"
+}
+```
+
+`429 otp_resend_too_soon`: show a short wait message/countdown before enabling resend.
 
 OTP errors:
 

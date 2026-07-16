@@ -283,6 +283,7 @@ turnstile.secretKey = secret
 publicContact.toEmail = "hello@nextronyx.com"
 security.recipientTokenGraceDays = 30
 security.otpMinutes = 10
+security.otpResendCooldownSeconds = 60
 developer.apiKeyDefaultDays = 180
 reminders.beforeDueDays = 3
 reminders.overdueDays = 1

@@ -25,6 +25,7 @@ public static class RecipientEndpoints
 
         var group = app.MapGroup("/v1/recipient").WithTags("Recipient");
         group.MapPost("/access/verify", VerifyAccessCode);
+        group.MapPost("/access/resend", ResendAccessCode);
         group.MapGet("/checklist", GetChecklist);
         group.MapPatch("/responses/{requirementId:guid}", AutosaveResponse);
         group.MapPost("/uploads", CreateRecipientUploadIntent);
@@ -204,6 +205,78 @@ public static class RecipientEndpoints
         return Results.Ok(new { verified = true });
     }
 
+    private static async Task<IResult> ResendAccessCode(
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IEmailService emailService,
+        IAdminSettingService settings,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (!EndpointHelpers.TryGetRecipientTenant(tenantContext, out var organizationId, out var recipientId, out var problem))
+        {
+            return problem!;
+        }
+
+        var session = await GetCurrentRecipientSessionAsync(dbContext, httpContext, cancellationToken);
+        var recipient = await dbContext.ActionRecipients
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.Organization)
+            .FirstOrDefaultAsync(item => item.Id == recipientId, cancellationToken);
+        if (session is null || recipient?.Action?.Organization is null)
+        {
+            return EndpointHelpers.Problem("recipient_session_required", "A valid recipient session is required.", StatusCodes.Status401Unauthorized);
+        }
+
+        if (!recipient.OtpRequired)
+        {
+            session.OtpVerified = true;
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(new { sent = false, otpRequired = false, otpVerified = true });
+        }
+
+        if (session.OtpVerified)
+        {
+            return Results.Ok(new { sent = false, otpRequired = true, otpVerified = true });
+        }
+
+        var resend = await SendRecipientOtpAsync(
+            recipient,
+            dbContext,
+            emailService,
+            settings,
+            secretHasher,
+            clock,
+            httpContext,
+            cancellationToken,
+            forceNewCode: true);
+        if (resend.Problem is not null)
+        {
+            return resend.Problem;
+        }
+
+        if (resend.Delivery is not null)
+        {
+            dbContext.NotificationDeliveries.Add(resend.Delivery);
+            dbContext.AuditEvents.Add(new AuditEvent
+            {
+                OrganizationId = organizationId,
+                ActionId = recipient.ActionId,
+                ActorType = ActorType.Recipient,
+                ActorId = recipient.Email,
+                EventType = "recipient.otp_resent",
+                EventData = JsonSerializer.Serialize(new { recipient.Id, recipient.OtpExpiresAt }, EndpointHelpers.JsonOptions),
+                IpAddress = httpContext.Connection.RemoteIpAddress,
+                UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        return Results.Accepted(value: new { sent = true, otpRequired = true, otpVerified = false, expiresAt = recipient.OtpExpiresAt });
+    }
+
     private static async Task<OtpEmailAttempt> SendRecipientOtpAsync(
         ActionRecipient recipient,
         AtlasDbContext dbContext,
@@ -212,11 +285,48 @@ public static class RecipientEndpoints
         ISecretHasher secretHasher,
         IAtlasClock clock,
         HttpContext httpContext,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool forceNewCode = false)
     {
         var otpMinutes = EndpointHelpers.ReadPositiveIntSetting(
             (await settings.GetAsync(recipient.Action!.OrganizationId, "security", "otpMinutes", cancellationToken))?.ValueJson,
             10);
+        var activeCodeExists = recipient.OtpCodeHash is not null
+            && recipient.OtpExpiresAt is not null
+            && recipient.OtpExpiresAt > clock.UtcNow;
+        var lastSuccessfulSentAt = await dbContext.NotificationDeliveries
+            .IgnoreQueryFilters()
+            .Where(item => item.ActionRecipientId == recipient.Id
+                && item.TemplateKey == "recipient_otp"
+                && item.Status == NotificationDeliveryStatus.Delivered
+                && item.SentAt != null)
+            .OrderByDescending(item => item.SentAt)
+            .Select(item => item.SentAt)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (!forceNewCode && activeCodeExists && lastSuccessfulSentAt is not null)
+        {
+            return new OtpEmailAttempt(null, null);
+        }
+
+        if (forceNewCode && lastSuccessfulSentAt is not null)
+        {
+            var cooldownSeconds = EndpointHelpers.ReadPositiveIntSetting(
+                (await settings.GetAsync(recipient.Action.OrganizationId, "security", "otpResendCooldownSeconds", cancellationToken))?.ValueJson,
+                60);
+            var retryAt = lastSuccessfulSentAt.Value.AddSeconds(cooldownSeconds);
+            if (retryAt > clock.UtcNow)
+            {
+                var retryAfterSeconds = Math.Max(1, (int)Math.Ceiling((retryAt - clock.UtcNow).TotalSeconds));
+                return new OtpEmailAttempt(
+                    EndpointHelpers.Problem(
+                        "otp_resend_too_soon",
+                        $"Please wait {retryAfterSeconds} seconds before requesting another access code.",
+                        StatusCodes.Status429TooManyRequests),
+                    null);
+            }
+        }
+
         var code = EndpointHelpers.NewOtpCode();
         recipient.OtpCodeHash = secretHasher.HashSecret(code);
         recipient.OtpExpiresAt = clock.UtcNow.AddMinutes(otpMinutes);

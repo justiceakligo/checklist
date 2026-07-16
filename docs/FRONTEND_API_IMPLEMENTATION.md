@@ -1168,6 +1168,8 @@ await fetch(`${apiBaseUrl}/c/${token}`, {
 
 If `otpRequired` is `true` and `otpVerified` is `false`, show the OTP screen immediately. The code has already been emailed.
 
+Repeated calls to `/c/{token}` while an unexpired OTP already exists do not send another email. Keep the user on the OTP screen and let them use the resend action below if needed.
+
 ### POST `/v1/recipient/access/verify`
 
 Must also include credentials so the backend receives the recipient session cookie created by `/c/{token}`. The code alone is not enough.
@@ -1209,6 +1211,30 @@ OTP errors:
 410 otp_expired: reopen /c/{token} to send a fresh code
 429 otp_locked: too many attempts
 ```
+
+### POST `/v1/recipient/access/resend`
+
+Use when the recipient clicks "Resend code". Requires the same recipient session cookie, so include credentials.
+
+```ts
+await fetch(`${apiBaseUrl}/v1/recipient/access/resend`, {
+  method: "POST",
+  credentials: "include"
+});
+```
+
+`202`:
+
+```json
+{
+  "sent": true,
+  "otpRequired": true,
+  "otpVerified": false,
+  "expiresAt": "2026-07-16T21:10:00Z"
+}
+```
+
+`429 otp_resend_too_soon` means the recipient clicked resend too quickly. Show the problem `title` or a short countdown before enabling resend again.
 
 ### GET `/v1/recipient/checklist`
 
