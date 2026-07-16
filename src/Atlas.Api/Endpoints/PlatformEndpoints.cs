@@ -43,6 +43,7 @@ public static class PlatformEndpoints
 
         MapStaff(group);
         MapSettings(group);
+        MapTemplates(group);
         MapOrganizations(group);
         MapInterests(group);
         MapRevenue(group);
@@ -543,6 +544,367 @@ public static class PlatformEndpoints
 
             dbContext.AdminSettings.Remove(setting);
             AddPlatformAudit(dbContext, access.Staff!.Id, "platform.setting_deleted", new { setting.Id, setting.OrganizationId, setting.Category, setting.Key }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.NoContent();
+        });
+    }
+
+    private static void MapTemplates(RouteGroupBuilder group)
+    {
+        group.MapGet("/templates", async (
+            int? page,
+            int? pageSize,
+            string? q,
+            TemplateStatus? status,
+            Guid? organizationId,
+            bool? globalOnly,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var query = dbContext.Templates.IgnoreQueryFilters().AsNoTracking()
+                .Include(item => item.Organization)
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(item => item!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(item => item.Requirements)
+                .Where(item => item.DeletedAt == null);
+            if (status.HasValue)
+            {
+                query = query.Where(item => item.Status == status.Value);
+            }
+            if (organizationId.HasValue)
+            {
+                query = query.Where(item => item.OrganizationId == organizationId.Value);
+            }
+            if (globalOnly == true)
+            {
+                query = query.Where(item => item.OrganizationId == null);
+            }
+            if (!string.IsNullOrWhiteSpace(q))
+            {
+                var term = q.Trim();
+                query = query.Where(item =>
+                    item.Name.Contains(term)
+                    || (item.Category != null && item.Category.Contains(term))
+                    || (item.Description != null && item.Description.Contains(term))
+                    || (item.CurrentVersion != null
+                        && (item.CurrentVersion.Title.Contains(term)
+                            || (item.CurrentVersion.Instructions != null && item.CurrentVersion.Instructions.Contains(term))
+                            || item.CurrentVersion.SettingsJson.Contains(term)))
+                    || item.Versions.Any(version =>
+                        version.Title.Contains(term)
+                        || (version.Instructions != null && version.Instructions.Contains(term))
+                        || version.SettingsJson.Contains(term)));
+            }
+
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
+            var templates = await query
+                .OrderBy(item => item.OrganizationId == null ? 0 : 1)
+                .ThenBy(item => item.Category)
+                .ThenBy(item => item.Name)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
+                .ToListAsync(cancellationToken);
+            var items = templates.Select(item => ToPlatformTemplateResponse(item, EffectiveTemplateVersion(item))).ToList();
+
+            return Results.Ok(new { items, page = normalizedPage, pageSize = normalizedPageSize, total });
+        });
+
+        group.MapGet("/templates/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var template = await dbContext.Templates.IgnoreQueryFilters().AsNoTracking()
+                .Include(item => item.Organization)
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(item => item!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(item => item.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id && item.DeletedAt == null, cancellationToken);
+
+            return template is null
+                ? EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound)
+                : Results.Ok(ToPlatformTemplateResponse(template, EffectiveTemplateVersion(template)));
+        });
+
+        group.MapPost("/templates", async (
+            CreatePlatformTemplateRequest request,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var validation = await ValidatePlatformTemplateRequestAsync(dbContext, request.OrganizationId, request.Name, request.Title, request.Requirements, cancellationToken);
+            if (validation is not null)
+            {
+                return validation;
+            }
+
+            var name = request.Name.Trim();
+            var duplicate = await TemplateNameExistsAsync(dbContext, request.OrganizationId, name, excludingTemplateId: null, cancellationToken);
+            if (duplicate)
+            {
+                return EndpointHelpers.Problem("template_exists", "A template with this name already exists for this scope.", StatusCodes.Status409Conflict);
+            }
+
+            var now = clock.UtcNow;
+            var template = new Template
+            {
+                OrganizationId = request.OrganizationId,
+                Name = name,
+                Category = request.Category?.Trim(),
+                Description = request.Description?.Trim(),
+                Status = request.PublishImmediately ? TemplateStatus.Published : TemplateStatus.Draft,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            var version = new TemplateVersion
+            {
+                Template = template,
+                VersionNumber = 1,
+                Title = request.Title.Trim(),
+                Instructions = request.Instructions?.Trim(),
+                SettingsJson = EndpointHelpers.JsonOrDefault(request.Settings),
+                PublishedAt = request.PublishImmediately ? now : null,
+                CreatedAt = now
+            };
+            foreach (var requirement in request.Requirements.OrderBy(item => item.DisplayOrder))
+            {
+                version.Requirements.Add(ToTemplateRequirement(requirement));
+            }
+            if (request.PublishImmediately)
+            {
+                template.CurrentVersionId = version.Id;
+            }
+
+            dbContext.Templates.Add(template);
+            dbContext.TemplateVersions.Add(version);
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.template_created", new { template.Id, template.OrganizationId, template.Name, request.PublishImmediately }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Created($"/v1/platform/templates/{template.Id}", ToPlatformTemplateResponse(template, version));
+        });
+
+        group.MapPut("/templates/{id:guid}", async (
+            Guid id,
+            UpdatePlatformTemplateRequest request,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var template = await dbContext.Templates.IgnoreQueryFilters()
+                .Include(item => item.Organization)
+                .Include(item => item.Versions)
+                .ThenInclude(item => item.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id && item.DeletedAt == null, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var nextOrganizationId = request.OrganizationId.HasValue ? request.OrganizationId : template.OrganizationId;
+            var nextName = string.IsNullOrWhiteSpace(request.Name) ? template.Name : request.Name.Trim();
+            var latestVersion = template.Versions.OrderByDescending(item => item.VersionNumber).FirstOrDefault();
+            var nextTitle = string.IsNullOrWhiteSpace(request.Title) ? latestVersion?.Title ?? template.Name : request.Title.Trim();
+            var nextRequirements = request.Requirements;
+            var validation = await ValidatePlatformTemplateRequestAsync(dbContext, nextOrganizationId, nextName, nextTitle, nextRequirements, cancellationToken, requireRequirements: false);
+            if (validation is not null)
+            {
+                return validation;
+            }
+
+            var duplicate = await TemplateNameExistsAsync(dbContext, nextOrganizationId, nextName, excludingTemplateId: template.Id, cancellationToken);
+            if (duplicate)
+            {
+                return EndpointHelpers.Problem("template_exists", "A template with this name already exists for this scope.", StatusCodes.Status409Conflict);
+            }
+
+            template.OrganizationId = nextOrganizationId;
+            template.Name = nextName;
+            if (request.Category is not null)
+            {
+                template.Category = string.IsNullOrWhiteSpace(request.Category) ? null : request.Category.Trim();
+            }
+            if (request.Description is not null)
+            {
+                template.Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim();
+            }
+            if (request.Status.HasValue)
+            {
+                var enumValidation = ValidateEnum(request.Status.Value, "status");
+                if (enumValidation is not null)
+                {
+                    return enumValidation;
+                }
+
+                template.Status = request.Status.Value;
+            }
+
+            var shouldCreateVersion = request.Title is not null
+                || request.Instructions is not null
+                || request.Settings.HasValue
+                || request.Requirements is not null;
+            TemplateVersion? responseVersion = latestVersion;
+            if (shouldCreateVersion)
+            {
+                var nextVersionNumber = template.Versions.Count == 0
+                    ? 1
+                    : template.Versions.Max(item => item.VersionNumber) + 1;
+                responseVersion = new TemplateVersion
+                {
+                    Template = template,
+                    VersionNumber = nextVersionNumber,
+                    Title = nextTitle,
+                    Instructions = request.Instructions is null ? latestVersion?.Instructions : request.Instructions.Trim(),
+                    SettingsJson = request.Settings.HasValue
+                        ? EndpointHelpers.JsonOrDefault(request.Settings)
+                        : latestVersion?.SettingsJson ?? "{}",
+                    CreatedAt = clock.UtcNow
+                };
+
+                var requirements = nextRequirements is null
+                    ? latestVersion?.Requirements
+                        .OrderBy(item => item.DisplayOrder)
+                        .Select(CloneTemplateRequirement)
+                        .ToList() ?? []
+                    : nextRequirements.OrderBy(item => item.DisplayOrder).Select(ToTemplateRequirement).ToList();
+                foreach (var requirement in requirements)
+                {
+                    responseVersion.Requirements.Add(requirement);
+                }
+
+                dbContext.TemplateVersions.Add(responseVersion);
+            }
+
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.template_updated", new { template.Id, template.OrganizationId, template.Name, createdVersion = shouldCreateVersion }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToPlatformTemplateResponse(template, responseVersion));
+        });
+
+        group.MapPost("/templates/{id:guid}/publish", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var template = await dbContext.Templates.IgnoreQueryFilters()
+                .Include(item => item.Organization)
+                .Include(item => item.Versions)
+                .ThenInclude(item => item.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id && item.DeletedAt == null, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var version = template.Versions.OrderByDescending(item => item.VersionNumber).FirstOrDefault();
+            if (version is null)
+            {
+                return EndpointHelpers.Problem("validation_failed", "Template has no version to publish.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            version.PublishedAt ??= clock.UtcNow;
+            template.CurrentVersionId = version.Id;
+            template.Status = TemplateStatus.Published;
+            AddPlatformAudit(
+                dbContext,
+                access.Staff!.Id,
+                "platform.template_published",
+                new { templateId = template.Id, versionId = version.Id, version.VersionNumber },
+                httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToPlatformTemplateResponse(template, version));
+        });
+
+        group.MapPost("/templates/{id:guid}/archive", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var template = await dbContext.Templates.IgnoreQueryFilters()
+                .Include(item => item.Organization)
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(item => item!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(item => item.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id && item.DeletedAt == null, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            template.Status = TemplateStatus.Archived;
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.template_archived", new { template.Id, template.Name }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToPlatformTemplateResponse(template, EffectiveTemplateVersion(template)));
+        });
+
+        group.MapDelete("/templates/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var template = await dbContext.Templates.IgnoreQueryFilters()
+                .FirstOrDefaultAsync(item => item.Id == id && item.DeletedAt == null, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            template.Status = TemplateStatus.Archived;
+            template.DeletedAt = clock.UtcNow;
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.template_deleted", new { template.Id, template.Name }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
             return Results.NoContent();
         });
@@ -2122,6 +2484,172 @@ public static class PlatformEndpoints
             setting.UpdatedAt);
     }
 
+    private static PlatformTemplateResponse ToPlatformTemplateResponse(Template template, TemplateVersion? version)
+    {
+        var settings = ParseJsonOrEmpty(version?.SettingsJson);
+        return new PlatformTemplateResponse(
+            template.Id,
+            template.OrganizationId,
+            template.Organization?.Name,
+            template.OrganizationId is null,
+            template.Name,
+            template.Category,
+            template.Description,
+            template.Status,
+            template.CurrentVersionId,
+            version?.Id,
+            version?.VersionNumber,
+            version?.Title,
+            version?.Instructions,
+            settings,
+            version?.PublishedAt,
+            version?.Requirements
+                .OrderBy(item => item.DisplayOrder)
+                .Select(ToPlatformTemplateRequirementResponse)
+                .ToList() ?? [],
+            template.CreatedAt,
+            template.UpdatedAt,
+            template.DeletedAt);
+    }
+
+    private static TemplateVersion? EffectiveTemplateVersion(Template template)
+    {
+        return template.CurrentVersion
+            ?? template.Versions.OrderByDescending(item => item.VersionNumber).FirstOrDefault();
+    }
+
+    private static PlatformTemplateRequirementResponse ToPlatformTemplateRequirementResponse(TemplateRequirement requirement)
+    {
+        return new PlatformTemplateRequirementResponse(
+            requirement.Id,
+            requirement.Key,
+            requirement.Type,
+            requirement.Label,
+            requirement.Description,
+            requirement.IsRequired,
+            requirement.DisplayOrder,
+            ParseJsonOrEmpty(requirement.ConfigurationJson),
+            ParseJsonOrEmpty(requirement.ValidationJson),
+            string.IsNullOrWhiteSpace(requirement.ConditionJson) ? null : ParseJsonOrEmpty(requirement.ConditionJson));
+    }
+
+    private static TemplateRequirement ToTemplateRequirement(RequirementDefinitionRequest request)
+    {
+        return new TemplateRequirement
+        {
+            Key = request.Key.Trim(),
+            Type = request.Type,
+            Label = request.Label.Trim(),
+            Description = request.Description?.Trim(),
+            IsRequired = request.Required,
+            DisplayOrder = request.DisplayOrder,
+            ConfigurationJson = EndpointHelpers.JsonOrDefault(request.Configuration),
+            ValidationJson = EndpointHelpers.JsonOrDefault(request.Validation),
+            ConditionJson = request.Condition is null ? null : request.Condition.Value.GetRawText()
+        };
+    }
+
+    private static TemplateRequirement CloneTemplateRequirement(TemplateRequirement requirement)
+    {
+        return new TemplateRequirement
+        {
+            Key = requirement.Key,
+            Type = requirement.Type,
+            Label = requirement.Label,
+            Description = requirement.Description,
+            IsRequired = requirement.IsRequired,
+            DisplayOrder = requirement.DisplayOrder,
+            ConfigurationJson = requirement.ConfigurationJson,
+            ValidationJson = requirement.ValidationJson,
+            ConditionJson = requirement.ConditionJson
+        };
+    }
+
+    private static async Task<IResult?> ValidatePlatformTemplateRequestAsync(
+        AtlasDbContext dbContext,
+        Guid? organizationId,
+        string? name,
+        string? title,
+        IReadOnlyList<RequirementDefinitionRequest>? requirements,
+        CancellationToken cancellationToken,
+        bool requireRequirements = true)
+    {
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(title))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Template name and title are required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (organizationId.HasValue)
+        {
+            var organizationExists = await dbContext.Organizations.IgnoreQueryFilters()
+                .AnyAsync(item => item.Id == organizationId.Value && item.DeletedAt == null, cancellationToken);
+            if (!organizationExists)
+            {
+                return EndpointHelpers.Problem("organization_not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+        }
+
+        if (requirements is null)
+        {
+            return requireRequirements
+                ? EndpointHelpers.Problem("validation_failed", "At least one requirement is required.", StatusCodes.Status422UnprocessableEntity)
+                : null;
+        }
+
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var requirement in requirements)
+        {
+            if (string.IsNullOrWhiteSpace(requirement.Key)
+                || string.IsNullOrWhiteSpace(requirement.Label)
+                || requirement.DisplayOrder < 0)
+            {
+                return EndpointHelpers.Problem("validation_failed", "Each requirement needs key, label and a non-negative display order.", StatusCodes.Status422UnprocessableEntity);
+            }
+            if (!Enum.IsDefined(requirement.Type))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Requirement type is invalid.", StatusCodes.Status422UnprocessableEntity);
+            }
+            if (!keys.Add(requirement.Key.Trim()))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Requirement keys must be unique within a template.", StatusCodes.Status422UnprocessableEntity);
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task<bool> TemplateNameExistsAsync(
+        AtlasDbContext dbContext,
+        Guid? organizationId,
+        string name,
+        Guid? excludingTemplateId,
+        CancellationToken cancellationToken)
+    {
+        return await dbContext.Templates.IgnoreQueryFilters()
+            .AnyAsync(item => item.DeletedAt == null
+                && item.Id != excludingTemplateId
+                && item.OrganizationId == organizationId
+                && item.Name.ToLower() == name.ToLower(),
+                cancellationToken);
+    }
+
+    private static JsonElement ParseJsonOrEmpty(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return JsonSerializer.Deserialize<JsonElement>("{}");
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<JsonElement>(json, EndpointHelpers.JsonOptions);
+        }
+        catch (JsonException)
+        {
+            return JsonSerializer.Deserialize<JsonElement>("{}");
+        }
+    }
+
     private static async Task<PlatformOrganizationResponse> ToPlatformOrganizationResponseAsync(
         AtlasDbContext dbContext,
         IEntitlementService entitlements,
@@ -2303,6 +2831,61 @@ public sealed record PlatformSettingResponse(
     string ValueJson,
     bool IsSecret,
     DateTimeOffset UpdatedAt);
+
+public sealed record CreatePlatformTemplateRequest(
+    Guid? OrganizationId,
+    string Name,
+    string? Category,
+    string? Description,
+    string Title,
+    string? Instructions,
+    JsonElement? Settings,
+    IReadOnlyList<RequirementDefinitionRequest> Requirements,
+    bool PublishImmediately);
+
+public sealed record UpdatePlatformTemplateRequest(
+    Guid? OrganizationId,
+    string? Name,
+    string? Category,
+    string? Description,
+    TemplateStatus? Status,
+    string? Title,
+    string? Instructions,
+    JsonElement? Settings,
+    IReadOnlyList<RequirementDefinitionRequest>? Requirements);
+
+public sealed record PlatformTemplateResponse(
+    Guid Id,
+    Guid? OrganizationId,
+    string? OrganizationName,
+    bool IsGlobal,
+    string Name,
+    string? Category,
+    string? Description,
+    TemplateStatus Status,
+    Guid? CurrentVersionId,
+    Guid? VersionId,
+    int? VersionNumber,
+    string? Title,
+    string? Instructions,
+    JsonElement Settings,
+    DateTimeOffset? PublishedAt,
+    IReadOnlyList<PlatformTemplateRequirementResponse> Requirements,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset? DeletedAt);
+
+public sealed record PlatformTemplateRequirementResponse(
+    Guid Id,
+    string Key,
+    RequirementType Type,
+    string Label,
+    string? Description,
+    bool Required,
+    int DisplayOrder,
+    JsonElement Configuration,
+    JsonElement Validation,
+    JsonElement? Condition);
 
 public sealed record CreatePlatformOrganizationRequest(
     string Name,

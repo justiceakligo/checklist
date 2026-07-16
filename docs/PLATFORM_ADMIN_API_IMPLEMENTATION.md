@@ -420,6 +420,151 @@ Default pricing:
 
 The platform admin console should expose a safe plan editor or a structured JSON editor with validation. Do not require code deploys for pricing changes.
 
+## Checklist Templates
+
+Use these endpoints for platform-admin CRUD of the global checklist library and any organization-owned templates.
+
+Read access: Owner, Admin, Support.  
+Write access: Owner, Admin.
+
+Global library templates have `organizationId: null` and `isGlobal: true`.
+
+### GET `/v1/platform/templates`
+
+Query params:
+
+```text
+page
+pageSize
+q
+status=Draft | Published | Archived
+organizationId
+globalOnly=true
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "66666666-6666-6666-6666-666666666666",
+      "organizationId": null,
+      "organizationName": null,
+      "isGlobal": true,
+      "name": "Vendor Insurance Renewal",
+      "category": "Property Management",
+      "description": "Collect updated insurance, expiry dates, WSIB, and trade licence.",
+      "status": "Published",
+      "currentVersionId": "77777777-7777-7777-7777-777777777777",
+      "versionId": "77777777-7777-7777-7777-777777777777",
+      "versionNumber": 1,
+      "title": "Vendor Insurance Renewal",
+      "instructions": "Use when vendors need to renew compliance documents.",
+      "settings": {
+        "industry": "Property Management",
+        "rating": 5,
+        "country": "Canada",
+        "tags": ["insurance", "vendor", "compliance"]
+      },
+      "publishedAt": "2026-07-16T18:00:00Z",
+      "requirements": [
+        {
+          "id": "88888888-8888-8888-8888-888888888888",
+          "key": "insurance_certificate",
+          "type": "File",
+          "label": "Insurance certificate",
+          "description": "Upload the current certificate of insurance.",
+          "required": true,
+          "displayOrder": 1,
+          "configuration": {},
+          "validation": {},
+          "condition": null
+        }
+      ],
+      "createdAt": "2026-07-16T18:00:00Z",
+      "updatedAt": "2026-07-16T18:00:00Z",
+      "deletedAt": null
+    }
+  ],
+  "page": 1,
+  "pageSize": 25,
+  "total": 1
+}
+```
+
+### GET `/v1/platform/templates/{id}`
+
+Returns the same `PlatformTemplateResponse` shape with full editable requirements.
+
+### POST `/v1/platform/templates`
+
+Create a global template by sending `organizationId: null`. Create an org-owned template by sending an organization id.
+
+```json
+{
+  "organizationId": null,
+  "name": "Vendor Insurance Renewal",
+  "category": "Property Management",
+  "description": "Collect updated insurance and compliance documents.",
+  "title": "Vendor Insurance Renewal",
+  "instructions": "Please upload current compliance documents.",
+  "settings": {
+    "industry": "Property Management",
+    "rating": 5,
+    "country": "Canada",
+    "tags": ["insurance", "vendor", "compliance"],
+    "searchTerms": ["certificate of insurance", "wsib", "licence"]
+  },
+  "requirements": [
+    {
+      "key": "insurance_certificate",
+      "type": "File",
+      "label": "Insurance certificate",
+      "description": "Upload the current certificate of insurance.",
+      "required": true,
+      "displayOrder": 1,
+      "configuration": {},
+      "validation": {},
+      "condition": null
+    }
+  ],
+  "publishImmediately": true
+}
+```
+
+### PUT `/v1/platform/templates/{id}`
+
+All fields are optional. Updating `title`, `instructions`, `settings`, or `requirements` creates a new draft version. Use publish after editing to make the newest version live.
+
+```json
+{
+  "name": "Vendor Insurance Renewal",
+  "category": "Property Management",
+  "description": "Collect vendor compliance documents.",
+  "status": "Draft",
+  "title": "Vendor Insurance Renewal",
+  "instructions": "Please upload current compliance documents.",
+  "settings": {
+    "industry": "Property Management",
+    "rating": 5
+  },
+  "requirements": []
+}
+```
+
+### POST `/v1/platform/templates/{id}/publish`
+
+Publishes the newest version and sets `status` to `Published`.
+
+### POST `/v1/platform/templates/{id}/archive`
+
+Sets `status` to `Archived`.
+
+### DELETE `/v1/platform/templates/{id}`
+
+Soft-deletes the template and returns `204`. Deleted templates are hidden from both admin list and customer library search.
+
 ## Organizations
 
 Self-serve signup creates Active organizations. Platform approval is not required for Free usage.
@@ -904,6 +1049,15 @@ Settings
 - GET /v1/platform/settings/{id}
 - PUT /v1/platform/settings/{id}
 - DELETE /v1/platform/settings/{id}
+
+Checklist Templates
+- GET /v1/platform/templates
+- POST /v1/platform/templates
+- GET /v1/platform/templates/{id}
+- PUT /v1/platform/templates/{id}
+- POST /v1/platform/templates/{id}/publish
+- POST /v1/platform/templates/{id}/archive
+- DELETE /v1/platform/templates/{id}
 
 Organizations
 - GET /v1/platform/organizations
