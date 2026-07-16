@@ -2,6 +2,8 @@
 
 This file is the handoff for the platform admin console: staff, settings, organizations, org requests, developer production approval, revenue, metrics, and audit.
 
+Platform overview dashboard field mapping is documented in [PLATFORM_ADMIN_DASHBOARD_DATA.md](PLATFORM_ADMIN_DASHBOARD_DATA.md).
+
 Customer dashboard, recipient portal, and developer endpoints are documented in [FRONTEND_API_IMPLEMENTATION.md](FRONTEND_API_IMPLEMENTATION.md).
 
 Frontend deployment is documented in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).

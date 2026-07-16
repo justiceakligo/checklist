@@ -39,6 +39,8 @@ public sealed class AtlasDbContext(
     public DbSet<PlatformOrganizationInterest> PlatformOrganizationInterests => Set<PlatformOrganizationInterest>();
     public DbSet<PlatformRevenueEvent> PlatformRevenueEvents => Set<PlatformRevenueEvent>();
     public DbSet<PlatformAuditEvent> PlatformAuditEvents => Set<PlatformAuditEvent>();
+    public DbSet<AnalyticsEvent> AnalyticsEvents => Set<AnalyticsEvent>();
+    public DbSet<InvestorReport> InvestorReports => Set<InvestorReport>();
 
     private Guid? CurrentOrganizationId => tenantContext.OrganizationId;
 
@@ -55,6 +57,7 @@ public sealed class AtlasDbContext(
         ConfigureDeveloperAndAudit(modelBuilder);
         ConfigureAdminSettings(modelBuilder);
         ConfigurePlatform(modelBuilder);
+        ConfigureAnalytics(modelBuilder);
         ConfigureQueryFilters(modelBuilder);
         ConfigureIds(modelBuilder);
     }
@@ -1216,6 +1219,46 @@ public sealed class AtlasDbContext(
         });
     }
 
+    private static void ConfigureAnalytics(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<AnalyticsEvent>(entity =>
+        {
+            entity.ToTable("analytics_events");
+            entity.HasIndex(e => new { e.OrganizationId, e.OccurredAt }).HasDatabaseName("ix_analytics_events_org_occurred");
+            entity.HasIndex(e => new { e.EventName, e.OccurredAt }).HasDatabaseName("ix_analytics_events_name_occurred");
+            entity.HasIndex(e => e.ChecklistId).HasDatabaseName("ix_analytics_events_checklist");
+            entity.HasIndex(e => e.TemplateId).HasDatabaseName("ix_analytics_events_template");
+            entity.HasIndex(e => e.RecipientId).HasDatabaseName("ix_analytics_events_recipient");
+            entity.Property(e => e.EventName).HasMaxLength(160).IsRequired();
+            entity.Property(e => e.SessionId).HasMaxLength(160);
+            entity.Property(e => e.PropertiesJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.OccurredAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ReceivedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<InvestorReport>(entity =>
+        {
+            entity.ToTable("investor_reports");
+            entity.HasIndex(e => new { e.ReportType, e.Period }).HasDatabaseName("ix_investor_reports_type_period");
+            entity.HasIndex(e => new { e.RequestedByStaffId, e.CreatedAt }).HasDatabaseName("ix_investor_reports_staff_created");
+            entity.Property(e => e.ReportType).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.Period).HasMaxLength(32).IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ResultJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CompletedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.RequestedByStaff)
+                .WithMany()
+                .HasForeignKey(e => e.RequestedByStaffId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+    }
+
     private void ConfigureQueryFilters(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<Organization>()
@@ -1311,6 +1354,8 @@ public sealed class AtlasDbContext(
         modelBuilder.Entity<AdminSetting>()
             .HasQueryFilter(e => e.OrganizationId == null
                 || e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<AnalyticsEvent>()
+            .HasQueryFilter(e => e.OrganizationId == CurrentOrganizationId);
     }
 
     private static void ConfigureIds(ModelBuilder modelBuilder)
@@ -1365,6 +1410,14 @@ public sealed class AtlasDbContext(
                         revenueEvent.CreatedAt = revenueEvent.CreatedAt == default ? now : revenueEvent.CreatedAt;
                         revenueEvent.UpdatedAt = now;
                         break;
+                    case AnalyticsEvent analyticsEvent:
+                        analyticsEvent.ReceivedAt = analyticsEvent.ReceivedAt == default ? now : analyticsEvent.ReceivedAt;
+                        analyticsEvent.OccurredAt = analyticsEvent.OccurredAt == default ? now : analyticsEvent.OccurredAt;
+                        break;
+                    case InvestorReport investorReport:
+                        investorReport.CreatedAt = investorReport.CreatedAt == default ? now : investorReport.CreatedAt;
+                        investorReport.UpdatedAt = now;
+                        break;
                 }
             }
             else if (entry.State == EntityState.Modified)
@@ -1391,6 +1444,9 @@ public sealed class AtlasDbContext(
                         break;
                     case PlatformRevenueEvent revenueEvent:
                         revenueEvent.UpdatedAt = now;
+                        break;
+                    case InvestorReport investorReport:
+                        investorReport.UpdatedAt = now;
                         break;
                 }
             }

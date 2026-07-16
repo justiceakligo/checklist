@@ -4,6 +4,8 @@ This file is the customer dashboard, recipient portal, and developer handoff for
 
 Platform admin endpoints are documented separately in [PLATFORM_ADMIN_API_IMPLEMENTATION.md](PLATFORM_ADMIN_API_IMPLEMENTATION.md).
 
+Customer analytics, platform analytics, and Investor & Board API flows are documented in [ANALYTICS_AND_INVESTOR_FRONTEND_HANDOFF.md](ANALYTICS_AND_INVESTOR_FRONTEND_HANDOFF.md).
+
 Frontend deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
 
 Recipient autosave, duplicate-send protection, and the "Previously Submitted" document flow are documented in [PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md](PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md).
@@ -37,6 +39,8 @@ VITE_TURNSTILE_SITE_KEY=0x4AAAAAAD3PDppjZsCXGkx4
 - Dashboard auth cookie: `__Host-atlas_dashboard`.
 - Recipient auth cookie: `__Host-atlas_recipient`.
 - Include `X-Atlas-Organization-Id` when the signed-in user belongs to more than one org.
+- After login or signup, call `GET /v1/me`, store `currentOrganizationId`, and include it on all dashboard-scoped calls.
+- If `GET /v1/dashboard/summary` or `POST /v1/auth/email-verification/request` returns `401 authentication_required`, the browser did not send the dashboard cookie. Check `credentials: "include"`, HTTPS, and that the cookie exists for `api.reqara.com`.
 - Server integrations use `X-Atlas-Key`. Never put API keys in browser code.
 - CORS is currently open for rapid integration. Tighten this before final hardening.
 
@@ -44,12 +48,14 @@ VITE_TURNSTILE_SITE_KEY=0x4AAAAAAD3PDppjZsCXGkx4
 const API_BASE_URL = import.meta.env.VITE_ATLAS_API_BASE_URL ?? "https://api.reqara.com";
 
 export async function api(path: string, init: RequestInit = {}) {
+  const organizationId = window.localStorage.getItem("reqara.currentOrganizationId");
   const res = await fetch(`${API_BASE_URL}${path}`, {
     credentials: "include",
     ...init,
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
+      ...(organizationId ? { "X-Atlas-Organization-Id": organizationId } : {}),
       ...(init.headers ?? {})
     }
   });

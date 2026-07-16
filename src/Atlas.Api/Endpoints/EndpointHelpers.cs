@@ -30,6 +30,14 @@ internal static class EndpointHelpers
     {
         if (!TryGetTenant(tenantContext, out organizationId, out problem))
         {
+            if (tenantContext.ActorType is null)
+            {
+                problem = Problem(
+                    "authentication_required",
+                    "Dashboard authentication or an API key is required. Browser calls must include credentials so the dashboard cookie is sent.",
+                    StatusCodes.Status401Unauthorized);
+            }
+
             return false;
         }
 

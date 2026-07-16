@@ -186,3 +186,10 @@ public enum UserAuthTokenPurpose : short
     EmailVerification = 1,
     PasswordReset = 2
 }
+
+public enum InvestorReportStatus : short
+{
+    Processing = 1,
+    Completed = 2,
+    Failed = 3
+}

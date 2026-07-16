@@ -22,6 +22,43 @@ fetch("https://api.reqara.com/v1/me", {
 });
 ```
 
+Recommended frontend auth bootstrap:
+
+```ts
+const API_BASE_URL = import.meta.env.VITE_ATLAS_API_BASE_URL ?? "https://api.reqara.com";
+
+export async function loadMe() {
+  const res = await fetch(`${API_BASE_URL}/v1/me`, {
+    credentials: "include",
+    headers: { Accept: "application/json" }
+  });
+  if (!res.ok) throw await res.json();
+  const me = await res.json();
+  if (me.currentOrganizationId) {
+    localStorage.setItem("reqara.currentOrganizationId", me.currentOrganizationId);
+  }
+  return me;
+}
+
+export async function dashboardFetch(path: string, init: RequestInit = {}) {
+  const organizationId = localStorage.getItem("reqara.currentOrganizationId");
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    credentials: "include",
+    ...init,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(organizationId ? { "X-Atlas-Organization-Id": organizationId } : {}),
+      ...(init.headers ?? {})
+    }
+  });
+  if (!res.ok) throw await res.json();
+  return res.status === 204 ? null : res.json();
+}
+```
+
+If a signed-in dashboard call returns `401 authentication_required`, the request did not include a valid `__Host-atlas_dashboard` cookie. Fix the frontend request first; do not retry as an anonymous public call.
+
 ## Pricing Meaning
 
 When the website says:
@@ -165,7 +202,7 @@ Blocked action error:
 
 ### POST `/v1/auth/email-verification/request`
 
-Requires dashboard cookie.
+Requires dashboard cookie. Send it with `credentials: "include"`. The backend can infer the first active organization from the cookie, but the frontend should still include `X-Atlas-Organization-Id` from `/v1/me` for consistency.
 
 Request body:
 
@@ -482,4 +519,3 @@ OTP errors:
 - Password reset request always shows generic success.
 - Recipient OTP screen appears only when `otpRequired` is true and `otpVerified` is false.
 - Pricing copy says "sent checklists" or explains the recipient-send meaning in details.
-
