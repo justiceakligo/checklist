@@ -9,8 +9,24 @@ Customer dashboard and recipient portal endpoints are documented in [FRONTEND_AP
 Base API origin:
 
 ```text
-Production: https://<your-api-origin>
-Local: https://localhost:<port>
+Production: https://api.reqara.com
+Production health: https://api.reqara.com/v1/health
+Local: https://localhost:<port> or http://localhost:<port>
+```
+
+Recommended platform-admin environment variable:
+
+```text
+VITE_ATLAS_API_BASE_URL=https://api.reqara.com
+```
+
+Current production settings in the database:
+
+```text
+email.provider=resend
+Email:Resend.From=requests@reqara.com
+Email:Resend.FromName=Reqara
+app.baseUrl=https://atlaschecklist.lovable.app
 ```
 
 All JSON examples use the actual wire format expected by the API:
@@ -25,6 +41,18 @@ All JSON examples use the actual wire format expected by the API:
 Platform auth uses the same underlying HttpOnly cookie name as dashboard auth: `__Host-atlas_dashboard`.
 
 Implementation recommendation: run the platform admin console on a separate subdomain or tell admins that logging into platform admin replaces their organization-dashboard session in the same browser.
+
+Cross-origin note: platform auth is cookie-based. The production API currently allows any browser origin with credentials so the admin app can integrate quickly. Tighten this to the deployed frontend/admin origins before final production hardening.
+
+Production health check:
+
+```ts
+const API_BASE_URL = import.meta.env.VITE_ATLAS_API_BASE_URL ?? "https://api.reqara.com";
+
+const response = await fetch(`${API_BASE_URL}/v1/health`, {
+  headers: { "Accept": "application/json" }
+});
+```
 
 ## Error Shape
 
@@ -121,9 +149,9 @@ type PlatformSession = {
 
 Operational scenario:
 
-1. Set `PlatformAdmin__BootstrapKey` in production environment.
+1. Retrieve the production bootstrap key from the server-only production config.
 2. Open a private bootstrap screen.
-3. Submit `POST /v1/platform/bootstrap`.
+3. Submit `POST https://api.reqara.com/v1/platform/bootstrap`.
 4. API creates the first `Owner`, signs them in, and refuses future bootstrap once any platform staff exists.
 5. Remove or rotate the bootstrap key after the owner exists.
 

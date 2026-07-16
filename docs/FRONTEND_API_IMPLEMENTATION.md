@@ -9,8 +9,31 @@ Platform-operator endpoints are intentionally documented separately in [PLATFORM
 Base API origin:
 
 ```text
-Production: https://<your-api-origin>
-Local: https://localhost:<port>
+Production: https://api.reqara.com
+Production health: https://api.reqara.com/v1/health
+Local: https://localhost:<port> or http://localhost:<port>
+```
+
+Recommended frontend environment variable:
+
+```text
+VITE_ATLAS_API_BASE_URL=https://api.reqara.com
+```
+
+Current recipient-link frontend origin in the database:
+
+```text
+app.baseUrl=https://atlaschecklist.lovable.app
+```
+
+`app.baseUrl` is not the API origin. The backend uses it only when generating recipient email links like `/c/{token}`. Platform admins can CRUD it through platform settings, and organization admins can override it through organization admin settings.
+
+Current production email sender settings in the database:
+
+```text
+email.provider=resend
+Email:Resend.From=requests@reqara.com
+Email:Resend.FromName=Reqara
 ```
 
 All JSON examples use the actual wire format expected by the API:
@@ -31,7 +54,9 @@ Organization-scoped dashboard requests should include `X-Atlas-Organization-Id` 
 Server-to-server calls can use `X-Atlas-Key` instead of the dashboard cookie. Do not put API keys in browser code.
 
 ```ts
-await fetch("/v1/actions", {
+const API_BASE_URL = import.meta.env.VITE_ATLAS_API_BASE_URL ?? "https://api.reqara.com";
+
+await fetch(`${API_BASE_URL}/v1/actions`, {
   method: "GET",
   credentials: "include",
   headers: {
@@ -40,6 +65,8 @@ await fetch("/v1/actions", {
   }
 });
 ```
+
+Cross-origin note: dashboard and recipient auth are cookie-based. The production API currently allows any browser origin with credentials so the frontend can integrate quickly. Tighten this to the deployed frontend/admin origins before final production hardening.
 
 ## Error Shape
 
@@ -112,6 +139,12 @@ Marketing/public:
 ### GET `/v1/health`
 
 Use for deployment checks and simple frontend diagnostics.
+
+Full production URL:
+
+```text
+GET https://api.reqara.com/v1/health
+```
 
 Response:
 
@@ -339,7 +372,7 @@ Request:
 {
   "scope": "Organization",
   "organizationId": "22222222-2222-2222-2222-222222222222",
-  "value": "https://app.projectatlas.app",
+  "value": "https://atlaschecklist.lovable.app",
   "isSecret": false,
   "updatedByUserId": "11111111-1111-1111-1111-111111111111"
 }
@@ -360,7 +393,7 @@ Response:
   "scope": "Organization",
   "category": "app",
   "key": "baseUrl",
-  "valueJson": "\"https://app.projectatlas.app\"",
+  "valueJson": "\"https://atlaschecklist.lovable.app\"",
   "isSecret": false,
   "updatedAt": "2026-07-15T19:00:00Z"
 }
@@ -973,7 +1006,7 @@ Response:
 UI scenario:
 
 1. Recipient opens an email link like `/c/{token}`.
-2. Frontend calls `GET /c/{token}` on the API origin.
+2. Frontend calls `GET https://api.reqara.com/c/{token}`.
 3. API validates the token, creates the `__Host-atlas_recipient` cookie, and returns whether OTP is required.
 4. If `otpRequired` is true and `otpVerified` is false, show OTP screen.
 5. After OTP verification, load `GET /v1/recipient/checklist`.

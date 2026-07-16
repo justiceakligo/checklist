@@ -130,7 +130,7 @@ public static class RecipientEndpoints
             {
                 HttpOnly = true,
                 Secure = true,
-                SameSite = SameSiteMode.Strict,
+                SameSite = SameSiteMode.None,
                 Path = "/",
                 Expires = session.ExpiresAt
             });

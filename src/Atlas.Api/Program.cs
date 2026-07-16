@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Diagnostics;
 using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
+const string PermissiveCorsPolicy = "PermissiveCors";
 
 builder.Services.AddProblemDetails();
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
@@ -13,7 +14,7 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
     {
         options.Cookie.Name = "__Host-atlas_dashboard";
         options.Cookie.HttpOnly = true;
-        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.Cookie.SameSite = SameSiteMode.None;
         options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
         options.SlidingExpiration = true;
         options.ExpireTimeSpan = TimeSpan.FromHours(8);
@@ -28,6 +29,18 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
             return Task.CompletedTask;
         };
     });
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(PermissiveCorsPolicy, policy =>
+    {
+        policy
+            .SetIsOriginAllowed(_ => true)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials()
+            .SetPreflightMaxAge(TimeSpan.FromHours(1));
+    });
+});
 builder.Services.AddAuthorization();
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
@@ -73,6 +86,7 @@ if (!app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseCors(PermissiveCorsPolicy);
 app.UseAtlasSecurityHeaders();
 app.UseAuthentication();
 app.UseAuthorization();
