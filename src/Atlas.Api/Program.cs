@@ -153,6 +153,7 @@ if (!app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseStaticFiles();
 app.UseCors(PermissiveCorsPolicy);
 app.UseRateLimiter();
 app.UseAtlasSecurityHeaders();

@@ -16,6 +16,7 @@ public sealed class ResendEmailService(
     ILogger<ResendEmailService> logger) : IEmailService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private const string DefaultEmailLogoUrl = "https://api.reqara.com/brand/reqara-email-logo.png";
 
     public async Task<EmailSendResult> SendAsync(
         string toEmail,
@@ -59,6 +60,12 @@ public sealed class ResendEmailService(
             ?? configuration["Email:ReplyTo"]
             ?? configuration["EMAIL_REPLY_TO"]
             ?? "support@example.com";
+        var logoUrl = await GetSettingAsync("Email:Brand", "LogoUrl", cancellationToken)
+            ?? configuration["Email:Brand:LogoUrl"]
+            ?? configuration["EMAIL_BRAND_LOGO_URL"];
+        var effectiveHtmlBody = string.IsNullOrWhiteSpace(logoUrl)
+            ? htmlBody
+            : htmlBody?.Replace(DefaultEmailLogoUrl, logoUrl.Trim(), StringComparison.Ordinal);
 
         var from = string.IsNullOrWhiteSpace(configuredFromName)
             ? configuredFromEmail
@@ -70,7 +77,7 @@ public sealed class ResendEmailService(
             to = new[] { toEmail },
             subject,
             text = textBody,
-            html = htmlBody ?? textBody,
+            html = effectiveHtmlBody ?? textBody,
             reply_to = replyTo,
             headers = headers is { Count: > 0 } ? headers : null
         };

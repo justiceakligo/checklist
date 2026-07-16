@@ -7,6 +7,7 @@ internal sealed record TransactionalEmail(string Subject, string TextBody, strin
 internal static class TransactionalEmailTemplates
 {
     private const string BrandName = "Reqara";
+    internal const string DefaultLogoUrl = "https://api.reqara.com/brand/reqara-email-logo.png";
 
     public static TransactionalEmail AccountCreated(
         string recipientFirstName,
@@ -355,7 +356,14 @@ internal static class TransactionalEmailTemplates
                     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:600px;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
                       <tr>
                         <td style="padding:22px 24px;border-bottom:1px solid #e5e7eb">
-                          <div style="font-size:14px;font-weight:800;letter-spacing:.04em;color:#2563eb;text-transform:uppercase">{Html(BrandName)}</div>
+                          <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 12px 0">
+                            <tr>
+                              <td style="vertical-align:middle;padding:0 10px 0 0">
+                                <img src="{HtmlAttribute(DefaultLogoUrl)}" width="36" height="36" alt="{HtmlAttribute(BrandName)}" style="display:block;border:0;outline:none;text-decoration:none;width:36px;height:36px">
+                              </td>
+                              <td style="vertical-align:middle;font-size:14px;font-weight:800;letter-spacing:.04em;color:#2563eb;text-transform:uppercase">{Html(BrandName)}</td>
+                            </tr>
+                          </table>
                           <h1 style="margin:12px 0 0 0;font-size:24px;line-height:1.25;color:#111827">{Html(heading)}</h1>
                         </td>
                       </tr>

@@ -258,6 +258,7 @@ email.provider = "resend"
 Email:Resend.From = "requests@reqara.com"
 Email:Resend.FromName = "Reqara"
 Email:Resend.ApiKey = secret
+Email:Brand.LogoUrl = "https://api.reqara.com/brand/reqara-email-logo.png"
 DigitalOceanSpaces.ServiceUrl = "https://tor1.digitaloceanspaces.com"
 DigitalOceanSpaces.Region = "tor1"
 DigitalOceanSpaces.BucketName = "reqara-bucket"
