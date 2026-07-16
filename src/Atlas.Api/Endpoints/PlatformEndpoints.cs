@@ -151,6 +151,8 @@ public static class PlatformEndpoints
     private static void MapStaff(RouteGroupBuilder group)
     {
         group.MapGet("/staff", async (
+            int? page,
+            int? pageSize,
             PlatformStaffStatus? status,
             AtlasDbContext dbContext,
             HttpContext httpContext,
@@ -168,11 +170,16 @@ public static class PlatformEndpoints
                 query = query.Where(item => item.Status == status.Value);
             }
 
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
             var staff = await query
                 .OrderBy(item => item.FullName)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => ToStaffResponse(item))
                 .ToListAsync(cancellationToken);
-            return Results.Ok(new { items = staff });
+            return Results.Ok(new { items = staff, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
 
         group.MapPost("/staff", async (
@@ -543,6 +550,8 @@ public static class PlatformEndpoints
     private static void MapOrganizations(RouteGroupBuilder group)
     {
         group.MapGet("/organizations", async (
+            int? page,
+            int? pageSize,
             string? q,
             OrganizationStatus? status,
             AtlasDbContext dbContext,
@@ -568,14 +577,21 @@ public static class PlatformEndpoints
                 query = query.Where(item => item.Name.ToLower().Contains(search) || item.Slug.ToLower().Contains(search));
             }
 
-            var organizations = await query.OrderByDescending(item => item.CreatedAt).ToListAsync(cancellationToken);
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
+            var organizations = await query
+                .OrderByDescending(item => item.CreatedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
+                .ToListAsync(cancellationToken);
             var responses = new List<PlatformOrganizationResponse>();
             foreach (var organization in organizations)
             {
                 responses.Add(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
             }
 
-            return Results.Ok(new { items = responses });
+            return Results.Ok(new { items = responses, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
 
         group.MapPost("/organizations", async (
@@ -1016,6 +1032,8 @@ public static class PlatformEndpoints
     private static void MapInterests(RouteGroupBuilder group)
     {
         group.MapGet("/organization-requests", async (
+            int? page,
+            int? pageSize,
             OrganizationInterestStatus? status,
             Guid? assignedStaffId,
             string? q,
@@ -1046,13 +1064,21 @@ public static class PlatformEndpoints
                     || item.ContactName.ToLower().Contains(search));
             }
 
-            var interests = await query.OrderByDescending(item => item.CreatedAt)
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
+            var interests = await query
+                .OrderByDescending(item => item.CreatedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => ToInterestResponse(item))
                 .ToListAsync(cancellationToken);
-            return Results.Ok(new { items = interests });
+            return Results.Ok(new { items = interests, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
 
         group.MapGet("/interests", async (
+            int? page,
+            int? pageSize,
             OrganizationInterestStatus? status,
             Guid? assignedStaffId,
             string? q,
@@ -1083,10 +1109,16 @@ public static class PlatformEndpoints
                     || item.ContactName.ToLower().Contains(search));
             }
 
-            var interests = await query.OrderByDescending(item => item.CreatedAt)
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
+            var interests = await query
+                .OrderByDescending(item => item.CreatedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => ToInterestResponse(item))
                 .ToListAsync(cancellationToken);
-            return Results.Ok(new { items = interests });
+            return Results.Ok(new { items = interests, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
 
         group.MapPost("/interests", async (
@@ -1331,6 +1363,8 @@ public static class PlatformEndpoints
     private static void MapRevenue(RouteGroupBuilder group)
     {
         group.MapGet("/revenue-events", async (
+            int? page,
+            int? pageSize,
             Guid? organizationId,
             PlatformRevenueEventType? type,
             DateTimeOffset? from,
@@ -1346,11 +1380,16 @@ public static class PlatformEndpoints
             }
 
             var query = FilterRevenue(dbContext.PlatformRevenueEvents.IgnoreQueryFilters().AsNoTracking(), organizationId, type, from, to);
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = await query.CountAsync(cancellationToken);
             var events = await query
                 .OrderByDescending(item => item.OccurredAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => ToRevenueResponse(item))
                 .ToListAsync(cancellationToken);
-            return Results.Ok(new { items = events });
+            return Results.Ok(new { items = events, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
 
         group.MapPost("/revenue-events", async (
@@ -1551,6 +1590,8 @@ public static class PlatformEndpoints
     private static void MapAudit(RouteGroupBuilder group)
     {
         group.MapGet("/audit", async (
+            int? page,
+            int? pageSize,
             Guid? staffId,
             string? eventType,
             DateTimeOffset? from,
@@ -1583,12 +1624,16 @@ public static class PlatformEndpoints
                 query = query.Where(item => item.CreatedAt <= to.Value);
             }
 
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize, max: 250);
+            var total = await query.CountAsync(cancellationToken);
             var events = await query
                 .OrderByDescending(item => item.CreatedAt)
-                .Take(250)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => new PlatformAuditResponse(item.Id, item.StaffId, item.EventType, item.EventData, item.CreatedAt))
                 .ToListAsync(cancellationToken);
-            return Results.Ok(new { items = events });
+            return Results.Ok(new { items = events, page = normalizedPage, pageSize = normalizedPageSize, total });
         });
     }
 

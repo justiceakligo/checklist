@@ -14,6 +14,8 @@ public static class SubmissionEndpoints
         var group = app.MapGroup("/v1/submissions").WithTags("Submissions");
 
         group.MapGet("", async (
+            int? page,
+            int? pageSize,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             CancellationToken cancellationToken) =>
@@ -27,9 +29,14 @@ public static class SubmissionEndpoints
                 return sandboxProblem;
             }
 
-            var submissions = await dbContext.Submissions
-                .AsNoTracking()
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var query = dbContext.Submissions.AsNoTracking();
+            var total = await query.CountAsync(cancellationToken);
+            var submissions = await query
                 .OrderByDescending(item => item.SubmittedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .Select(item => new SubmissionSummaryResponse(
                     item.Id,
                     item.ActionId,
@@ -40,7 +47,13 @@ public static class SubmissionEndpoints
                     item.ReviewedAt))
                 .ToListAsync(cancellationToken);
 
-            return Results.Ok(new { items = submissions });
+            return Results.Ok(new
+            {
+                items = submissions,
+                page = normalizedPage,
+                pageSize = normalizedPageSize,
+                total
+            });
         });
 
         group.MapGet("/{id:guid}", async (

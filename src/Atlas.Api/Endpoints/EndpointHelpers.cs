@@ -106,6 +106,27 @@ internal static class EndpointHelpers
             });
     }
 
+    public static int NormalizePage(int? page)
+    {
+        return page.GetValueOrDefault(1) < 1 ? 1 : page.GetValueOrDefault(1);
+    }
+
+    public static int NormalizePageSize(int? pageSize, int fallback = 25, int max = 100)
+    {
+        var value = pageSize.GetValueOrDefault(fallback);
+        if (value < 1)
+        {
+            return fallback;
+        }
+
+        return Math.Min(value, max);
+    }
+
+    public static int PageSkip(int page, int pageSize)
+    {
+        return (page - 1) * pageSize;
+    }
+
     public static string JsonOrDefault(JsonElement? value, string defaultJson = "{}")
     {
         return value is { ValueKind: not JsonValueKind.Undefined }

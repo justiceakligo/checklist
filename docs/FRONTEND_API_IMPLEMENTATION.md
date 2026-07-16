@@ -104,6 +104,28 @@ Common codes:
 503: email, storage, or provider failure
 ```
 
+## Pagination
+
+List endpoints use:
+
+```text
+page: 1-based, default 1
+pageSize: default 25, max 100 unless noted
+```
+
+Response envelope:
+
+```json
+{
+  "items": [],
+  "page": 1,
+  "pageSize": 25,
+  "total": 148
+}
+```
+
+Dashboard lists with this envelope: `/v1/actions`, `/v1/submissions`.
+
 ## Enums
 
 ```text
@@ -199,13 +221,18 @@ Self-serve organizations do not require platform approval. Signup creates an act
 
 ### POST `/v1/auth/signup`
 
+`organizationSlug` is optional. When omitted, the backend derives a unique slug from the organization name. Accepted aliases:
+
+- full name: `fullName`, `name`, or `firstName` + `lastName`
+- organization name: `organizationName`, `orgName`, `companyName`, or `company`
+- organization slug: `organizationSlug`, `orgSlug`, or `slug`
+
 ```json
 {
   "email": "ollie@northstarstaffing.com",
   "password": "correct-horse-battery-staple",
   "fullName": "Ollie Ed",
   "organizationName": "Northstar Staffing",
-  "organizationSlug": "northstar-staffing",
   "timezone": "America/Toronto",
   "defaultLanguage": "en"
 }
@@ -219,6 +246,19 @@ Self-serve organizations do not require platform approval. Signup creates an act
   "organizationId": "22222222-2222-2222-2222-222222222222",
   "organizationSlug": "northstar-staffing",
   "role": "Owner"
+}
+```
+
+Invalid JSON or body-binding failures return RFC7807:
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/invalid_request_body",
+  "title": "Invalid request body.",
+  "status": 400,
+  "detail": "The request body could not be parsed or did not match the expected JSON contract.",
+  "code": "invalid_request_body",
+  "errors": ["Check Content-Type, JSON syntax, and required request fields."]
 }
 ```
 
@@ -616,6 +656,8 @@ Use `Idempotency-Key` for create.
 
 Sending immediately consumes monthly checklist quota.
 
+When `templateId` is provided, the backend clones the published template requirements into the action. `requirements: []` is valid and means "use the template requirements only." If `templateId` is omitted, provide explicit `requirements`.
+
 ```json
 {
   "templateId": "66666666-6666-6666-6666-666666666666",
@@ -655,7 +697,46 @@ Do not log the full `recipientUrl`. For support, show only the first six token c
 
 ### GET `/v1/actions`
 
-Lists actions.
+Lists actions for dashboard tables.
+
+```text
+GET /v1/actions?page=1&pageSize=25
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "88888888-8888-8888-8888-888888888888",
+      "publicReference": "act_5fd67eb7d9c2a001e3a4",
+      "title": "Onboarding - Jamie Chen",
+      "status": "Sent",
+      "dueAt": "2026-08-15T00:00:00Z",
+      "expiresAt": "2026-09-14T00:00:00Z",
+      "sentAt": "2026-07-16T05:00:00Z",
+      "completedAt": null,
+      "templateId": "66666666-6666-6666-6666-666666666666",
+      "templateName": "Candidate Onboarding",
+      "recipient": {
+        "id": "99999999-9999-9999-9999-999999999999",
+        "name": "Jamie Chen",
+        "email": "jamie.chen@example.com",
+        "status": "Viewed",
+        "lastActivityAt": "2026-07-16T06:30:00Z",
+        "submittedAt": null
+      },
+      "completedRequirementCount": 2,
+      "totalRequirementCount": 8,
+      "createdAt": "2026-07-16T05:00:00Z",
+      "updatedAt": "2026-07-16T06:30:00Z",
+      "lastActivityAt": "2026-07-16T06:30:00Z"
+    }
+  ],
+  "page": 1,
+  "pageSize": 25,
+  "total": 1
+}
+```
 
 ### GET `/v1/actions/{id}`
 
@@ -758,6 +839,29 @@ Only returns URLs for files marked `Clean`.
 
 Submission inbox.
 
+```text
+GET /v1/submissions?page=1&pageSize=25
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "actionId": "88888888-8888-8888-8888-888888888888",
+      "actionRecipientId": "99999999-9999-9999-9999-999999999999",
+      "versionNumber": 1,
+      "status": "Submitted",
+      "submittedAt": "2026-07-16T14:30:00Z",
+      "reviewedAt": null
+    }
+  ],
+  "page": 1,
+  "pageSize": 25,
+  "total": 1
+}
+```
+
 ### GET `/v1/submissions/{id}`
 
 Includes declaration timestamp/IP, content hash, response values, and file IDs.
@@ -797,6 +901,8 @@ Use for data export/package view. Includes title, recipient, responses, files, s
 
 ### POST `/v1/submissions/{id}/accept`
 
+Marks the latest submitted package as accepted, stores `reviewComment`, and marks the action `Completed`.
+
 ```json
 {
   "comment": "All documents accepted."
@@ -804,6 +910,8 @@ Use for data export/package view. Includes title, recipient, responses, files, s
 ```
 
 ### POST `/v1/submissions/{id}/request-changes`
+
+Marks the submitted package `ChangesRequested` and stores `reviewComment`. The recipient can submit a new version.
 
 ```json
 {
@@ -839,12 +947,37 @@ Validates token, creates recipient cookie, sends OTP if required.
 }
 ```
 
+If `otpRequired` is `true` and `otpVerified` is `false`, show the OTP screen immediately. The code has already been emailed.
+
 ### POST `/v1/recipient/access/verify`
 
 ```json
 {
   "code": "123456"
 }
+```
+
+`200`:
+
+```json
+{ "verified": true }
+```
+
+OTP errors:
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/invalid_otp",
+  "title": "Access code is invalid.",
+  "status": 422,
+  "code": "invalid_otp"
+}
+```
+
+```text
+403 otp_required: returned by recipient data endpoints before OTP verification
+410 otp_expired: reopen /c/{token} to send a fresh code
+429 otp_locked: too many attempts
 ```
 
 ### GET `/v1/recipient/checklist`
@@ -890,6 +1023,28 @@ Response includes `retentionUntil`, same shape as dashboard upload intents.
 ### POST `/v1/recipient/uploads/{fileId}/complete`
 
 Marks upload received and pending scan.
+
+```json
+{
+  "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "scanStatus": "Pending",
+  "scanCompletedAt": null
+}
+```
+
+### GET `/v1/recipient/uploads/{fileId}`
+
+Recipient-safe polling endpoint for async scan state.
+
+```json
+{
+  "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  "scanStatus": "Clean",
+  "scanCompletedAt": "2026-07-16T15:05:00Z"
+}
+```
+
+The recipient cannot submit while attached files are `Pending` or `Rejected`; submit returns `409 file_not_available`.
 
 ### DELETE `/v1/recipient/uploads/{fileId}`
 

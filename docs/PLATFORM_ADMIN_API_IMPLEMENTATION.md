@@ -64,6 +64,35 @@ Common codes:
 503 bootstrap_not_configured
 ```
 
+## Pagination
+
+List endpoints use:
+
+```text
+page: 1-based, default 1
+pageSize: default 25, max 100
+```
+
+Response envelope:
+
+```json
+{
+  "items": [],
+  "page": 1,
+  "pageSize": 25,
+  "total": 148
+}
+```
+
+Admin list endpoints with this envelope:
+
+- `GET /v1/platform/staff`
+- `GET /v1/platform/organizations`
+- `GET /v1/platform/organization-requests`
+- `GET /v1/platform/interests`
+- `GET /v1/platform/revenue-events`
+- `GET /v1/platform/audit` (`pageSize` max 250)
+
 ## Enums
 
 ```text
@@ -906,4 +935,3 @@ Metrics and Audit
 - SSO is a Scale plan flag, not an implemented SAML/OIDC login flow yet.
 - Malware scan engine is external; backend supports pending/clean/rejected state and scanner callback.
 - Full e-signature and payments collection are not implemented yet.
-- List pagination is limited; audit is capped at 250, other lists currently return matching records.

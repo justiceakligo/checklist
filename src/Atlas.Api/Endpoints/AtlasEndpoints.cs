@@ -49,20 +49,28 @@ public static class AtlasEndpoints
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
+            var fullName = request.ResolvedFullName();
+            var organizationName = request.ResolvedOrganizationName();
+            var requestedSlug = request.ResolvedOrganizationSlug();
             if (string.IsNullOrWhiteSpace(request.Email)
                 || string.IsNullOrWhiteSpace(request.Password)
-                || string.IsNullOrWhiteSpace(request.FullName)
-                || string.IsNullOrWhiteSpace(request.OrganizationName)
-                || string.IsNullOrWhiteSpace(request.OrganizationSlug))
+                || string.IsNullOrWhiteSpace(fullName)
+                || string.IsNullOrWhiteSpace(organizationName))
             {
                 return EndpointHelpers.Problem(
                     "validation_failed",
-                    "Email, password, full name, organization name and slug are required.",
+                    "Email, password, full name and organization name are required.",
                     StatusCodes.Status422UnprocessableEntity);
             }
 
             var email = request.Email.Trim().ToLowerInvariant();
-            var slug = request.OrganizationSlug.Trim().ToLowerInvariant();
+            var slugWasProvided = !string.IsNullOrWhiteSpace(requestedSlug);
+            var slug = ToOrganizationSlug(slugWasProvided ? requestedSlug! : organizationName);
+            var slugProblem = ValidateOrganizationSlug(slug);
+            if (slugProblem is not null)
+            {
+                return slugProblem;
+            }
 
             var emailExists = await dbContext.Users.IgnoreQueryFilters()
                 .AnyAsync(user => user.Email == email, cancellationToken);
@@ -75,14 +83,19 @@ public static class AtlasEndpoints
                 .AnyAsync(organization => organization.Slug == slug, cancellationToken);
             if (slugExists)
             {
-                return EndpointHelpers.Problem("slug_in_use", "Organization slug is already in use.", StatusCodes.Status409Conflict);
+                if (slugWasProvided)
+                {
+                    return EndpointHelpers.Problem("slug_in_use", "Organization slug is already in use.", StatusCodes.Status409Conflict);
+                }
+
+                slug = await NextAvailableOrganizationSlugAsync(dbContext, slug, cancellationToken);
             }
 
             var now = clock.UtcNow;
             var user = new AppUser
             {
                 Email = email,
-                FullName = request.FullName.Trim(),
+                FullName = fullName.Trim(),
                 CreatedAt = now
             };
             user.PasswordHash = new PasswordHasher<AppUser>().HashPassword(user, request.Password);
@@ -92,7 +105,7 @@ public static class AtlasEndpoints
                 365);
             var organization = new Organization
             {
-                Name = request.OrganizationName.Trim(),
+                Name = organizationName.Trim(),
                 Slug = slug,
                 Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "UTC" : request.Timezone.Trim(),
                 DefaultLanguage = string.IsNullOrWhiteSpace(request.DefaultLanguage) ? "en" : request.DefaultLanguage.Trim(),
@@ -389,6 +402,8 @@ public static class AtlasEndpoints
         var group = v1.MapGroup("/organization-members").WithTags("Organization members");
 
         group.MapGet("", async (
+            int? page,
+            int? pageSize,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             CancellationToken cancellationToken) =>
@@ -796,6 +811,8 @@ public static class AtlasEndpoints
         var group = v1.MapGroup("/actions").WithTags("Actions");
 
         group.MapGet("", async (
+            int? page,
+            int? pageSize,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             CancellationToken cancellationToken) =>
@@ -809,21 +826,33 @@ public static class AtlasEndpoints
                 return sandboxProblem;
             }
 
-            var actions = await dbContext.Actions
-                .AsNoTracking()
-                .OrderByDescending(action => action.CreatedAt)
-                .Select(action => new ActionResponse(
-                    action.Id,
-                    action.PublicReference,
-                    action.Title,
-                    action.Status,
-                    action.DueAt,
-                    action.ExpiresAt,
-                    null,
-                    action.CreatedAt))
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var query = dbContext.Actions.AsNoTracking();
+            var total = await query.CountAsync(cancellationToken);
+            var actionRows = await query
+                .Include(action => action.Template)
+                .Include(action => action.Recipients)
+                .Include(action => action.Requirements)
+                .Include(action => action.Submissions)
+                .ThenInclude(submission => submission.Responses)
+                .Include(action => action.Submissions)
+                .ThenInclude(submission => submission.Files)
+                .OrderByDescending(action => action.UpdatedAt)
+                .ThenByDescending(action => action.CreatedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
                 .ToListAsync(cancellationToken);
 
-            return Results.Ok(new { items = actions });
+            var actions = actionRows.Select(ToActionListItemResponse).ToList();
+
+            return Results.Ok(new
+            {
+                items = actions,
+                page = normalizedPage,
+                pageSize = normalizedPageSize,
+                total
+            });
         });
 
         group.MapGet("/{id:guid}", async (
@@ -2005,6 +2034,149 @@ public static class AtlasEndpoints
         return space > 0 ? trimmed[..space] : trimmed;
     }
 
+    private static ActionListItemResponse ToActionListItemResponse(ChecklistAction action)
+    {
+        var recipient = action.Recipients
+            .OrderBy(item => item.CreatedAt)
+            .FirstOrDefault();
+        var latestSubmission = action.Submissions
+            .OrderByDescending(item => item.SubmittedAt)
+            .ThenByDescending(item => item.VersionNumber)
+            .FirstOrDefault();
+        var completedRequirementCount = latestSubmission is null
+            ? 0
+            : latestSubmission.Responses.Select(item => item.RequirementId)
+                .Concat(latestSubmission.Files.Select(item => item.RequirementId))
+                .Distinct()
+                .Count();
+        var lastActivityAt = new[]
+            {
+                action.UpdatedAt,
+                action.SentAt,
+                action.CompletedAt,
+                recipient?.LastActivityAt,
+                recipient?.SubmittedAt,
+                latestSubmission?.SubmittedAt,
+                latestSubmission?.ReviewedAt
+            }
+            .Where(item => item.HasValue)
+            .Select(item => item!.Value)
+            .DefaultIfEmpty(action.CreatedAt)
+            .Max();
+
+        return new ActionListItemResponse(
+            action.Id,
+            action.PublicReference,
+            action.Title,
+            action.Status,
+            action.DueAt,
+            action.ExpiresAt,
+            action.SentAt,
+            action.CompletedAt,
+            action.TemplateId,
+            action.Template?.Name,
+            recipient is null
+                ? null
+                : new ActionListRecipientResponse(
+                    recipient.Id,
+                    recipient.Name,
+                    recipient.Email,
+                    recipient.Status,
+                    recipient.LastActivityAt,
+                    recipient.SubmittedAt),
+            completedRequirementCount,
+            action.Requirements.Count,
+            action.CreatedAt,
+            action.UpdatedAt,
+            lastActivityAt);
+    }
+
+    private static string ToOrganizationSlug(string value)
+    {
+        var builder = new System.Text.StringBuilder(value.Length);
+        var lastWasHyphen = false;
+
+        foreach (var character in value.Trim().ToLowerInvariant())
+        {
+            var next = (character is >= 'a' and <= 'z') || (character is >= '0' and <= '9')
+                ? character
+                : '-';
+
+            if (next == '-')
+            {
+                if (lastWasHyphen || builder.Length == 0)
+                {
+                    continue;
+                }
+
+                lastWasHyphen = true;
+                builder.Append(next);
+                continue;
+            }
+
+            lastWasHyphen = false;
+            builder.Append(next);
+        }
+
+        var slug = builder.ToString().Trim('-');
+        if (slug.Length > 100)
+        {
+            slug = slug[..100].Trim('-');
+        }
+
+        return string.IsNullOrWhiteSpace(slug) ? "organization" : slug;
+    }
+
+    private static IResult? ValidateOrganizationSlug(string slug)
+    {
+        if (slug.Length is < 2 or > 100)
+        {
+            return EndpointHelpers.Problem("validation_failed", "Organization slug must be between 2 and 100 characters.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (slug.StartsWith('-') || slug.EndsWith('-') || slug.Contains("--", StringComparison.Ordinal))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Organization slug cannot start, end, or contain consecutive hyphens.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        foreach (var character in slug)
+        {
+            if ((character is >= 'a' and <= 'z') || (character is >= '0' and <= '9') || character == '-')
+            {
+                continue;
+            }
+
+            return EndpointHelpers.Problem("validation_failed", "Organization slug can only contain lowercase letters, numbers, and hyphens.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return null;
+    }
+
+    private static async Task<string> NextAvailableOrganizationSlugAsync(
+        AtlasDbContext dbContext,
+        string baseSlug,
+        CancellationToken cancellationToken)
+    {
+        for (var suffix = 2; suffix < 1000; suffix++)
+        {
+            var suffixText = "-" + suffix.ToString(CultureInfo.InvariantCulture);
+            var stemMaxLength = 100 - suffixText.Length;
+            var stem = baseSlug.Length > stemMaxLength
+                ? baseSlug[..stemMaxLength].Trim('-')
+                : baseSlug;
+            var candidate = stem + suffixText;
+
+            var exists = await dbContext.Organizations.IgnoreQueryFilters()
+                .AnyAsync(organization => organization.Slug == candidate, cancellationToken);
+            if (!exists)
+            {
+                return candidate;
+            }
+        }
+
+        throw new InvalidOperationException("Unable to allocate an organization slug.");
+    }
+
     private static string FormatDate(DateTimeOffset? value)
     {
         return value is null
@@ -2027,14 +2199,75 @@ public static class AtlasEndpoints
     private sealed record ChecklistEmailSendResult(Guid RecipientId, string TokenPrefix, EmailSendResult Result);
 }
 
-public sealed record SignupRequest(
-    string Email,
-    string Password,
-    string FullName,
-    string OrganizationName,
-    string OrganizationSlug,
-    string? Timezone,
-    string? DefaultLanguage);
+public sealed class SignupRequest
+{
+    public string? Email { get; init; }
+    public string? Password { get; init; }
+    public string? FullName { get; init; }
+    public string? Name { get; init; }
+    public string? FirstName { get; init; }
+    public string? LastName { get; init; }
+    public string? OrganizationName { get; init; }
+    public string? OrgName { get; init; }
+    public string? CompanyName { get; init; }
+    public string? Company { get; init; }
+    public string? OrganizationSlug { get; init; }
+    public string? OrgSlug { get; init; }
+    public string? Slug { get; init; }
+    public string? Timezone { get; init; }
+    public string? DefaultLanguage { get; init; }
+
+    public string? ResolvedFullName()
+    {
+        if (!string.IsNullOrWhiteSpace(FullName))
+        {
+            return FullName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(Name))
+        {
+            return Name;
+        }
+
+        var combined = string.Join(' ', new[] { FirstName, LastName }.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value!.Trim()));
+        return string.IsNullOrWhiteSpace(combined) ? null : combined;
+    }
+
+    public string? ResolvedOrganizationName()
+    {
+        if (!string.IsNullOrWhiteSpace(OrganizationName))
+        {
+            return OrganizationName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(OrgName))
+        {
+            return OrgName;
+        }
+
+        if (!string.IsNullOrWhiteSpace(CompanyName))
+        {
+            return CompanyName;
+        }
+
+        return string.IsNullOrWhiteSpace(Company) ? null : Company;
+    }
+
+    public string? ResolvedOrganizationSlug()
+    {
+        if (!string.IsNullOrWhiteSpace(OrganizationSlug))
+        {
+            return OrganizationSlug;
+        }
+
+        if (!string.IsNullOrWhiteSpace(OrgSlug))
+        {
+            return OrgSlug;
+        }
+
+        return string.IsNullOrWhiteSpace(Slug) ? null : Slug;
+    }
+}
 
 public sealed record SignupResponse(
     Guid UserId,
@@ -2212,6 +2445,32 @@ public sealed record ActionResponse(
     DateTimeOffset? ExpiresAt,
     string? RecipientUrl,
     DateTimeOffset CreatedAt);
+
+public sealed record ActionListItemResponse(
+    Guid Id,
+    string PublicReference,
+    string Title,
+    ChecklistActionStatus Status,
+    DateTimeOffset? DueAt,
+    DateTimeOffset? ExpiresAt,
+    DateTimeOffset? SentAt,
+    DateTimeOffset? CompletedAt,
+    Guid? TemplateId,
+    string? TemplateName,
+    ActionListRecipientResponse? Recipient,
+    int CompletedRequirementCount,
+    int TotalRequirementCount,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt,
+    DateTimeOffset LastActivityAt);
+
+public sealed record ActionListRecipientResponse(
+    Guid Id,
+    string Name,
+    string Email,
+    ActionRecipientStatus Status,
+    DateTimeOffset? LastActivityAt,
+    DateTimeOffset? SubmittedAt);
 
 public sealed record ActionDetailResponse(
     Guid Id,

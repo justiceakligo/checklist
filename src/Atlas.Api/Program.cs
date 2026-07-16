@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.Routing;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 
@@ -13,6 +14,10 @@ var builder = WebApplication.CreateBuilder(args);
 const string PermissiveCorsPolicy = "PermissiveCors";
 
 builder.Services.AddProblemDetails();
+builder.Services.Configure<RouteHandlerOptions>(options =>
+{
+    options.ThrowOnBadRequest = true;
+});
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
 {
     options.ForwardedHeaders = ForwardedHeaders.XForwardedFor
@@ -113,6 +118,21 @@ app.UseExceptionHandler(errorApp =>
     {
         var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
         var traceId = context.TraceIdentifier;
+        if (exception is BadHttpRequestException badRequest)
+        {
+            await Results.Problem(
+                title: "Invalid request body.",
+                detail: "The request body could not be parsed or did not match the expected JSON contract.",
+                statusCode: badRequest.StatusCode,
+                type: "https://docs.atlas.example/errors/invalid_request_body",
+                extensions: new Dictionary<string, object?>
+                {
+                    ["code"] = "invalid_request_body",
+                    ["traceId"] = traceId,
+                    ["errors"] = new[] { "Check Content-Type, JSON syntax, and required request fields." }
+                }).ExecuteAsync(context);
+            return;
+        }
 
         await Results.Problem(
             title: "An unexpected error occurred.",

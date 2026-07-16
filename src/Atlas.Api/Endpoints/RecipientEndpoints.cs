@@ -28,6 +28,7 @@ public static class RecipientEndpoints
         group.MapGet("/checklist", GetChecklist);
         group.MapPatch("/responses/{requirementId:guid}", AutosaveResponse);
         group.MapPost("/uploads", CreateRecipientUploadIntent);
+        group.MapGet("/uploads/{fileId:guid}", GetRecipientUploadStatus);
         group.MapPost("/uploads/{fileId:guid}/complete", CompleteRecipientUpload);
         group.MapDelete("/uploads/{fileId:guid}", DeleteRecipientUpload);
         group.MapPost("/return-link", RequestReturnLink);
@@ -492,6 +493,31 @@ public static class RecipientEndpoints
             signedUrl.Headers,
             signedUrl.ExpiresAt,
             file.RetentionUntil));
+    }
+
+    private static async Task<IResult> GetRecipientUploadStatus(
+        Guid fileId,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireVerifiedRecipientAsync(dbContext, tenantContext, httpContext, cancellationToken);
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var recipient = access.Recipient!;
+        var file = await dbContext.FileAssets.AsNoTracking().FirstOrDefaultAsync(
+            item => item.Id == fileId && item.ActionRecipientId == recipient.Id,
+            cancellationToken);
+        if (file is null)
+        {
+            return EndpointHelpers.Problem("not_found", "File was not found.", StatusCodes.Status404NotFound);
+        }
+
+        return Results.Ok(new FileStatusResponse(file.Id, file.ScanStatus, file.ScanCompletedAt));
     }
 
     private static async Task<IResult> CompleteRecipientUpload(
