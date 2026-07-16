@@ -4,6 +4,7 @@ using System.Net;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -12,9 +13,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Atlas.Infrastructure.Persistence.Migrations
 {
     [DbContext(typeof(AtlasDbContext))]
-    partial class AtlasDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260716062126_PricingEntitlementsAndRetention")]
+    partial class PricingEntitlementsAndRetention
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -480,18 +483,14 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                         .HasColumnType("timestamptz")
                         .HasColumnName("created_at");
 
-                    b.Property<short>("Environment")
-                        .HasColumnType("smallint")
-                        .HasColumnName("environment");
-
                     b.Property<DateTimeOffset?>("ExpiresAt")
                         .HasColumnType("timestamptz")
                         .HasColumnName("expires_at");
 
                     b.Property<string>("KeyPrefix")
                         .IsRequired()
-                        .HasMaxLength(32)
-                        .HasColumnType("character varying(32)")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
                         .HasColumnName("key_prefix");
 
                     b.Property<DateTimeOffset?>("LastUsedAt")
@@ -1026,27 +1025,6 @@ namespace Atlas.Infrastructure.Persistence.Migrations
                     b.Property<DateTimeOffset?>("DeletedAt")
                         .HasColumnType("timestamptz")
                         .HasColumnName("deleted_at");
-
-                    b.Property<short>("DeveloperAccessStatus")
-                        .HasColumnType("smallint")
-                        .HasColumnName("developer_access_status");
-
-                    b.Property<DateTimeOffset?>("DeveloperProductionApprovedAt")
-                        .HasColumnType("timestamptz")
-                        .HasColumnName("developer_production_approved_at");
-
-                    b.Property<string>("DeveloperProductionNotes")
-                        .HasMaxLength(1000)
-                        .HasColumnType("character varying(1000)")
-                        .HasColumnName("developer_production_notes");
-
-                    b.Property<DateTimeOffset?>("DeveloperProductionRejectedAt")
-                        .HasColumnType("timestamptz")
-                        .HasColumnName("developer_production_rejected_at");
-
-                    b.Property<DateTimeOffset?>("DeveloperProductionRequestedAt")
-                        .HasColumnType("timestamptz")
-                        .HasColumnName("developer_production_requested_at");
 
                     b.Property<Guid?>("LogoFileId")
                         .HasColumnType("uuid")

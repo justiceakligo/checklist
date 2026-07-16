@@ -2,7 +2,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Billing;
 using Atlas.Application.Settings;
+using Atlas.Domain.Enums;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.Extensions.Configuration;
 
@@ -64,6 +66,21 @@ internal static class EndpointHelpers
             || tenantContext.Scopes.Contains(scope[..scope.IndexOf(':', StringComparison.Ordinal)] + ":*");
     }
 
+    public static bool IsSandboxApi(ITenantContext tenantContext)
+    {
+        return tenantContext.ActorType == "api" && tenantContext.Scopes.Contains("env:sandbox");
+    }
+
+    public static IResult? RequireProductionApiOrDashboard(ITenantContext tenantContext)
+    {
+        return IsSandboxApi(tenantContext)
+            ? Problem(
+                "sandbox_key_not_allowed",
+                "Sandbox API keys cannot access production organization data. Use sandbox endpoints or request production API approval.",
+                StatusCodes.Status403Forbidden)
+            : null;
+    }
+
     public static IResult Problem(string code, string title, int statusCode, string? detail = null)
     {
         return Results.Problem(
@@ -72,6 +89,21 @@ internal static class EndpointHelpers
             statusCode: statusCode,
             type: $"https://docs.atlas.example/errors/{code}",
             extensions: new Dictionary<string, object?> { ["code"] = code });
+    }
+
+    public static IResult EntitlementProblem(EntitlementCheckResult result)
+    {
+        return Results.Problem(
+            title: result.Message,
+            statusCode: StatusCodes.Status402PaymentRequired,
+            type: $"https://docs.atlas.example/errors/{result.Code}",
+            extensions: new Dictionary<string, object?>
+            {
+                ["code"] = result.Code,
+                ["plan"] = result.Snapshot.Plan,
+                ["billing"] = result.Snapshot.Billing,
+                ["usage"] = result.Snapshot.Usage
+            });
     }
 
     public static string JsonOrDefault(JsonElement? value, string defaultJson = "{}")
@@ -104,9 +136,14 @@ internal static class EndpointHelpers
 
     public static string NewApiKey(out string keyPrefix)
     {
+        return NewApiKey(ApiKeyEnvironment.Production, out keyPrefix);
+    }
+
+    public static string NewApiKey(ApiKeyEnvironment environment, out string keyPrefix)
+    {
         var prefix = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
         var secret = NewOpaqueToken();
-        keyPrefix = "atl_live_" + prefix;
+        keyPrefix = (environment == ApiKeyEnvironment.Sandbox ? "atl_test_" : "atl_live_") + prefix;
         return $"{keyPrefix}_{secret}";
     }
 

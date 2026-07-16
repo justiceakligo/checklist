@@ -28,6 +28,7 @@ public sealed class ApiKey : Entity, ITenantOwned
     public string KeyPrefix { get; set; } = string.Empty;
     public byte[] SecretHash { get; set; } = Array.Empty<byte>();
     public string[] Scopes { get; set; } = Array.Empty<string>();
+    public ApiKeyEnvironment Environment { get; set; } = ApiKeyEnvironment.Sandbox;
     public DateTimeOffset? LastUsedAt { get; set; }
     public DateTimeOffset? ExpiresAt { get; set; }
     public DateTimeOffset? RevokedAt { get; set; }

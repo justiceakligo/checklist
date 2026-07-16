@@ -175,6 +175,49 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail("Your Reqara checklist link", text, html);
     }
 
+    public static TransactionalEmail ApiKeyCreatedNotification(
+        string recipientFirstName,
+        string organizationName,
+        string keyName,
+        string keyPrefix,
+        string? expiresAt,
+        string appBaseUrl)
+    {
+        var safeFirstName = CleanName(recipientFirstName, "there");
+        var safeOrganization = CleanName(organizationName, "your organization");
+        var safeKeyName = CleanName(keyName, "API key");
+        var safeKeyPrefix = CleanName(keyPrefix, "new key");
+        var safeExpiresAt = CleanName(expiresAt, "No expiry set");
+        var url = appBaseUrl.TrimEnd('/');
+
+        var text =
+            $"Hi {safeFirstName},\n\n" +
+            $"A Reqara API key was created for {safeOrganization}.\n\n" +
+            $"Key name: {safeKeyName}\n" +
+            $"Key prefix: {safeKeyPrefix}\n" +
+            $"Expires: {safeExpiresAt}\n\n" +
+            "For security, the secret value is not included in email. Ask your platform administrator to share it through an approved secure channel if you are the intended owner.\n\n" +
+            $"Developer settings: {url}\n\n" +
+            "If you did not expect this, rotate or revoke the key immediately.";
+
+        var html = BuildLayout(
+            "API key created",
+            $"Hi {Html(safeFirstName)},",
+            $"A Reqara API key was created for <strong>{Html(safeOrganization)}</strong>.",
+            "Open Reqara",
+            url,
+            new[]
+            {
+                $"<strong>Key name:</strong> {Html(safeKeyName)}",
+                $"<strong>Key prefix:</strong> {Html(safeKeyPrefix)}",
+                $"<strong>Expires:</strong> {Html(safeExpiresAt)}",
+                "For security, the secret value is not included in email."
+            },
+            "If you did not expect this, rotate or revoke the key immediately.");
+
+        return new TransactionalEmail("Reqara API key created", text, html);
+    }
+
     private static string BuildLayout(
         string heading,
         string greeting,

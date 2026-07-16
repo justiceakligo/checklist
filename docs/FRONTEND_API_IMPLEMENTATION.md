@@ -1,102 +1,110 @@
 # Reqara Frontend API Implementation Guide
 
-This guide covers the customer dashboard, recipient checklist portal, public interest intake, and organization-level administration endpoints.
+This file is the customer dashboard, recipient portal, and developer handoff for the production backend.
 
-Platform-operator endpoints are intentionally documented separately in [PLATFORM_ADMIN_API_IMPLEMENTATION.md](PLATFORM_ADMIN_API_IMPLEMENTATION.md).
+Platform admin endpoints are documented separately in [PLATFORM_ADMIN_API_IMPLEMENTATION.md](PLATFORM_ADMIN_API_IMPLEMENTATION.md).
 
-Frontend droplet deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
+Frontend deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
 
-## Client Basics
-
-Base API origin:
+## Base URLs
 
 ```text
-Production: https://api.reqara.com
-Production health: https://api.reqara.com/v1/health
-Local: https://localhost:<port> or http://localhost:<port>
+API production origin: https://api.reqara.com
+API health: https://api.reqara.com/v1/health
+Frontend app base URL in DB: https://reqara.com
+OpenAPI JSON: https://api.reqara.com/openapi/v1.json
+Developer reference: https://api.reqara.com/v1/developer/reference
 ```
 
-Recommended frontend environment variable:
+Use:
 
 ```text
 VITE_ATLAS_API_BASE_URL=https://api.reqara.com
 ```
 
-Current recipient-link frontend origin in the database:
+`app.baseUrl` is not the API origin. The backend uses it for recipient links in emails: `https://reqara.com/c/{token}`. Platform admins can CRUD it in platform settings. Organization admins can override it with organization admin settings.
 
-```text
-app.baseUrl=https://reqara.com
-```
+## Client Rules
 
-`app.baseUrl` is not the API origin. The backend uses it only when generating recipient email links like `/c/{token}`. Platform admins can CRUD it through platform settings, and organization admins can override it through organization admin settings.
-
-Current production email sender settings in the database:
-
-```text
-email.provider=resend
-Email:Resend.From=requests@reqara.com
-Email:Resend.FromName=Reqara
-```
-
-All JSON examples use the actual wire format expected by the API:
-
-- JSON property names are `camelCase`.
-- Enum values are strings, for example `"Active"` or `"Text"`.
-- Dates are ISO 8601 strings.
-- Send `Content-Type: application/json` on JSON requests.
-- Send `Accept: application/json` on API requests.
-- Browser calls that use cookies must include `credentials: "include"`.
-
-Dashboard auth uses an HttpOnly cookie named `__Host-atlas_dashboard`.
-
-Recipient auth uses an HttpOnly cookie named `__Host-atlas_recipient`.
-
-Organization-scoped dashboard requests should include `X-Atlas-Organization-Id` when the signed-in user belongs to multiple organizations.
-
-Server-to-server calls can use `X-Atlas-Key` instead of the dashboard cookie. Do not put API keys in browser code.
+- JSON uses `camelCase`.
+- Enum values are strings, for example `"Active"`, `"Text"`, `"Production"`.
+- Dashboard and recipient browser calls must use `credentials: "include"`.
+- Dashboard auth cookie: `__Host-atlas_dashboard`.
+- Recipient auth cookie: `__Host-atlas_recipient`.
+- Include `X-Atlas-Organization-Id` when the signed-in user belongs to more than one org.
+- Server integrations use `X-Atlas-Key`. Never put API keys in browser code.
+- CORS is currently open for rapid integration. Tighten this before final hardening.
 
 ```ts
 const API_BASE_URL = import.meta.env.VITE_ATLAS_API_BASE_URL ?? "https://api.reqara.com";
 
-await fetch(`${API_BASE_URL}/v1/actions`, {
-  method: "GET",
-  credentials: "include",
-  headers: {
-    "Accept": "application/json",
-    "X-Atlas-Organization-Id": currentOrganizationId
-  }
-});
+export async function api(path: string, init: RequestInit = {}) {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    credentials: "include",
+    ...init,
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(init.headers ?? {})
+    }
+  });
+  if (!res.ok) throw await res.json();
+  return res.status === 204 ? null : res.json();
+}
 ```
-
-Cross-origin note: dashboard and recipient auth are cookie-based. The production API currently allows any browser origin with credentials so the frontend can integrate quickly. Tighten this to the deployed frontend/admin origins before final production hardening.
 
 ## Error Shape
 
-Most errors use RFC7807-style problem details.
+Most errors use problem details:
 
 ```json
 {
   "type": "https://docs.atlas.example/errors/validation_failed",
-  "title": "Template name and title are required.",
+  "title": "Name is required.",
   "status": 422,
   "code": "validation_failed"
 }
 ```
 
-Common status codes:
+Entitlement and quota failures use `402` and include the current plan and usage:
 
-- `401`: not signed in, missing tenant, expired recipient session, or invalid credentials.
-- `403`: signed in but missing permission, wrong actor type, or OTP still required.
-- `404`: resource not found in the current tenant.
-- `409`: state conflict, duplicate slug/email, stale autosave version, already submitted, or idempotency conflict.
-- `410`: expired or inactive recipient link.
-- `413`: upload exceeds configured size.
-- `422`: request validation failed.
-- `503`: email/storage/provider failure.
+```json
+{
+  "type": "https://docs.atlas.example/errors/monthly_checklist_limit_exceeded",
+  "title": "This organization has reached the Free monthly checklist limit.",
+  "status": 402,
+  "code": "monthly_checklist_limit_exceeded",
+  "plan": {
+    "code": "free",
+    "name": "Free",
+    "monthlyChecklistLimit": 10,
+    "storageBytes": 524288000
+  },
+  "usage": {
+    "checklistsSent": 10,
+    "checklistsRemaining": 0,
+    "storageBytesUsed": 245760,
+    "storageBytesRemaining": 524042240
+  }
+}
+```
+
+Common codes:
+
+```text
+401: not signed in, no tenant, expired recipient session, invalid credentials
+402: plan feature/quota not available
+403: missing permission, sandbox key used on production endpoint, OTP required
+404: resource not found
+409: duplicate, state conflict, stale autosave version, idempotency conflict
+410: expired/inactive recipient link
+413: upload too large
+422: validation failed
+429: OTP locked/rate limited
+503: email, storage, or provider failure
+```
 
 ## Enums
-
-Use these string values in requests and UI state mapping.
 
 ```text
 OrganizationStatus: Active, Suspended, Closed
@@ -109,44 +117,72 @@ ActionRecipientStatus: Pending, Viewed, Started, Submitted, Cancelled, Expired
 SubmissionStatus: Submitted, Accepted, ChangesRequested
 FileScanStatus: Pending, Clean, Rejected
 AdminSettingScope: System, Organization
+ApiKeyEnvironment: Sandbox, Production
+DeveloperAccessStatus: SandboxOnly, ProductionRequested, ProductionApproved, ProductionRejected
 ```
 
-## Recommended App Areas
+## Product And Pricing Support
 
-Dashboard:
+The backend now supports and enforces the public pricing table by DB-configurable plans.
 
-- Sign up, login, logout, session restore.
-- Organization switcher and organization settings.
-- Template list/create/publish.
-- Checklist action list/detail/create/send/cancel/remind/timeline.
-- Submission inbox, detail, accept, request changes.
-- Developer API keys.
-- Organization-level admin settings.
+Default plan for self-serve signup: `free`.
 
-Recipient portal:
+Default limits:
 
-- Open `/c/{token}` from email.
-- OTP screen when required.
-- Checklist form with autosave.
-- File upload using signed DigitalOcean Spaces URLs.
-- Review and submit.
-- Receipt page.
+```text
+Free: 10 sent checklists/month, 500 MB storage, team workspace, library, Reqara branding
+Starter: 100 sent checklists/month, 5 GB storage, custom branding, automatic reminders
+Business: 500 sent checklists/month, 25 GB storage, API/webhooks, custom workflows, priority support
+Scale: custom volume, SSO/security review/DPA/dedicated onboarding flags, custom retention
+```
 
-Marketing/public:
+Enforced today:
 
-- Prospective organization interest form.
+- Monthly checklist quota when sending immediately or sending a draft.
+- Storage quota before creating upload intents.
+- Custom logo/color by `custom_branding`.
+- Custom retention by `custom_retention`.
+- Custom template creation/publish by `custom_workflows`.
+- Production API keys and webhooks by `api_and_webhooks` plus platform approval.
+- Automatic scheduled reminders only for plans with `automatic_reminders`.
+
+Still not automatic billing:
+
+- There is no checkout or Stripe subscription sync yet.
+- Admins set organization plan in DB-backed settings: category `billing`, key `plan`.
+- Revenue metrics are manual platform records until billing is integrated.
+
+## Website Claims Matrix
+
+Use this as the frontend truth table.
+
+| Claim | Backend status | Frontend note |
+| --- | --- | --- |
+| Secure checklist links | Supported | Tokens are CSPRNG path tokens. DB stores token hashes only. |
+| No recipient account | Supported | Recipient opens `/c/{token}` and optional OTP, no account. |
+| Works on mobile | API-supported | Responsive UX is frontend-owned. |
+| Direct secure uploads | Supported | Browser uploads directly to private DigitalOcean Spaces signed URLs. |
+| Private object storage | Supported by configuration | Objects are stored in private Spaces; never expose public object URLs. |
+| Time-limited downloads | Supported | Reviewer downloads use short-lived signed URLs. |
+| Progress tracking | Supported | Dashboard summary, action statuses, recipients, timeline. |
+| One final package | Supported | Submissions collect responses/files into one package. |
+| Automatic reminders | Supported | Worker sends before-due and overdue reminders for eligible plans. |
+| API and webhooks | Supported for Business/Scale | Sandbox is self-serve. Production requires platform approval. |
+| Malware scanning | Integration-ready | Files are blocked until marked `Clean`; scanner engine itself is external. |
+| Audit trail | Supported | Sends, views, uploads, OTP, submissions, reviews, admin events. |
+| Auto-expiration | Supported | Recipient links expire; tokens rotate on resend/reminder. |
+| Rate limiting | Supported broadly | Global fixed-window rate limiting plus OTP attempt caps. |
+| Configurable retention | Supported | Retention days and purge worker are DB-configurable. |
+| Deletion workflows | Supported | Submission delete deletes underlying objects and marks files deleted. |
+| Consent records | Supported | Submission declaration timestamp and IP are stored. |
+| Data export | Supported | Submission export endpoint includes package and timeline. |
+| SSO | Plan flag only | Do not show as self-serve yet. Treat as Scale/sales. |
+| Payments | Not implemented | Mark as coming soon if shown. |
+| Signatures | Requirement type exists | Full e-signature workflow is not implemented yet. |
 
 ## Health
 
 ### GET `/v1/health`
-
-Use for deployment checks and simple frontend diagnostics.
-
-Full production URL:
-
-```text
-GET https://api.reqara.com/v1/health
-```
 
 Response:
 
@@ -157,21 +193,11 @@ Response:
 }
 ```
 
-## Dashboard Auth And Organization Flow
+## Auth And Organization Signup
 
-### Signup Flow
-
-UI scenario:
-
-1. User fills account and organization fields.
-2. Submit `POST /v1/auth/signup`.
-3. API creates the user, organization, owner membership, and signs in via cookie.
-4. Store returned `organizationId` as the current organization context.
-5. Route to dashboard.
+Self-serve organizations do not require platform approval. Signup creates an active Free org and sends a welcome email.
 
 ### POST `/v1/auth/signup`
-
-Request:
 
 ```json
 {
@@ -185,7 +211,7 @@ Request:
 }
 ```
 
-Response `201`:
+`201`:
 
 ```json
 {
@@ -196,25 +222,7 @@ Response `201`:
 }
 ```
 
-Common errors:
-
-- `409 email_in_use`
-- `409 slug_in_use`
-- `422 validation_failed`
-
-### Login Flow
-
-UI scenario:
-
-1. User submits email/password.
-2. Call `POST /v1/auth/login`.
-3. If the user belongs to multiple organizations, show an organization switcher using `organizations`.
-4. Save `currentOrganizationId` in frontend state.
-5. Include `X-Atlas-Organization-Id` on tenant-scoped dashboard calls.
-
 ### POST `/v1/auth/login`
-
-Request:
 
 ```json
 {
@@ -224,7 +232,7 @@ Request:
 }
 ```
 
-Response:
+`200`:
 
 ```json
 {
@@ -243,56 +251,18 @@ Response:
   "currentOrganizationId": "22222222-2222-2222-2222-222222222222"
 }
 ```
-
-### POST `/v1/auth/logout`
-
-Request body: none.
-
-Response: `204 No Content`.
 
 ### GET `/v1/me`
 
-Use on app boot to restore the session.
+Use on app boot to restore the dashboard session. Response is the same shape as login.
 
-Response:
+### POST `/v1/auth/logout`
 
-```json
-{
-  "userId": "11111111-1111-1111-1111-111111111111",
-  "email": "ollie@northstarstaffing.com",
-  "fullName": "Ollie Ed",
-  "organizations": [
-    {
-      "organizationId": "22222222-2222-2222-2222-222222222222",
-      "name": "Northstar Staffing",
-      "slug": "northstar-staffing",
-      "role": "Owner",
-      "status": "Active"
-    }
-  ],
-  "currentOrganizationId": "22222222-2222-2222-2222-222222222222"
-}
-```
+Returns `204`.
 
-## Organization Settings
-
-### Organization Profile Flow
-
-UI scenario:
-
-1. Load `GET /v1/organizations/{id}`.
-2. Let owners/admins edit branding, privacy statement, timezone, language, and retention.
-3. Save via `PATCH /v1/organizations/{id}`.
+## Organization Profile
 
 ### GET `/v1/organizations/{id}`
-
-Headers:
-
-```text
-X-Atlas-Organization-Id: 22222222-2222-2222-2222-222222222222
-```
-
-Response:
 
 ```json
 {
@@ -302,17 +272,17 @@ Response:
   "status": "Active",
   "timezone": "America/Toronto",
   "defaultLanguage": "en",
-  "accentColor": "#111827",
-  "privacyStatement": "We use your documents only for onboarding.",
+  "accentColor": "#0f172a",
+  "privacyStatement": "We use your documents only to process your request.",
   "retentionDays": 365,
-  "createdAt": "2026-07-15T18:00:00Z",
-  "updatedAt": "2026-07-15T18:10:00Z"
+  "createdAt": "2026-07-16T05:00:00Z",
+  "updatedAt": "2026-07-16T05:00:00Z"
 }
 ```
 
 ### PATCH `/v1/organizations/{id}`
 
-Request:
+Custom branding requires Starter or higher. Custom retention requires Scale.
 
 ```json
 {
@@ -325,50 +295,195 @@ Request:
 }
 ```
 
-Response: same shape as `GET /v1/organizations/{id}`.
+## Billing And Entitlements
 
-## Organization Admin Settings
+### GET `/v1/billing/plans`
 
-These are organization-admin settings, not platform-admin settings.
+Use for pricing UI.
 
-Use them for configurable product values such as upload limits, token grace days, email display settings, and app base URL.
+```json
+{
+  "items": [
+    {
+      "code": "free",
+      "name": "Free",
+      "description": "Try Reqara on real requests.",
+      "monthlyPriceCents": 0,
+      "annualPriceCents": 0,
+      "currency": "USD",
+      "monthlyChecklistLimit": 10,
+      "storageBytes": 524288000,
+      "customPricing": false,
+      "features": {
+        "teamWorkspace": true,
+        "templateLibrary": true,
+        "reqaraBranding": true,
+        "customBranding": false,
+        "automaticReminders": false,
+        "apiAndWebhooks": false,
+        "customWorkflows": false,
+        "prioritySupport": false,
+        "sso": false,
+        "customRetention": false,
+        "securityReview": false,
+        "dpa": false,
+        "dedicatedOnboarding": false
+      }
+    }
+  ]
+}
+```
 
-### GET `/v1/admin/settings?organizationId={id}`
+### GET `/v1/organizations/{id}/entitlements`
 
-Requires dashboard user with `admin:*` scope.
+Use for plan badge, quota meter, feature locks, and upgrade prompts.
 
-Response:
+```json
+{
+  "plan": {
+    "code": "business",
+    "name": "Business",
+    "monthlyChecklistLimit": 500,
+    "storageBytes": 26843545600,
+    "features": {
+      "apiAndWebhooks": true,
+      "customWorkflows": true,
+      "prioritySupport": true
+    }
+  },
+  "billing": {
+    "planCode": "business",
+    "billingCycle": "monthly",
+    "status": "active",
+    "currentPeriodStart": null,
+    "currentPeriodEnd": null
+  },
+  "usage": {
+    "periodStart": "2026-07-01T00:00:00Z",
+    "periodEnd": "2026-08-01T00:00:00Z",
+    "checklistsSent": 18,
+    "monthlyChecklistLimit": 500,
+    "checklistsRemaining": 482,
+    "storageBytesUsed": 13631488,
+    "storageBytesLimit": 26843545600,
+    "storageBytesRemaining": 26829914112
+  }
+}
+```
+
+## Dashboard Summary
+
+### GET `/v1/dashboard/summary`
+
+Use for the "who needs attention" dashboard.
+
+```json
+{
+  "organizationId": "22222222-2222-2222-2222-222222222222",
+  "generatedAt": "2026-07-16T06:00:00Z",
+  "needsAttention": {
+    "waitingRecipients": 3,
+    "overdueRecipients": 1,
+    "dueSoonRecipients": 1
+  },
+  "checklists": {
+    "total": 18,
+    "draft": 2,
+    "inFlight": 8,
+    "submitted": 3,
+    "completed": 5,
+    "cancelled": 0,
+    "expired": 0
+  },
+  "submissions": {
+    "total": 12,
+    "submitted": 3,
+    "accepted": 8,
+    "changesRequested": 1
+  },
+  "files": {
+    "pendingScan": 2,
+    "rejected": 0
+  },
+  "attentionItems": [
+    {
+      "actionId": "88888888-8888-8888-8888-888888888888",
+      "checklistTitle": "Vendor Insurance Renewal",
+      "dueAt": "2026-07-15T00:00:00Z",
+      "recipientId": "99999999-9999-9999-9999-999999999999",
+      "recipientName": "ABC Plumbing",
+      "recipientEmail": "admin@abc.example",
+      "recipientStatus": "Viewed",
+      "lastActivityAt": "2026-07-14T13:00:00Z",
+      "overdue": true,
+      "dueSoon": false
+    }
+  ],
+  "entitlements": {}
+}
+```
+
+## Organization Members
+
+### GET `/v1/organization-members`
 
 ```json
 {
   "items": [
     {
       "id": "33333333-3333-3333-3333-333333333333",
-      "organizationId": null,
-      "scope": "System",
-      "category": "files",
-      "key": "maxUploadBytes",
-      "valueJson": "10485760",
-      "isSecret": false,
-      "updatedAt": "2026-07-15T18:00:00Z"
-    },
-    {
-      "id": "44444444-4444-4444-4444-444444444444",
       "organizationId": "22222222-2222-2222-2222-222222222222",
-      "scope": "Organization",
-      "category": "app",
-      "key": "baseUrl",
-      "valueJson": "\"https://reqara.com\"",
-      "isSecret": false,
-      "updatedAt": "2026-07-15T18:05:00Z"
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "email": "ollie@northstarstaffing.com",
+      "fullName": "Ollie Ed",
+      "role": "Owner",
+      "status": "Active",
+      "invitedAt": null,
+      "joinedAt": "2026-07-16T05:00:00Z",
+      "createdAt": "2026-07-16T05:00:00Z"
     }
   ]
 }
 ```
 
+### POST `/v1/organization-members`
+
+Requires Owner/Admin. If creating a new user, include `password`. Existing users can be added without password.
+
+```json
+{
+  "email": "member@northstarstaffing.com",
+  "password": "temporary-password",
+  "fullName": "Jamie Manager",
+  "role": "Member",
+  "status": "Active"
+}
+```
+
+### PATCH `/v1/organization-members/{id}`
+
+```json
+{
+  "fullName": "Jamie Manager",
+  "password": null,
+  "role": "Admin",
+  "status": "Active"
+}
+```
+
+### DELETE `/v1/organization-members/{id}`
+
+Disables the member. Returns `204`.
+
+## Organization Admin Settings
+
+### GET `/v1/admin/settings?organizationId={id}`
+
+Requires `admin:*`.
+
 ### PUT `/v1/admin/settings/{category}/{key}`
 
-Request:
+Use for org-specific overrides such as `app.baseUrl`, upload limits, retention, sender display, or token grace.
 
 ```json
 {
@@ -380,118 +495,42 @@ Request:
 }
 ```
 
-Example route:
+## Template Library
+
+The intended UI should feel like Canva search, not a wall of cards.
+
+Primary screen:
 
 ```text
-PUT /v1/admin/settings/app/baseUrl
+What are you trying to collect?
+[ Search the library... ]
 ```
 
-Response:
+Examples:
 
-```json
-{
-  "id": "44444444-4444-4444-4444-444444444444",
-  "organizationId": "22222222-2222-2222-2222-222222222222",
-  "scope": "Organization",
-  "category": "app",
-  "key": "baseUrl",
-  "valueJson": "\"https://reqara.com\"",
-  "isSecret": false,
-  "updatedAt": "2026-07-15T19:00:00Z"
-}
+```text
+insurance -> Vendor Insurance Renewal, Contractor Insurance, Vehicle Insurance, Property Insurance, Claim Evidence
+employee -> Candidate Onboarding, New Employee Onboarding, Employee Offboarding, Equipment Return, Reference Check
+canada -> New Hire Onboarding (Canada), WSIB Contractor Compliance, Tax Season Client Checklist (Canada)
 ```
-
-## Developer API Keys
-
-API keys are for backend integrations. Show the raw `secret` once after creation and never expect it again from the API.
-
-### GET `/v1/api-keys`
-
-Response:
-
-```json
-{
-  "items": [
-    {
-      "id": "55555555-5555-5555-5555-555555555555",
-      "name": "Production integration",
-      "keyPrefix": "atl_live_ab12cd34",
-      "scopes": ["actions:*", "files:*"],
-      "lastUsedAt": null,
-      "expiresAt": null,
-      "revokedAt": null,
-      "createdAt": "2026-07-15T18:00:00Z"
-    }
-  ]
-}
-```
-
-### POST `/v1/api-keys`
-
-Requires `developer:*`.
-
-Request:
-
-```json
-{
-  "name": "Production integration",
-  "scopes": ["actions:*", "files:*"],
-  "expiresAt": null
-}
-```
-
-Response `201`:
-
-```json
-{
-  "id": "55555555-5555-5555-5555-555555555555",
-  "name": "Production integration",
-  "keyPrefix": "atl_live_ab12cd34",
-  "secret": "atl_live_ab12cd34_Wr0w...",
-  "scopes": ["actions:*", "files:*"],
-  "expiresAt": null,
-  "createdAt": "2026-07-15T18:00:00Z"
-}
-```
-
-### DELETE `/v1/api-keys/{id}`
-
-Revokes the key.
-
-Response: `204 No Content`.
-
-## Templates
-
-### Template Search And Builder Flow
-
-UI scenario:
-
-1. Show a template search surface first, not a wall of cards.
-2. Prompt: `What are you trying to collect?`
-3. Call `GET /v1/templates?query={term}&limit=12` as the user searches.
-4. Use `category`, `country`, `region`, `pack`, `tags`, `searchTerms`, and `highlight` to group results into practical packs such as HR, Accounting, Healthcare, Government, Education, Logistics, and Hospitality.
-5. Create custom draft templates with requirements using `POST /v1/templates`.
-6. Publish the latest version with `POST /v1/templates/{id}/publish`.
-7. Use published templates when creating checklist actions.
-
-Current backend note: there is no template detail or template-version edit endpoint yet. The current frontend can list, create, and publish templates.
 
 ### GET `/v1/templates`
 
 Query params:
 
-`query`: Optional search text. Search across template name, category, description, instructions, tags, pack metadata, region, and search terms.
-`category`: Optional category filter.
-`country`: Optional country filter, for example `Canada`, `United States`, or `Global`.
-`region`: Optional region filter, for example `Ontario`.
-`limit`: Optional result limit from `1` to `100`. Default `50`.
+```text
+query: search text
+category: optional category
+country: optional country
+region: optional region
+limit: 1..100, default 50
+```
 
-Example searches:
+Example:
 
-`GET /v1/templates?query=insurance&limit=8`
-`GET /v1/templates?query=employee&limit=8`
-`GET /v1/templates?country=Canada&query=contractor`
-`GET /v1/templates?category=Healthcare`
+```text
+GET /v1/templates?query=insurance&limit=8
+```
 
 Response:
 
@@ -514,9 +553,8 @@ Response:
         "highlight": "Built for Ontario healthcare staffing workflows.",
         "country": "Canada",
         "region": "Ontario",
-        "pack": "Core",
-        "tags": ["healthcare", "staffing", "employee", "ontario", "candidate"],
-        "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization", "availability"]
+        "tags": ["healthcare", "staffing", "employee", "ontario"],
+        "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization"]
       },
       "industry": "HR",
       "example": "Healthcare Staffing Onboarding (Ontario)",
@@ -524,22 +562,18 @@ Response:
       "highlight": "Built for Ontario healthcare staffing workflows.",
       "country": "Canada",
       "region": "Ontario",
-      "tags": ["healthcare", "staffing", "employee", "ontario", "candidate"],
-      "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization", "availability"],
-      "createdAt": "2026-07-15T18:00:00Z",
-      "updatedAt": "2026-07-15T18:00:00Z"
+      "tags": ["healthcare", "staffing", "employee", "ontario"],
+      "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization"],
+      "createdAt": "2026-07-16T05:00:00Z",
+      "updatedAt": "2026-07-16T05:00:00Z"
     }
   ]
 }
 ```
 
-Recommended UI behavior:
-
-Show the search box first. For example, a search for `insurance` should surface insurance-heavy workflows such as `Vendor Insurance Renewal`, `Vendor Compliance`, `Contractor Registration`, `Insurance Claim Evidence`, and related regional templates. A search for `employee` should surface `Candidate Onboarding`, `New Employee Onboarding`, `Employee Offboarding`, `Reference Check`, and staffing variants.
-
 ### POST `/v1/templates`
 
-Request:
+Requires `custom_workflows` entitlement.
 
 ```json
 {
@@ -549,185 +583,38 @@ Request:
   "title": "Onboarding documents",
   "instructions": "Please complete each item carefully.",
   "settings": {
-    "allowPartialSave": true
+    "industry": "HR",
+    "rating": 5,
+    "tags": ["employee", "onboarding"]
   },
   "createdByUserId": "11111111-1111-1111-1111-111111111111",
   "requirements": [
     {
       "key": "legal_name",
       "type": "Text",
-      "label": "Legal name",
+      "label": "Full legal name",
       "description": "Enter your full legal name.",
       "required": true,
       "displayOrder": 1,
       "configuration": {},
-      "validation": {
-        "minLength": 2
-      },
-      "condition": null
-    },
-    {
-      "key": "government_id",
-      "type": "File",
-      "label": "Government ID",
-      "description": "Upload a clear image or PDF.",
-      "required": true,
-      "displayOrder": 2,
-      "configuration": {
-        "acceptedMimeTypes": ["image/jpeg", "image/png", "application/pdf"]
-      },
-      "validation": {},
+      "validation": { "minLength": 2 },
       "condition": null
     }
   ]
-}
-```
-
-Response `201`:
-
-```json
-{
-  "id": "66666666-6666-6666-6666-666666666666",
-  "name": "Employee onboarding",
-  "category": "HR",
-  "description": "Collect identity and payroll documents.",
-  "status": "Draft",
-  "currentVersionId": null,
-  "title": "Onboarding documents",
-  "instructions": "Please complete each item carefully.",
-  "settings": {
-    "allowPartialSave": true
-  },
-  "industry": null,
-  "example": null,
-  "rating": null,
-  "highlight": null,
-  "country": null,
-  "region": null,
-  "tags": [],
-  "searchTerms": [],
-  "createdAt": "2026-07-15T18:00:00Z",
-  "updatedAt": "2026-07-15T18:00:00Z"
 }
 ```
 
 ### POST `/v1/templates/{id}/publish`
 
-Request body: none.
-
-Response:
-
-```json
-{
-  "id": "66666666-6666-6666-6666-666666666666",
-  "name": "Employee onboarding",
-  "category": "HR",
-  "description": "Collect identity and payroll documents.",
-  "status": "Published",
-  "currentVersionId": "77777777-7777-7777-7777-777777777777",
-  "title": "Onboarding documents",
-  "instructions": "Please complete each item carefully.",
-  "settings": {
-    "allowPartialSave": true
-  },
-  "industry": null,
-  "example": null,
-  "rating": null,
-  "highlight": null,
-  "country": null,
-  "region": null,
-  "tags": [],
-  "searchTerms": [],
-  "createdAt": "2026-07-15T18:00:00Z",
-  "updatedAt": "2026-07-15T18:00:00Z"
-}
-```
+Requires `custom_workflows`. Returns the template response.
 
 ## Checklist Actions
 
-### Checklist Creation Flow
-
-UI scenario:
-
-1. Sender chooses a template or builds custom requirements.
-2. Sender enters recipient, due date, and whether OTP is required.
-3. Call `POST /v1/actions` with an `Idempotency-Key`.
-4. If `sendImmediately` is `true`, the API emails the recipient and returns status `"Sent"`.
-5. If `sendImmediately` is `false`, show draft detail and a "Send" button.
-
-### GET `/v1/actions`
-
-Response:
-
-```json
-{
-  "items": [
-    {
-      "id": "88888888-8888-8888-8888-888888888888",
-      "publicReference": "act_5fd67eb7d9c2a001e3a4",
-      "title": "Onboarding - Jamie Chen",
-      "status": "Sent",
-      "dueAt": "2026-08-15T00:00:00Z",
-      "expiresAt": "2026-09-14T00:00:00Z",
-      "recipientUrl": null,
-      "createdAt": "2026-07-15T18:00:00Z"
-    }
-  ]
-}
-```
-
-### GET `/v1/actions/{id}`
-
-Response:
-
-```json
-{
-  "id": "88888888-8888-8888-8888-888888888888",
-  "publicReference": "act_5fd67eb7d9c2a001e3a4",
-  "title": "Onboarding - Jamie Chen",
-  "description": "Collect onboarding documents.",
-  "status": "InProgress",
-  "dueAt": "2026-08-15T00:00:00Z",
-  "expiresAt": "2026-09-14T00:00:00Z",
-  "sentAt": "2026-07-15T18:05:00Z",
-  "completedAt": null,
-  "recipients": [
-    {
-      "id": "99999999-9999-9999-9999-999999999999",
-      "name": "Jamie Chen",
-      "email": "jamie.chen@example.com",
-      "phone": null,
-      "status": "Started",
-      "otpRequired": true,
-      "firstViewedAt": "2026-07-15T18:10:00Z",
-      "startedAt": "2026-07-15T18:12:00Z",
-      "submittedAt": null
-    }
-  ],
-  "requirements": [
-    {
-      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-      "key": "legal_name",
-      "type": "Text",
-      "label": "Legal name",
-      "required": true,
-      "displayOrder": 1
-    }
-  ],
-  "createdAt": "2026-07-15T18:00:00Z",
-  "updatedAt": "2026-07-15T18:12:00Z"
-}
-```
-
 ### POST `/v1/actions`
 
-Recommended header:
+Use `Idempotency-Key` for create.
 
-```text
-Idempotency-Key: create-action-<uuid>
-```
-
-Request:
+Sending immediately consumes monthly checklist quota.
 
 ```json
 {
@@ -742,50 +629,14 @@ Request:
   },
   "dueAt": "2026-08-15T00:00:00Z",
   "expiresAt": null,
-  "settings": {
-    "priority": "normal"
-  },
+  "settings": {},
   "sendImmediately": true,
   "createdByUserId": "11111111-1111-1111-1111-111111111111",
   "requirements": []
 }
 ```
 
-Custom action without a template:
-
-```json
-{
-  "templateId": null,
-  "title": "Vendor setup",
-  "description": "Collect vendor details.",
-  "recipient": {
-    "name": "Pat Doe",
-    "email": "pat@example.com",
-    "phone": "+14165550199",
-    "otpRequired": false
-  },
-  "dueAt": "2026-08-01T00:00:00Z",
-  "expiresAt": null,
-  "settings": {},
-  "sendImmediately": false,
-  "createdByUserId": "11111111-1111-1111-1111-111111111111",
-  "requirements": [
-    {
-      "key": "w9",
-      "type": "File",
-      "label": "W-9",
-      "description": "Upload signed W-9.",
-      "required": true,
-      "displayOrder": 1,
-      "configuration": {},
-      "validation": {},
-      "condition": null
-    }
-  ]
-}
-```
-
-Response `201`:
+`201`:
 
 ```json
 {
@@ -796,88 +647,47 @@ Response `201`:
   "dueAt": "2026-08-15T00:00:00Z",
   "expiresAt": "2026-09-14T00:00:00Z",
   "recipientUrl": "https://reqara.com/c/9f3kV2qP_hN8mL0aZxYtR7wQeUcJbGdKsMoXnBvIrAs",
-  "createdAt": "2026-07-15T18:00:00Z"
+  "createdAt": "2026-07-16T05:00:00Z"
 }
 ```
 
-Security note: do not log or display the raw `recipientUrl` except in intentional sender UI. If copied for support, show only a token prefix.
+Do not log the full `recipientUrl`. For support, show only the first six token characters.
+
+### GET `/v1/actions`
+
+Lists actions.
+
+### GET `/v1/actions/{id}`
+
+Returns action detail with recipients and requirements.
 
 ### POST `/v1/actions/{id}/send`
 
-Mints fresh recipient tokens, invalidates prior links, and sends invitation email.
-
-Request body: none.
-
-Response `202`:
+Mints fresh tokens, sends invitations, schedules automatic reminders when the plan allows it, and increments usage if the action was not previously sent.
 
 ```json
-{
-  "sent": 1
-}
+{ "sent": 1 }
 ```
 
 ### POST `/v1/actions/{id}/cancel`
 
-Request body: none.
-
-Response:
-
-```json
-{
-  "id": "88888888-8888-8888-8888-888888888888",
-  "status": "Cancelled",
-  "cancelledAt": "2026-07-15T19:00:00Z"
-}
-```
+Cancels an action.
 
 ### POST `/v1/actions/{id}/reminders`
 
-Sends reminder or overdue emails to pending recipients. The API reuses the same structure as invitation emails and rotates tokens for the reminded recipients.
-
-Request body: none.
-
-Response `202`:
-
-```json
-{
-  "sent": 1
-}
-```
+Sends manual reminder or overdue email to pending recipients. Tokens are rotated for reminded recipients.
 
 ### GET `/v1/actions/{id}/timeline`
 
-Response:
+Returns audit events for the action.
 
-```json
-{
-  "items": [
-    {
-      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-      "eventType": "action.sent",
-      "actorType": "User",
-      "actorId": "ollie@northstarstaffing.com",
-      "eventData": "{\"id\":\"88888888-8888-8888-8888-888888888888\"}",
-      "createdAt": "2026-07-15T18:05:00Z"
-    }
-  ]
-}
-```
+## Files
 
-## Dashboard File Uploads
-
-Most recipient uploads happen through the recipient endpoints. Dashboard file endpoints are useful for organization-managed files and scanner callbacks.
-
-### Dashboard Upload Flow
-
-1. Call `POST /v1/files/upload-intents`.
-2. Upload the binary directly to the returned `uploadUrl` with the returned headers.
-3. Call `POST /v1/files/{fileId}/complete`.
-4. A scanner or trusted workflow calls `POST /v1/files/{fileId}/scan-result`.
-5. Download only after scan status is `"Clean"`.
+Dashboard and recipient uploads are direct-to-Spaces. The backend creates a private object key and signed PUT URL.
 
 ### POST `/v1/files/upload-intents`
 
-Request:
+Requires production dashboard or production API key. Sandbox keys cannot touch production files.
 
 ```json
 {
@@ -890,21 +700,22 @@ Request:
 }
 ```
 
-Response `201`:
+`201`:
 
 ```json
 {
   "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
   "storageKey": "quarantine/22222222-2222-2222-2222-222222222222/cccccccc-cccc-cccc-cccc-cccccccccccc/passport.pdf",
-  "uploadUrl": "https://nyc3.digitaloceanspaces.com/...",
+  "uploadUrl": "https://tor1.digitaloceanspaces.com/...",
   "headers": {
     "Content-Type": "application/pdf"
   },
-  "expiresAt": "2026-07-15T18:10:00Z"
+  "expiresAt": "2026-07-16T05:10:00Z",
+  "retentionUntil": "2027-07-16T05:00:00Z"
 }
 ```
 
-Direct upload to Spaces:
+Upload:
 
 ```ts
 await fetch(uploadIntent.uploadUrl, {
@@ -916,9 +727,7 @@ await fetch(uploadIntent.uploadUrl, {
 
 ### POST `/v1/files/{id}/complete`
 
-Request body: none.
-
-Response:
+Checks object exists and size matches. Returns:
 
 ```json
 {
@@ -930,9 +739,7 @@ Response:
 
 ### POST `/v1/files/{id}/scan-result`
 
-Requires `files:*`. Intended for trusted admin/scanner integration, not normal recipient UI.
-
-Request:
+Trusted scanner/admin callback.
 
 ```json
 {
@@ -941,59 +748,19 @@ Request:
 }
 ```
 
-Response:
-
-```json
-{
-  "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-  "scanStatus": "Clean",
-  "scanCompletedAt": "2026-07-15T18:11:00Z"
-}
-```
-
 ### GET `/v1/files/{id}/download-url`
 
-Response:
+Only returns URLs for files marked `Clean`.
 
-```json
-{
-  "downloadUrl": "https://nyc3.digitaloceanspaces.com/...",
-  "expiresAt": "2026-07-15T18:16:00Z"
-}
-```
-
-## Submissions Dashboard
-
-### Submission Review Flow
-
-1. Reviewer opens submissions inbox with `GET /v1/submissions`.
-2. Reviewer opens detail with `GET /v1/submissions/{id}`.
-3. For files, call `GET /v1/files/{fileId}/download-url`.
-4. Reviewer accepts with `POST /v1/submissions/{id}/accept` or requests changes with `POST /v1/submissions/{id}/request-changes`.
+## Submissions
 
 ### GET `/v1/submissions`
 
-Response:
-
-```json
-{
-  "items": [
-    {
-      "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
-      "actionId": "88888888-8888-8888-8888-888888888888",
-      "actionRecipientId": "99999999-9999-9999-9999-999999999999",
-      "versionNumber": 1,
-      "status": "Submitted",
-      "submittedAt": "2026-07-16T14:30:00Z",
-      "reviewedAt": null
-    }
-  ]
-}
-```
+Submission inbox.
 
 ### GET `/v1/submissions/{id}`
 
-Response:
+Includes declaration timestamp/IP, content hash, response values, and file IDs.
 
 ```json
 {
@@ -1006,6 +773,8 @@ Response:
   "reviewedAt": null,
   "reviewedByUserId": null,
   "reviewComment": null,
+  "declarationAcceptedAt": "2026-07-16T14:30:00Z",
+  "declarationIpAddress": "203.0.113.25",
   "contentHash": "e3b0c44298fc1c149afbf4c8996fb924...",
   "responses": [
     {
@@ -1022,9 +791,11 @@ Response:
 }
 ```
 
-### POST `/v1/submissions/{id}/accept`
+### GET `/v1/submissions/{id}/export`
 
-Request:
+Use for data export/package view. Includes title, recipient, responses, files, scan status, declaration, and timeline.
+
+### POST `/v1/submissions/{id}/accept`
 
 ```json
 {
@@ -1032,84 +803,43 @@ Request:
 }
 ```
 
-Response:
-
-```json
-{
-  "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
-  "actionId": "88888888-8888-8888-8888-888888888888",
-  "actionRecipientId": "99999999-9999-9999-9999-999999999999",
-  "versionNumber": 1,
-  "status": "Accepted",
-  "submittedAt": "2026-07-16T14:30:00Z",
-  "reviewedAt": "2026-07-16T15:00:00Z"
-}
-```
-
 ### POST `/v1/submissions/{id}/request-changes`
 
-Request:
-
 ```json
 {
-  "comment": "Please upload a clearer copy of your ID."
+  "comment": "Please upload a clearer ID."
 }
 ```
 
-Response:
+### DELETE `/v1/submissions/{id}`
 
-```json
-{
-  "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
-  "actionId": "88888888-8888-8888-8888-888888888888",
-  "actionRecipientId": "99999999-9999-9999-9999-999999999999",
-  "versionNumber": 1,
-  "status": "ChangesRequested",
-  "submittedAt": "2026-07-16T14:30:00Z",
-  "reviewedAt": "2026-07-16T15:00:00Z"
-}
-```
+Requires admin. Deletes the submission and deletes underlying Spaces objects.
 
 ## Recipient Portal
 
-### Recipient Link Flow
+The frontend route `/c/{token}` should render an HTML page with:
 
-UI scenario:
+```text
+Referrer-Policy: no-referrer
+```
 
-1. Recipient opens an email link like `/c/{token}`.
-2. Frontend calls `GET https://api.reqara.com/c/{token}`.
-3. API validates the token, creates the `__Host-atlas_recipient` cookie, and returns whether OTP is required.
-4. If `otpRequired` is true and `otpVerified` is false, show OTP screen.
-5. After OTP verification, load `GET /v1/recipient/checklist`.
-
-Security requirement for frontend hosting: serve `/c/{token}` HTML with `Referrer-Policy: no-referrer` so the token does not leak through outbound referrer headers.
+Then call the API:
 
 ### GET `/c/{token}` or `/r/{token}`
 
-Request body: none.
-
-Response:
+Validates token, creates recipient cookie, sends OTP if required.
 
 ```json
 {
   "otpRequired": true,
   "otpVerified": false,
-  "sessionExpiresAt": "2026-07-15T22:00:00Z",
+  "sessionExpiresAt": "2026-07-16T08:00:00Z",
   "organizationName": "Northstar Staffing",
   "checklistTitle": "Onboarding - Jamie Chen"
 }
 ```
 
-Errors:
-
-- `404 not_found`: invalid or rotated token.
-- `410 expired_link`: token expired.
-- `410 inactive_link`: action cancelled or expired.
-- `503 otp_email_failed`: OTP email could not be sent.
-
 ### POST `/v1/recipient/access/verify`
-
-Request:
 
 ```json
 {
@@ -1117,93 +847,13 @@ Request:
 }
 ```
 
-Response:
-
-```json
-{
-  "verified": true
-}
-```
-
-Errors:
-
-- `422 invalid_otp`
-- `410 otp_expired`
-- `429 otp_locked`
-
 ### GET `/v1/recipient/checklist`
 
-Response:
-
-```json
-{
-  "organization": {
-    "name": "Northstar Staffing",
-    "slug": "northstar-staffing",
-    "accentColor": "#0f172a",
-    "privacyStatement": "We use your documents only to process your request.",
-    "logoFileId": null
-  },
-  "checklist": {
-    "id": "88888888-8888-8888-8888-888888888888",
-    "publicReference": "act_5fd67eb7d9c2a001e3a4",
-    "title": "Onboarding - Jamie Chen",
-    "description": "Collect onboarding documents.",
-    "status": "InProgress",
-    "dueAt": "2026-08-15T00:00:00Z",
-    "expiresAt": "2026-09-14T00:00:00Z"
-  },
-  "requirements": [
-    {
-      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-      "key": "legal_name",
-      "type": "Text",
-      "label": "Legal name",
-      "description": "Enter your full legal name.",
-      "required": true,
-      "displayOrder": 1,
-      "configuration": {},
-      "validation": {
-        "minLength": 2
-      },
-      "condition": null
-    },
-    {
-      "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
-      "key": "government_id",
-      "type": "File",
-      "label": "Government ID",
-      "description": "Upload a clear image or PDF.",
-      "required": true,
-      "displayOrder": 2,
-      "configuration": {},
-      "validation": {},
-      "condition": null
-    }
-  ],
-  "drafts": [
-    {
-      "requirementId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-      "value": "Jamie Chen",
-      "version": 2,
-      "updatedAt": "2026-07-15T18:20:00Z"
-    }
-  ]
-}
-```
-
-### Autosave Flow
-
-UI scenario:
-
-1. Keep a local `version` per requirement from `drafts`.
-2. On debounced field save, call `PATCH /v1/recipient/responses/{requirementId}` with `expectedVersion`.
-3. Replace the local version with the returned `version`.
-4. On `409 concurrency_conflict`, reload the checklist and ask the user to resolve.
+Returns organization branding, checklist metadata, requirements, and draft responses.
 
 ### PATCH `/v1/recipient/responses/{requirementId}`
 
-Request:
+Autosave with optimistic concurrency.
 
 ```json
 {
@@ -1212,37 +862,19 @@ Request:
 }
 ```
 
-Response:
+`200`:
 
 ```json
 {
   "requirementId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
   "version": 3,
-  "updatedAt": "2026-07-15T18:25:00Z"
+  "updatedAt": "2026-07-16T05:25:00Z"
 }
 ```
 
-Use JSON values that match requirement type:
-
-```json
-{ "value": true, "expectedVersion": 1 }
-```
-
-```json
-{ "value": ["A", "B"], "expectedVersion": 4 }
-```
-
-### Recipient File Upload Flow
-
-1. File requirement selected.
-2. Call `POST /v1/recipient/uploads`.
-3. PUT file bytes to returned Spaces `uploadUrl` with returned headers.
-4. Call `POST /v1/recipient/uploads/{fileId}/complete`.
-5. Show scan status. Submission can include the file only after it is `"Clean"`.
-
 ### POST `/v1/recipient/uploads`
 
-Request:
+Creates a signed upload URL and applies storage quota.
 
 ```json
 {
@@ -1253,73 +885,23 @@ Request:
 }
 ```
 
-Response `201`:
-
-```json
-{
-  "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-  "storageKey": "quarantine/22222222-2222-2222-2222-222222222222/cccccccc-cccc-cccc-cccc-cccccccccccc/government-id.pdf",
-  "uploadUrl": "https://nyc3.digitaloceanspaces.com/...",
-  "headers": {
-    "Content-Type": "application/pdf"
-  },
-  "expiresAt": "2026-07-15T18:35:00Z"
-}
-```
+Response includes `retentionUntil`, same shape as dashboard upload intents.
 
 ### POST `/v1/recipient/uploads/{fileId}/complete`
 
-Request body: none.
-
-Response:
-
-```json
-{
-  "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-  "scanStatus": "Pending",
-  "scanCompletedAt": null
-}
-```
+Marks upload received and pending scan.
 
 ### DELETE `/v1/recipient/uploads/{fileId}`
 
-Deletes the object from storage and marks it deleted.
-
-Response: `204 No Content`.
+Deletes a draft upload.
 
 ### POST `/v1/recipient/return-link`
 
-Use when a recipient has a valid session and wants a return-link email queued. Current backend queues the delivery record.
-
-Request body: none.
-
-Response `202`:
-
-```json
-{
-  "queued": true
-}
-```
-
-### Recipient Submit Flow
-
-UI scenario:
-
-1. Validate required non-file fields client-side.
-2. Ensure file requirements have uploaded files that have passed scanning.
-3. Show declaration checkbox.
-4. Submit with `POST /v1/recipient/submit` and an `Idempotency-Key`.
-5. Route to receipt screen.
+Rotates token and emails a fresh link. Returns `202`.
 
 ### POST `/v1/recipient/submit`
 
-Recommended header:
-
-```text
-Idempotency-Key: recipient-submit-<uuid>
-```
-
-Request:
+Use `Idempotency-Key`.
 
 ```json
 {
@@ -1333,7 +915,7 @@ Request:
 }
 ```
 
-Response `201`:
+`201`:
 
 ```json
 {
@@ -1342,44 +924,227 @@ Response `201`:
   "status": "Submitted",
   "submittedAt": "2026-07-16T14:30:00Z",
   "contentHash": "e3b0c44298fc1c149afbf4c8996fb924..."
-}
-```
-
-Validation error with missing required fields:
-
-```json
-{
-  "type": "https://docs.atlas.example/errors/validation_failed",
-  "title": "Validation failed",
-  "status": 422,
-  "code": "validation_failed",
-  "errors": {
-    "requirements": ["legal_name"]
-  }
 }
 ```
 
 ### GET `/v1/recipient/receipt`
 
-Response:
+Returns the latest submission receipt.
+
+## Developer Experience
+
+Recommended frontend route: `/developer`.
+
+Product policy:
+
+- Every org can create sandbox keys immediately.
+- Sandbox keys use `atl_test_...`.
+- Sandbox keys can only call `/v1/sandbox/*`.
+- Sandbox endpoints validate request shape and return realistic responses without creating production recipients, emails, tokens, files, submissions, or usage.
+- Production keys use `atl_live_...`.
+- Production keys require `api_and_webhooks` entitlement and platform admin approval.
+- API secrets are shown once in the dashboard response. They are never emailed and never returned again.
+
+### GET `/v1/developer/reference`
+
+Returns the OpenAPI URL, endpoint groups, and sample code for a developer page.
+
+### GET `/v1/developer/access`
 
 ```json
 {
-  "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
-  "versionNumber": 1,
-  "status": "Submitted",
-  "submittedAt": "2026-07-16T14:30:00Z",
-  "contentHash": "e3b0c44298fc1c149afbf4c8996fb924..."
+  "status": "SandboxOnly",
+  "sandboxAvailable": true,
+  "productionAvailable": false,
+  "planAllowsProduction": false,
+  "requestedAt": null,
+  "approvedAt": null,
+  "rejectedAt": null,
+  "notes": null
 }
+```
+
+### POST `/v1/developer/access/production-request`
+
+```json
+{
+  "useCase": "Sync onboarding requests from our HRIS.",
+  "expectedVolume": "200 checklists per month",
+  "message": "We are ready to test production API access."
+}
+```
+
+`202` returns the updated access response.
+
+### GET `/v1/developer/api-keys`
+
+Alias: `GET /v1/api-keys`.
+
+```json
+{
+  "items": [
+    {
+      "id": "55555555-5555-5555-5555-555555555555",
+      "name": "Sandbox integration",
+      "keyPrefix": "atl_test_ab12cd34",
+      "environment": "Sandbox",
+      "scopes": ["sandbox:*"],
+      "lastUsedAt": null,
+      "expiresAt": "2027-01-12T05:00:00Z",
+      "revokedAt": null,
+      "createdAt": "2026-07-16T05:00:00Z"
+    }
+  ]
+}
+```
+
+### POST `/v1/developer/api-keys`
+
+Sandbox key:
+
+```json
+{
+  "name": "Sandbox integration",
+  "environment": "Sandbox",
+  "scopes": ["sandbox:*"],
+  "expiresAt": null
+}
+```
+
+`201`:
+
+```json
+{
+  "id": "55555555-5555-5555-5555-555555555555",
+  "name": "Sandbox integration",
+  "keyPrefix": "atl_test_ab12cd34",
+  "environment": "Sandbox",
+  "secret": "atl_test_ab12cd34_abcdefghijklmnopqrstuvwxyz",
+  "scopes": ["sandbox:*"],
+  "expiresAt": "2027-01-12T05:00:00Z",
+  "createdAt": "2026-07-16T05:00:00Z"
+}
+```
+
+Production key after approval:
+
+```json
+{
+  "name": "Production integration",
+  "environment": "Production",
+  "scopes": ["templates:read", "actions:write", "files:write"],
+  "expiresAt": null
+}
+```
+
+Expected blocking states:
+
+```text
+402 feature_not_available: org is not on Business/Scale
+403 production_developer_access_required: platform admin has not approved production access
+```
+
+### DELETE `/v1/developer/api-keys/{id}`
+
+Revokes the key.
+
+### Sandbox APIs
+
+Use these with either dashboard auth or `atl_test_...` sandbox keys.
+
+#### GET `/v1/sandbox/status`
+
+```json
+{
+  "organizationId": "22222222-2222-2222-2222-222222222222",
+  "environment": "sandbox",
+  "dataPersistence": "none",
+  "message": "Sandbox endpoints validate request shape and return realistic sample responses without touching production checklist or file data."
+}
+```
+
+#### GET `/v1/sandbox/templates`
+
+Returns sample sandbox templates.
+
+#### POST `/v1/sandbox/checklists`
+
+```json
+{
+  "title": "Vendor Insurance Renewal",
+  "recipientEmail": "jamie@example.com",
+  "templateId": "sandbox-template-vendor-insurance",
+  "payload": {
+    "insurance_certificate": "sample.pdf",
+    "expiry_date": "2026-12-31"
+  }
+}
+```
+
+`201`:
+
+```json
+{
+  "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "organizationId": "22222222-2222-2222-2222-222222222222",
+  "title": "Vendor Insurance Renewal",
+  "recipientEmail": "jamie@example.com",
+  "environment": "sandbox",
+  "status": "validated",
+  "message": "No production action, recipient token, email, or file record was created."
+}
+```
+
+### Webhooks
+
+Production webhooks require Business/Scale entitlement and platform production developer approval.
+
+Aliases:
+
+```text
+/v1/webhooks
+/v1/developer/webhooks
+```
+
+#### POST `/v1/developer/webhooks`
+
+```json
+{
+  "url": "https://example.com/reqara/webhook",
+  "eventTypes": ["action.sent", "submission.accepted"],
+  "status": "Active"
+}
+```
+
+`201`:
+
+```json
+{
+  "id": "77777777-7777-7777-7777-777777777777",
+  "url": "https://example.com/reqara/webhook",
+  "eventTypes": ["action.sent", "submission.accepted"],
+  "status": "Active",
+  "secret": "one-time-webhook-signing-secret",
+  "createdAt": "2026-07-16T05:00:00Z"
+}
+```
+
+Other endpoints:
+
+```text
+GET /v1/developer/webhooks
+GET /v1/developer/webhooks/{id}
+PATCH /v1/developer/webhooks/{id}
+POST /v1/developer/webhooks/{id}/rotate-secret
+DELETE /v1/developer/webhooks/{id}
+GET /v1/developer/webhooks/{id}/deliveries
 ```
 
 ## Public Interest Intake
 
-Use this on a marketing site or "Request access" page. It does not require auth.
+Use on marketing/contact sales. Self-serve Free signup does not need this flow.
 
 ### POST `/v1/public/interests`
-
-Request:
 
 ```json
 {
@@ -1397,7 +1162,7 @@ Request:
 }
 ```
 
-Response `202`:
+`202`:
 
 ```json
 {
@@ -1406,29 +1171,19 @@ Response `202`:
 }
 ```
 
-Frontend note: public callers cannot set internal status, internal notes, or assignee. The backend always creates public interests as `"New"`.
+## Frontend Implementation Checklist
 
-## Implementation Checklist
-
-- Always call dashboard and recipient APIs with `credentials: "include"`.
-- Store only organization IDs and UI state in local storage. Do not store raw cookies, API keys, checklist raw tokens, or signed URLs.
-- Treat signed upload/download URLs as short-lived.
-- Use `Idempotency-Key` for action creation and recipient submission.
-- For `/c/{token}` pages, set `Referrer-Policy: no-referrer`.
-- Hide raw checklist links in normal support logs. Show only the first 6 token characters if needed.
-- On `401`, route dashboard users to login and recipients back to the original link screen.
-- On `403 otp_required`, show the OTP form.
-- On `409 concurrency_conflict`, refresh recipient checklist drafts before saving again.
-- On `503 email_send_failed` or `otp_email_failed`, show a retry option and support fallback.
-
-## Current Backend Gaps To Plan Around
-
-These are not frontend blockers for the documented endpoints, but they matter for a polished production UI.
-
-- Template management currently supports list, create, and publish only. There is no template detail, update, archive, or version-edit endpoint yet.
-- Checklist creation currently accepts one recipient. The database can model multiple recipients, but the create endpoint takes a single `recipient`.
-- Organization member management is not exposed yet. Signup creates an owner; platform lead approval can create an owner; dashboard invite/edit/remove member endpoints are still needed.
-- Recipient file status polling is not exposed yet. The recipient receives status from upload completion, but there is no `GET /v1/recipient/uploads/{fileId}` endpoint to poll scanner completion.
-- `POST /v1/recipient/return-link` queues a delivery record, but the current backend does not yet send that return-link email.
-- Requesting changes on a submission updates review state, but it does not automatically send the recipient an email. Use checklist reminders until a dedicated changes-requested email endpoint exists.
-- Dashboard list endpoints do not currently expose pagination. Add pagination before high-volume production use.
+- Use `GET /v1/me` on boot.
+- Keep organization ID in frontend state and send `X-Atlas-Organization-Id` when needed.
+- Use `GET /v1/organizations/{id}/entitlements` to lock paid features.
+- Use `GET /v1/dashboard/summary` for the attention-first dashboard.
+- Use template search as the first library experience.
+- Show API key `secret` exactly once and push the user to copy it.
+- Do not email, log, or store raw API keys.
+- Do not log raw checklist links or signed URLs.
+- Set `Referrer-Policy: no-referrer` on `/c/{token}` pages.
+- Use `Idempotency-Key` for action create and recipient submit.
+- On `402`, show upgrade messaging based on `plan` and `usage`.
+- On `403 production_developer_access_required`, show request/approval status from `/v1/developer/access`.
+- On `403 sandbox_key_not_allowed`, tell developers to use `/v1/sandbox/*` or create a production key after approval.
+- Treat scanner integration, payments, SSO, and e-signatures as not self-serve yet.

@@ -1,9 +1,12 @@
 using Atlas.Api.Endpoints;
 using Atlas.Api.Filters;
+using Atlas.Api.Services;
 using Atlas.Infrastructure;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.RateLimiting;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 const string PermissiveCorsPolicy = "PermissiveCors";
@@ -42,6 +45,37 @@ builder.Services.AddCors(options =>
     });
 });
 builder.Services.AddAuthorization();
+builder.Services.AddRateLimiter(options =>
+{
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
+    {
+        var forwardedFor = context.Request.Headers["CF-Connecting-IP"].FirstOrDefault()
+            ?? context.Request.Headers["X-Forwarded-For"].FirstOrDefault()?.Split(',')[0].Trim();
+        var key = string.IsNullOrWhiteSpace(forwardedFor)
+            ? context.Connection.RemoteIpAddress?.ToString() ?? "unknown"
+            : forwardedFor;
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            key,
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 300,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, cancellationToken) =>
+    {
+        await Results.Problem(
+            title: "Too many requests.",
+            statusCode: StatusCodes.Status429TooManyRequests,
+            type: "https://docs.atlas.example/errors/rate_limited",
+            extensions: new Dictionary<string, object?> { ["code"] = "rate_limited" })
+            .ExecuteAsync(context.HttpContext);
+    };
+});
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
@@ -57,6 +91,8 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 builder.Services.AddAtlasInfrastructure(builder.Configuration);
+builder.Services.AddHostedService<ReminderDispatcherService>();
+builder.Services.AddHostedService<RetentionPurgeService>();
 
 var app = builder.Build();
 
@@ -87,17 +123,21 @@ if (!app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseCors(PermissiveCorsPolicy);
+app.UseRateLimiter();
 app.UseAtlasSecurityHeaders();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseAtlasTenantContext();
 
+app.UseSwagger(options =>
+{
+    options.RouteTemplate = "openapi/{documentName}.json";
+});
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
     app.UseSwaggerUI(options =>
     {
-        options.SwaggerEndpoint("/swagger/v1/swagger.json", "Reqara API v1");
+        options.SwaggerEndpoint("/openapi/v1.json", "Reqara API v1");
     });
 }
 

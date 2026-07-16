@@ -1,5 +1,6 @@
 using Atlas.Domain.Common;
 using Atlas.Domain.Enums;
+using System.Net;
 
 namespace Atlas.Domain.Entities;
 
@@ -13,6 +14,8 @@ public sealed class Submission : Entity
     public DateTimeOffset? ReviewedAt { get; set; }
     public Guid? ReviewedByUserId { get; set; }
     public string? ReviewComment { get; set; }
+    public DateTimeOffset? DeclarationAcceptedAt { get; set; }
+    public IPAddress? DeclarationIpAddress { get; set; }
     public byte[] ContentHash { get; set; } = Array.Empty<byte>();
 
     public ChecklistAction? Action { get; set; }

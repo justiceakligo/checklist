@@ -84,6 +84,11 @@ public sealed class AtlasDbContext(
             entity.Property(e => e.Timezone).HasMaxLength(64).IsRequired();
             entity.Property(e => e.DefaultLanguage).HasMaxLength(12).IsRequired();
             entity.Property(e => e.AccentColor).HasMaxLength(7);
+            entity.Property(e => e.DeveloperAccessStatus).HasConversion<short>().IsRequired();
+            entity.Property(e => e.DeveloperProductionRequestedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeveloperProductionApprovedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeveloperProductionRejectedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeveloperProductionNotes).HasMaxLength(1000);
             entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.DeletedAt).HasColumnType("timestamptz");
@@ -336,6 +341,8 @@ public sealed class AtlasDbContext(
             entity.Property(e => e.Status).HasConversion<short>().IsRequired();
             entity.Property(e => e.SubmittedAt).HasColumnType("timestamptz");
             entity.Property(e => e.ReviewedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeclarationAcceptedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeclarationIpAddress).HasColumnType("inet");
             entity.Property(e => e.ContentHash).IsRequired();
             entity.HasOne(e => e.Action)
                 .WithMany(e => e.Submissions)
@@ -482,8 +489,9 @@ public sealed class AtlasDbContext(
             entity.ToTable("api_keys");
             entity.HasIndex(e => new { e.OrganizationId, e.KeyPrefix }).HasDatabaseName("ix_api_keys_org_prefix");
             entity.Property(e => e.Name).HasMaxLength(120).IsRequired();
-            entity.Property(e => e.KeyPrefix).HasMaxLength(16).IsRequired();
+            entity.Property(e => e.KeyPrefix).HasMaxLength(32).IsRequired();
             entity.Property(e => e.SecretHash).IsRequired();
+            entity.Property(e => e.Environment).HasConversion<short>().IsRequired();
             entity.Property(e => e.LastUsedAt).HasColumnType("timestamptz");
             entity.Property(e => e.ExpiresAt).HasColumnType("timestamptz");
             entity.Property(e => e.RevokedAt).HasColumnType("timestamptz");
@@ -588,6 +596,117 @@ public sealed class AtlasDbContext(
                 .OnDelete(DeleteBehavior.Restrict);
 
             var seededAt = new DateTimeOffset(2026, 7, 15, 0, 0, 0, TimeSpan.Zero);
+            var billingPlansJson =
+                """
+                {
+                  "plans": [
+                    {
+                      "code": "free",
+                      "name": "Free",
+                      "description": "Try Reqara on real requests.",
+                      "monthlyPriceCents": 0,
+                      "annualPriceCents": 0,
+                      "currency": "USD",
+                      "monthlyChecklistLimit": 10,
+                      "storageBytes": 524288000,
+                      "customPricing": false,
+                      "features": {
+                        "teamWorkspace": true,
+                        "templateLibrary": true,
+                        "reqaraBranding": true,
+                        "customBranding": false,
+                        "automaticReminders": false,
+                        "apiAndWebhooks": false,
+                        "customWorkflows": false,
+                        "prioritySupport": false,
+                        "sso": false,
+                        "customRetention": false,
+                        "securityReview": false,
+                        "dpa": false,
+                        "dedicatedOnboarding": false
+                      }
+                    },
+                    {
+                      "code": "starter",
+                      "name": "Starter",
+                      "description": "For solo pros and small teams.",
+                      "monthlyPriceCents": 3900,
+                      "annualPriceCents": 39000,
+                      "currency": "USD",
+                      "monthlyChecklistLimit": 100,
+                      "storageBytes": 5368709120,
+                      "customPricing": false,
+                      "features": {
+                        "teamWorkspace": true,
+                        "templateLibrary": true,
+                        "reqaraBranding": false,
+                        "customBranding": true,
+                        "automaticReminders": true,
+                        "apiAndWebhooks": false,
+                        "customWorkflows": false,
+                        "prioritySupport": false,
+                        "sso": false,
+                        "customRetention": false,
+                        "securityReview": false,
+                        "dpa": false,
+                        "dedicatedOnboarding": false
+                      }
+                    },
+                    {
+                      "code": "business",
+                      "name": "Business",
+                      "description": "For teams sending every day.",
+                      "monthlyPriceCents": 9900,
+                      "annualPriceCents": 99000,
+                      "currency": "USD",
+                      "monthlyChecklistLimit": 500,
+                      "storageBytes": 26843545600,
+                      "customPricing": false,
+                      "features": {
+                        "teamWorkspace": true,
+                        "templateLibrary": true,
+                        "reqaraBranding": false,
+                        "customBranding": true,
+                        "automaticReminders": true,
+                        "apiAndWebhooks": true,
+                        "customWorkflows": true,
+                        "prioritySupport": true,
+                        "sso": false,
+                        "customRetention": false,
+                        "securityReview": false,
+                        "dpa": false,
+                        "dedicatedOnboarding": false
+                      }
+                    },
+                    {
+                      "code": "scale",
+                      "name": "Scale",
+                      "description": "For regulated and high-volume use.",
+                      "monthlyPriceCents": null,
+                      "annualPriceCents": null,
+                      "currency": "USD",
+                      "monthlyChecklistLimit": null,
+                      "storageBytes": null,
+                      "customPricing": true,
+                      "features": {
+                        "teamWorkspace": true,
+                        "templateLibrary": true,
+                        "reqaraBranding": false,
+                        "customBranding": true,
+                        "automaticReminders": true,
+                        "apiAndWebhooks": true,
+                        "customWorkflows": true,
+                        "prioritySupport": true,
+                        "sso": true,
+                        "customRetention": true,
+                        "securityReview": true,
+                        "dpa": true,
+                        "dedicatedOnboarding": true
+                      }
+                    }
+                  ]
+                }
+                """;
             entity.HasData(
                 new AdminSetting
                 {
@@ -778,6 +897,76 @@ public sealed class AtlasDbContext(
                     Category = "DigitalOceanSpaces",
                     Key = "ForcePathStyle",
                     ValueJson = "false",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("2c3051c8-b7d3-4e8a-bd6f-48d34de91201"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "billing",
+                    Key = "defaultPlanCode",
+                    ValueJson = "\"free\"",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("49da403e-f91d-4f17-bdb0-ef52117edeb4"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "billing",
+                    Key = "plans",
+                    ValueJson = billingPlansJson,
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("e2b64e8a-7b31-443b-84d8-5a8539db9eed"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "reminders",
+                    Key = "beforeDueDays",
+                    ValueJson = "3",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("ed4541b0-14bf-4a5a-b74c-19f18ce1223e"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "reminders",
+                    Key = "overdueDays",
+                    ValueJson = "1",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("4f7ea49d-6d39-4ae7-8d73-6283d2598131"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "reminders",
+                    Key = "dispatchIntervalSeconds",
+                    ValueJson = "60",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("4d0cf604-c972-49dd-965f-50dd5d0638c2"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "retention",
+                    Key = "purgeIntervalMinutes",
+                    ValueJson = "60",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("cb7399c6-3275-45d6-a5e8-f59d923208f2"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "developer",
+                    Key = "apiKeyDefaultDays",
+                    ValueJson = "180",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 });

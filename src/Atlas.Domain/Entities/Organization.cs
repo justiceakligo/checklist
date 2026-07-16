@@ -14,6 +14,11 @@ public sealed class Organization : Entity, ISoftDelete
     public string? AccentColor { get; set; }
     public string? PrivacyStatement { get; set; }
     public int RetentionDays { get; set; } = 365;
+    public DeveloperAccessStatus DeveloperAccessStatus { get; set; } = DeveloperAccessStatus.SandboxOnly;
+    public DateTimeOffset? DeveloperProductionRequestedAt { get; set; }
+    public DateTimeOffset? DeveloperProductionApprovedAt { get; set; }
+    public DateTimeOffset? DeveloperProductionRejectedAt { get; set; }
+    public string? DeveloperProductionNotes { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? DeletedAt { get; set; }

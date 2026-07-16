@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Atlas.Api.Email;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Billing;
 using Atlas.Application.Email;
 using Atlas.Application.Settings;
 using Atlas.Application.Storage;
@@ -23,6 +24,9 @@ public static class AtlasEndpoints
             .WithTags("Health");
 
         MapAuthAndOrganization(v1);
+        MapBilling(v1);
+        MapDashboard(v1);
+        MapOrganizationMembers(v1);
         MapAdminSettings(v1);
         MapTemplates(v1);
         MapActions(v1);
@@ -83,12 +87,16 @@ public static class AtlasEndpoints
             };
             user.PasswordHash = new PasswordHasher<AppUser>().HashPassword(user, request.Password);
 
+            var defaultRetentionDays = EndpointHelpers.ReadPositiveIntSetting(
+                (await settings.GetAsync(null, "retention", "defaultRetentionDays", cancellationToken))?.ValueJson,
+                365);
             var organization = new Organization
             {
                 Name = request.OrganizationName.Trim(),
                 Slug = slug,
                 Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "UTC" : request.Timezone.Trim(),
                 DefaultLanguage = string.IsNullOrWhiteSpace(request.DefaultLanguage) ? "en" : request.DefaultLanguage.Trim(),
+                RetentionDays = defaultRetentionDays,
                 CreatedAt = now,
                 UpdatedAt = now
             };
@@ -197,7 +205,9 @@ public static class AtlasEndpoints
             Guid id,
             UpdateOrganizationRequest request,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
             ITenantContext tenantContext,
+            IAtlasClock clock,
             CancellationToken cancellationToken) =>
         {
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
@@ -214,6 +224,24 @@ public static class AtlasEndpoints
             if (organization is null)
             {
                 return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (request.AccentColor is not null && request.AccentColor != organization.AccentColor)
+            {
+                var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_branding", cancellationToken);
+                if (!feature.Allowed)
+                {
+                    return EndpointHelpers.EntitlementProblem(feature);
+                }
+            }
+
+            if (request.RetentionDays is > 0 && request.RetentionDays.Value != organization.RetentionDays)
+            {
+                var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_retention", cancellationToken);
+                if (!feature.Allowed)
+                {
+                    return EndpointHelpers.EntitlementProblem(feature);
+                }
             }
 
             organization.Name = string.IsNullOrWhiteSpace(request.Name) ? organization.Name : request.Name.Trim();
@@ -238,6 +266,321 @@ public static class AtlasEndpoints
                 organization.RetentionDays,
                 organization.CreatedAt,
                 organization.UpdatedAt));
+        });
+    }
+
+    private static void MapBilling(RouteGroupBuilder v1)
+    {
+        var group = v1.MapGroup("/billing").WithTags("Billing");
+
+        group.MapGet("/plans", async (
+            IEntitlementService entitlements,
+            CancellationToken cancellationToken) =>
+        {
+            var plans = await entitlements.ListPlansAsync(cancellationToken);
+            return Results.Ok(new { items = plans });
+        });
+
+        v1.MapGet("/organizations/{id:guid}/entitlements", async (
+            Guid id,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            if (organizationId != id)
+            {
+                return EndpointHelpers.Problem("forbidden", "The organization context does not match the route.", StatusCodes.Status403Forbidden);
+            }
+
+            return Results.Ok(await entitlements.GetOrganizationEntitlementsAsync(id, clock.UtcNow, cancellationToken));
+        }).WithTags("Billing");
+    }
+
+    private static void MapDashboard(RouteGroupBuilder v1)
+    {
+        var group = v1.MapGroup("/dashboard").WithTags("Dashboard");
+
+        group.MapGet("/summary", async (
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var now = clock.UtcNow;
+            var tomorrow = now.AddDays(1);
+            var actions = await dbContext.Actions
+                .AsNoTracking()
+                .Include(item => item.Recipients)
+                .OrderByDescending(item => item.CreatedAt)
+                .ToListAsync(cancellationToken);
+            var submissions = await dbContext.Submissions
+                .AsNoTracking()
+                .ToListAsync(cancellationToken);
+            var pendingFiles = await dbContext.FileAssets
+                .AsNoTracking()
+                .CountAsync(item => item.ScanStatus == FileScanStatus.Pending, cancellationToken);
+            var rejectedFiles = await dbContext.FileAssets
+                .AsNoTracking()
+                .CountAsync(item => item.ScanStatus == FileScanStatus.Rejected, cancellationToken);
+            var waitingRecipients = actions
+                .SelectMany(action => action.Recipients.Select(recipient => new { action, recipient }))
+                .Where(item => item.recipient.Status != ActionRecipientStatus.Submitted
+                    && item.action.Status is not ChecklistActionStatus.Cancelled and not ChecklistActionStatus.Completed and not ChecklistActionStatus.Expired)
+                .ToList();
+
+            var attention = waitingRecipients
+                .OrderByDescending(item => item.action.DueAt is not null && item.action.DueAt < now)
+                .ThenBy(item => item.action.DueAt ?? DateTimeOffset.MaxValue)
+                .ThenByDescending(item => item.recipient.LastActivityAt ?? item.recipient.CreatedAt)
+                .Take(10)
+                .Select(item => new DashboardAttentionItem(
+                    item.action.Id,
+                    item.action.Title,
+                    item.action.DueAt,
+                    item.recipient.Id,
+                    item.recipient.Name,
+                    item.recipient.Email,
+                    item.recipient.Status,
+                    item.recipient.LastActivityAt,
+                    item.action.DueAt is not null && item.action.DueAt < now,
+                    item.action.DueAt is not null && item.action.DueAt >= now && item.action.DueAt <= tomorrow))
+                .ToList();
+
+            return Results.Ok(new DashboardSummaryResponse(
+                organizationId,
+                now,
+                new DashboardNeedsAttention(
+                    waitingRecipients.Count,
+                    waitingRecipients.Count(item => item.action.DueAt is not null && item.action.DueAt < now),
+                    waitingRecipients.Count(item => item.action.DueAt is not null && item.action.DueAt >= now && item.action.DueAt <= tomorrow)),
+                new DashboardChecklistCounts(
+                    actions.Count,
+                    actions.Count(item => item.Status == ChecklistActionStatus.Draft),
+                    actions.Count(item => item.Status is ChecklistActionStatus.Sent or ChecklistActionStatus.InProgress),
+                    actions.Count(item => item.Status == ChecklistActionStatus.Submitted),
+                    actions.Count(item => item.Status == ChecklistActionStatus.Completed),
+                    actions.Count(item => item.Status == ChecklistActionStatus.Cancelled),
+                    actions.Count(item => item.Status == ChecklistActionStatus.Expired)),
+                new DashboardSubmissionCounts(
+                    submissions.Count,
+                    submissions.Count(item => item.Status == SubmissionStatus.Submitted),
+                    submissions.Count(item => item.Status == SubmissionStatus.Accepted),
+                    submissions.Count(item => item.Status == SubmissionStatus.ChangesRequested)),
+                new DashboardFileCounts(pendingFiles, rejectedFiles),
+                attention,
+                await entitlements.GetOrganizationEntitlementsAsync(organizationId, now, cancellationToken)));
+        });
+    }
+
+    private static void MapOrganizationMembers(RouteGroupBuilder v1)
+    {
+        var group = v1.MapGroup("/organization-members").WithTags("Organization members");
+
+        group.MapGet("", async (
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+
+            var members = await dbContext.OrganizationUsers
+                .AsNoTracking()
+                .Include(item => item.User)
+                .OrderBy(item => item.User!.FullName)
+                .ToListAsync(cancellationToken);
+            return Results.Ok(new { items = members.Select(ToMemberResponse).ToList() });
+        });
+
+        group.MapPost("", async (
+            CreateOrganizationMemberRequest request,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            if (!EndpointHelpers.HasScope(tenantContext, "admin:*"))
+            {
+                return EndpointHelpers.Problem("forbidden", "Admin scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            if (string.IsNullOrWhiteSpace(request.Email) || string.IsNullOrWhiteSpace(request.FullName))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Email and full name are required.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var role = request.Role ?? OrganizationUserRole.Member;
+            var status = request.Status ?? MembershipStatus.Active;
+            if (!Enum.IsDefined(role) || !Enum.IsDefined(status))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Role or status is invalid.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var email = request.Email.Trim().ToLowerInvariant();
+            var existingMembership = await dbContext.OrganizationUsers.IgnoreQueryFilters()
+                .AnyAsync(item => item.OrganizationId == organizationId
+                    && item.User != null
+                    && item.User.Email == email,
+                    cancellationToken);
+            if (existingMembership)
+            {
+                return EndpointHelpers.Problem("member_exists", "This email is already a member of the organization.", StatusCodes.Status409Conflict);
+            }
+
+            var user = await dbContext.Users.IgnoreQueryFilters()
+                .FirstOrDefaultAsync(item => item.Email == email, cancellationToken);
+            if (user is null)
+            {
+                if (string.IsNullOrWhiteSpace(request.Password))
+                {
+                    return EndpointHelpers.Problem("validation_failed", "Password is required when creating a new user directly.", StatusCodes.Status422UnprocessableEntity);
+                }
+
+                user = new AppUser
+                {
+                    Email = email,
+                    FullName = request.FullName.Trim(),
+                    CreatedAt = clock.UtcNow
+                };
+                user.PasswordHash = new PasswordHasher<AppUser>().HashPassword(user, request.Password);
+                dbContext.Users.Add(user);
+            }
+            else
+            {
+                user.FullName = string.IsNullOrWhiteSpace(request.FullName) ? user.FullName : request.FullName.Trim();
+            }
+
+            var membership = new OrganizationUser
+            {
+                OrganizationId = organizationId,
+                User = user,
+                Role = role,
+                Status = status,
+                InvitedAt = status == MembershipStatus.Invited ? clock.UtcNow : null,
+                JoinedAt = status == MembershipStatus.Active ? clock.UtcNow : null,
+                CreatedAt = clock.UtcNow
+            };
+
+            dbContext.OrganizationUsers.Add(membership);
+            SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "organization.member_created", new { user.Email, membership.Role, membership.Status }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Created($"/v1/organization-members/{membership.Id}", ToMemberResponse(membership));
+        });
+
+        group.MapPatch("/{id:guid}", async (
+            Guid id,
+            UpdateOrganizationMemberRequest request,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            if (!EndpointHelpers.HasScope(tenantContext, "admin:*"))
+            {
+                return EndpointHelpers.Problem("forbidden", "Admin scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            var membership = await dbContext.OrganizationUsers
+                .Include(item => item.User)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (membership?.User is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization member was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var nextRole = request.Role ?? membership.Role;
+            var nextStatus = request.Status ?? membership.Status;
+            if (!Enum.IsDefined(nextRole) || !Enum.IsDefined(nextStatus))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Role or status is invalid.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (membership.Role == OrganizationUserRole.Owner
+                && (nextRole != OrganizationUserRole.Owner || nextStatus != MembershipStatus.Active)
+                && !await HasAnotherActiveOrganizationOwnerAsync(dbContext, organizationId, membership.Id, cancellationToken))
+            {
+                return EndpointHelpers.Problem("last_owner", "At least one active organization owner is required.", StatusCodes.Status409Conflict);
+            }
+
+            membership.Role = nextRole;
+            membership.Status = nextStatus;
+            membership.JoinedAt = nextStatus == MembershipStatus.Active ? membership.JoinedAt ?? clock.UtcNow : membership.JoinedAt;
+            membership.InvitedAt = nextStatus == MembershipStatus.Invited ? membership.InvitedAt ?? clock.UtcNow : membership.InvitedAt;
+            if (!string.IsNullOrWhiteSpace(request.FullName))
+            {
+                membership.User.FullName = request.FullName.Trim();
+            }
+            if (!string.IsNullOrWhiteSpace(request.Password))
+            {
+                membership.User.PasswordHash = new PasswordHasher<AppUser>().HashPassword(membership.User, request.Password);
+            }
+
+            SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "organization.member_updated", new { membership.Id, membership.User.Email, membership.Role, membership.Status }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToMemberResponse(membership));
+        });
+
+        group.MapDelete("/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            if (!EndpointHelpers.HasScope(tenantContext, "admin:*"))
+            {
+                return EndpointHelpers.Problem("forbidden", "Admin scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            var membership = await dbContext.OrganizationUsers
+                .Include(item => item.User)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (membership?.User is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization member was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (membership.Role == OrganizationUserRole.Owner
+                && !await HasAnotherActiveOrganizationOwnerAsync(dbContext, organizationId, membership.Id, cancellationToken))
+            {
+                return EndpointHelpers.Problem("last_owner", "At least one active organization owner is required.", StatusCodes.Status409Conflict);
+            }
+
+            membership.Status = MembershipStatus.Disabled;
+            SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "organization.member_disabled", new { membership.Id, membership.User.Email }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.NoContent();
         });
     }
 
@@ -345,6 +688,7 @@ public static class AtlasEndpoints
         group.MapPost("", async (
             CreateTemplateRequest request,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
             ITenantContext tenantContext,
             IAtlasClock clock,
             CancellationToken cancellationToken) =>
@@ -360,6 +704,12 @@ public static class AtlasEndpoints
                     "validation_failed",
                     "Template name and title are required.",
                     StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
             }
 
             var now = clock.UtcNow;
@@ -401,9 +751,22 @@ public static class AtlasEndpoints
         group.MapPost("/{id:guid}/publish", async (
             Guid id,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
             IAtlasClock clock,
             CancellationToken cancellationToken) =>
         {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
             var template = await dbContext.Templates
                 .Include(item => item.Versions)
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
@@ -432,8 +795,20 @@ public static class AtlasEndpoints
     {
         var group = v1.MapGroup("/actions").WithTags("Actions");
 
-        group.MapGet("", async (AtlasDbContext dbContext, CancellationToken cancellationToken) =>
+        group.MapGet("", async (
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
         {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
+
             var actions = await dbContext.Actions
                 .AsNoTracking()
                 .OrderByDescending(action => action.CreatedAt)
@@ -460,6 +835,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             var action = await dbContext.Actions
@@ -493,6 +872,7 @@ public static class AtlasEndpoints
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             IAdminSettingService settings,
+            IEntitlementService entitlements,
             IEmailService emailService,
             IConfiguration configuration,
             ISecretHasher secretHasher,
@@ -503,6 +883,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             if (request.CreatedByUserId == Guid.Empty
@@ -541,6 +925,15 @@ public static class AtlasEndpoints
             if (organization is null)
             {
                 return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (request.SendImmediately)
+            {
+                var limit = await entitlements.CanSendChecklistAsync(organizationId, clock.UtcNow, 1, cancellationToken);
+                if (!limit.Allowed)
+                {
+                    return EndpointHelpers.EntitlementProblem(limit);
+                }
             }
 
             var idempotencyKey = httpContext.Request.Headers["Idempotency-Key"].FirstOrDefault();
@@ -639,6 +1032,7 @@ public static class AtlasEndpoints
                     OccurredAt = clock.UtcNow,
                     CreatedAt = clock.UtcNow
                 });
+                await ScheduleAutomaticRemindersAsync(action, organizationId, entitlements, settings, clock, cancellationToken);
                 SecurityEndpoints.AddAudit(dbContext, organizationId, action.Id, tenantContext, "action.sent", new { actionId = action.Id, recipientId = recipient.Id, send.TokenPrefix }, httpContext);
                 await dbContext.SaveChangesAsync(cancellationToken);
             }
@@ -676,6 +1070,7 @@ public static class AtlasEndpoints
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             IAdminSettingService settings,
+            IEntitlementService entitlements,
             IEmailService emailService,
             IConfiguration configuration,
             ISecretHasher secretHasher,
@@ -687,11 +1082,16 @@ public static class AtlasEndpoints
             {
                 return problem!;
             }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
 
             var action = await dbContext.Actions
                 .Include(item => item.Organization)
                 .Include(item => item.CreatedByUser)
                 .Include(item => item.Recipients)
+                .ThenInclude(item => item.ReminderSchedules)
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
             if (action?.Organization is null || action.CreatedByUser is null)
             {
@@ -704,6 +1104,15 @@ public static class AtlasEndpoints
             }
 
             var wasAlreadySent = action.SentAt.HasValue;
+            if (!wasAlreadySent)
+            {
+                var limit = await entitlements.CanSendChecklistAsync(organizationId, clock.UtcNow, 1, cancellationToken);
+                if (!limit.Allowed)
+                {
+                    return EndpointHelpers.EntitlementProblem(limit);
+                }
+            }
+
             var graceDaysSetting = await settings.GetAsync(organizationId, "security", "recipientTokenGraceDays", cancellationToken)
                 ?? await settings.GetAsync(organizationId, "security", "recipientTokenDays", cancellationToken);
             var graceDays = EndpointHelpers.ReadPositiveIntSetting(graceDaysSetting?.ValueJson, 30);
@@ -767,6 +1176,7 @@ public static class AtlasEndpoints
                     OccurredAt = clock.UtcNow,
                     CreatedAt = clock.UtcNow
                 });
+                await ScheduleAutomaticRemindersAsync(action, organizationId, entitlements, settings, clock, cancellationToken);
             }
             SecurityEndpoints.AddAudit(dbContext, organizationId, action.Id, tenantContext, "action.sent", new { action.Id, recipients = sendResults.Select(item => new { item.RecipientId, item.TokenPrefix }) }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
@@ -784,6 +1194,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             var action = await dbContext.Actions.FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
@@ -819,6 +1233,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             var action = await dbContext.Actions
@@ -918,6 +1336,10 @@ public static class AtlasEndpoints
             {
                 return problem!;
             }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
 
             var events = await dbContext.AuditEvents
                 .Where(item => item.ActionId == id)
@@ -938,6 +1360,7 @@ public static class AtlasEndpoints
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             IAdminSettingService settings,
+            IEntitlementService entitlements,
             IObjectStorageService storage,
             IAtlasClock clock,
             CancellationToken cancellationToken) =>
@@ -945,6 +1368,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             if (string.IsNullOrWhiteSpace(request.FileName)
@@ -962,6 +1389,12 @@ public static class AtlasEndpoints
             if (request.SizeBytes > maxUploadBytes)
             {
                 return EndpointHelpers.Problem("upload_too_large", "Upload exceeds configured size limit.", StatusCodes.Status413PayloadTooLarge);
+            }
+
+            var storageLimit = await entitlements.CanStoreFileAsync(organizationId, clock.UtcNow, request.SizeBytes, cancellationToken);
+            if (!storageLimit.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(storageLimit);
             }
 
             var uploadMinutesSetting = await settings.GetAsync(organizationId, "files", "uploadUrlMinutes", cancellationToken);
@@ -982,6 +1415,7 @@ public static class AtlasEndpoints
                 Extension = Path.GetExtension(request.FileName),
                 SizeBytes = request.SizeBytes,
                 ScanStatus = FileScanStatus.Pending,
+                RetentionUntil = clock.UtcNow.AddDays(await GetRetentionDaysAsync(dbContext, organizationId, cancellationToken)),
                 CreatedAt = now
             };
 
@@ -1001,7 +1435,8 @@ public static class AtlasEndpoints
                 storageKey,
                 signedUrl.UploadUrl,
                 signedUrl.Headers,
-                signedUrl.ExpiresAt));
+                signedUrl.ExpiresAt,
+                fileAsset.RetentionUntil));
         });
 
         group.MapGet("/{id:guid}/download-url", async (
@@ -1015,6 +1450,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             var file = await dbContext.FileAssets.AsNoTracking()
@@ -1057,6 +1496,10 @@ public static class AtlasEndpoints
             {
                 return problem!;
             }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
 
             if (!EndpointHelpers.HasScope(tenantContext, "files:*"))
             {
@@ -1098,6 +1541,10 @@ public static class AtlasEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             if (!EndpointHelpers.HasScope(tenantContext, "files:*"))
@@ -1317,6 +1764,47 @@ public static class AtlasEndpoints
             .ToList();
     }
 
+    private static OrganizationMemberResponse ToMemberResponse(OrganizationUser membership)
+    {
+        return new OrganizationMemberResponse(
+            membership.Id,
+            membership.OrganizationId,
+            membership.UserId,
+            membership.User?.Email ?? string.Empty,
+            membership.User?.FullName ?? string.Empty,
+            membership.Role,
+            membership.Status,
+            membership.InvitedAt,
+            membership.JoinedAt,
+            membership.CreatedAt);
+    }
+
+    private static async Task<bool> HasAnotherActiveOrganizationOwnerAsync(
+        AtlasDbContext dbContext,
+        Guid organizationId,
+        Guid currentMembershipId,
+        CancellationToken cancellationToken)
+    {
+        return await dbContext.OrganizationUsers.IgnoreQueryFilters()
+            .AnyAsync(item => item.OrganizationId == organizationId
+                && item.Id != currentMembershipId
+                && item.Role == OrganizationUserRole.Owner
+                && item.Status == MembershipStatus.Active,
+                cancellationToken);
+    }
+
+    private static async Task<int> GetRetentionDaysAsync(
+        AtlasDbContext dbContext,
+        Guid organizationId,
+        CancellationToken cancellationToken)
+    {
+        var retentionDays = await dbContext.Organizations.IgnoreQueryFilters()
+            .Where(item => item.Id == organizationId)
+            .Select(item => item.RetentionDays)
+            .FirstOrDefaultAsync(cancellationToken);
+        return retentionDays > 0 ? retentionDays : 365;
+    }
+
     private static async Task AddRequirementSnapshotsAsync(
         ChecklistAction action,
         CreateActionRequest request,
@@ -1367,6 +1855,69 @@ public static class AtlasEndpoints
                 ValidationJson = EndpointHelpers.JsonOrDefault(requirement.Validation),
                 ConditionJson = requirement.Condition is null ? null : requirement.Condition.Value.GetRawText()
             });
+        }
+    }
+
+    private static async Task ScheduleAutomaticRemindersAsync(
+        ChecklistAction action,
+        Guid organizationId,
+        IEntitlementService entitlements,
+        IAdminSettingService settings,
+        IAtlasClock clock,
+        CancellationToken cancellationToken)
+    {
+        if (action.DueAt is null || action.Recipients.Count == 0)
+        {
+            return;
+        }
+
+        var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "automatic_reminders", cancellationToken);
+        if (!feature.Allowed)
+        {
+            return;
+        }
+
+        var beforeDueDays = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(organizationId, "reminders", "beforeDueDays", cancellationToken))?.ValueJson,
+            3);
+        var overdueDays = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(organizationId, "reminders", "overdueDays", cancellationToken))?.ValueJson,
+            1);
+        var beforeDueAt = action.DueAt.Value.AddDays(-beforeDueDays);
+        var overdueAt = action.DueAt.Value.AddDays(overdueDays);
+
+        foreach (var recipient in action.Recipients)
+        {
+            if (recipient.Status == ActionRecipientStatus.Submitted)
+            {
+                continue;
+            }
+
+            if (beforeDueAt > clock.UtcNow
+                && recipient.ReminderSchedules.All(item => item.Type != ReminderType.BeforeDue))
+            {
+                recipient.ReminderSchedules.Add(new ReminderSchedule
+                {
+                    ActionRecipientId = recipient.Id,
+                    TriggerAt = beforeDueAt,
+                    Type = ReminderType.BeforeDue,
+                    Status = ReminderStatus.Pending,
+                    CreatedAt = clock.UtcNow
+                });
+            }
+
+            if (overdueAt > clock.UtcNow
+                && recipient.ReminderSchedules.All(item => item.Type != ReminderType.Overdue))
+            {
+                recipient.ReminderSchedules.Add(new ReminderSchedule
+                {
+                    ActionRecipientId = recipient.Id,
+                    TriggerAt = overdueAt,
+                    Type = ReminderType.Overdue,
+                    Status = ReminderStatus.Pending,
+                    CreatedAt = clock.UtcNow
+                });
+            }
         }
     }
 
@@ -1512,6 +2063,77 @@ public sealed record UpdateOrganizationRequest(
     string? PrivacyStatement,
     int? RetentionDays);
 
+public sealed record DashboardSummaryResponse(
+    Guid OrganizationId,
+    DateTimeOffset GeneratedAt,
+    DashboardNeedsAttention NeedsAttention,
+    DashboardChecklistCounts Checklists,
+    DashboardSubmissionCounts Submissions,
+    DashboardFileCounts Files,
+    IReadOnlyList<DashboardAttentionItem> AttentionItems,
+    OrganizationEntitlementSnapshot Entitlements);
+
+public sealed record DashboardNeedsAttention(
+    int WaitingRecipients,
+    int OverdueRecipients,
+    int DueSoonRecipients);
+
+public sealed record DashboardChecklistCounts(
+    int Total,
+    int Draft,
+    int InFlight,
+    int Submitted,
+    int Completed,
+    int Cancelled,
+    int Expired);
+
+public sealed record DashboardSubmissionCounts(
+    int Total,
+    int Submitted,
+    int Accepted,
+    int ChangesRequested);
+
+public sealed record DashboardFileCounts(
+    int PendingScan,
+    int Rejected);
+
+public sealed record DashboardAttentionItem(
+    Guid ActionId,
+    string ChecklistTitle,
+    DateTimeOffset? DueAt,
+    Guid RecipientId,
+    string RecipientName,
+    string RecipientEmail,
+    ActionRecipientStatus RecipientStatus,
+    DateTimeOffset? LastActivityAt,
+    bool Overdue,
+    bool DueSoon);
+
+public sealed record OrganizationMemberResponse(
+    Guid Id,
+    Guid OrganizationId,
+    Guid UserId,
+    string Email,
+    string FullName,
+    OrganizationUserRole Role,
+    MembershipStatus Status,
+    DateTimeOffset? InvitedAt,
+    DateTimeOffset? JoinedAt,
+    DateTimeOffset CreatedAt);
+
+public sealed record CreateOrganizationMemberRequest(
+    string Email,
+    string FullName,
+    string? Password,
+    OrganizationUserRole? Role,
+    MembershipStatus? Status);
+
+public sealed record UpdateOrganizationMemberRequest(
+    string? FullName,
+    string? Password,
+    OrganizationUserRole? Role,
+    MembershipStatus? Status);
+
 public sealed record UpsertAdminSettingHttpRequest(
     AdminSettingScope Scope,
     JsonElement Value,
@@ -1646,6 +2268,7 @@ public sealed record UploadIntentResponse(
     string StorageKey,
     Uri UploadUrl,
     IReadOnlyDictionary<string, string> Headers,
-    DateTimeOffset ExpiresAt);
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset? RetentionUntil);
 
 public sealed record FileScanResultRequest(FileScanStatus ScanStatus, string? ScanEngine);

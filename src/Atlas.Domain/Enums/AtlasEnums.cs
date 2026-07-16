@@ -166,3 +166,17 @@ public enum PlatformRevenueEventType : short
     Refund = 4,
     Adjustment = 5
 }
+
+public enum ApiKeyEnvironment : short
+{
+    Sandbox = 1,
+    Production = 2
+}
+
+public enum DeveloperAccessStatus : short
+{
+    SandboxOnly = 1,
+    ProductionRequested = 2,
+    ProductionApproved = 3,
+    ProductionRejected = 4
+}

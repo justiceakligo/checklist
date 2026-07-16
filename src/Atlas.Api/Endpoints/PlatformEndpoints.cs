@@ -1,6 +1,10 @@
 using System.Security.Claims;
 using System.Text.Json;
+using Atlas.Api.Email;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Billing;
+using Atlas.Application.Email;
+using Atlas.Application.Settings;
 using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
@@ -542,6 +546,8 @@ public static class PlatformEndpoints
             string? q,
             OrganizationStatus? status,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -566,7 +572,7 @@ public static class PlatformEndpoints
             var responses = new List<PlatformOrganizationResponse>();
             foreach (var organization in organizations)
             {
-                responses.Add(await ToPlatformOrganizationResponseAsync(dbContext, organization, cancellationToken));
+                responses.Add(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
             }
 
             return Results.Ok(new { items = responses });
@@ -576,6 +582,8 @@ public static class PlatformEndpoints
             CreatePlatformOrganizationRequest request,
             AtlasDbContext dbContext,
             HttpContext httpContext,
+            IEntitlementService entitlements,
+            IAdminSettingService settings,
             IAtlasClock clock,
             CancellationToken cancellationToken) =>
         {
@@ -604,6 +612,9 @@ public static class PlatformEndpoints
                 return EndpointHelpers.Problem("slug_in_use", "Organization slug is already in use.", StatusCodes.Status409Conflict);
             }
 
+            var defaultRetentionDays = EndpointHelpers.ReadPositiveIntSetting(
+                (await settings.GetAsync(null, "retention", "defaultRetentionDays", cancellationToken))?.ValueJson,
+                365);
             var organization = new Organization
             {
                 Name = request.Name.Trim(),
@@ -611,19 +622,21 @@ public static class PlatformEndpoints
                 Status = status,
                 Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "UTC" : request.Timezone.Trim(),
                 DefaultLanguage = string.IsNullOrWhiteSpace(request.DefaultLanguage) ? "en" : request.DefaultLanguage.Trim(),
-                RetentionDays = request.RetentionDays is > 0 ? request.RetentionDays.Value : 365,
+                RetentionDays = request.RetentionDays is > 0 ? request.RetentionDays.Value : defaultRetentionDays,
                 CreatedAt = clock.UtcNow,
                 UpdatedAt = clock.UtcNow
             };
             dbContext.Organizations.Add(organization);
             AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_created", new { organization.Id, organization.Name, organization.Slug, organization.Status }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Created($"/v1/platform/organizations/{organization.Id}", await ToPlatformOrganizationResponseAsync(dbContext, organization, cancellationToken));
+            return Results.Created($"/v1/platform/organizations/{organization.Id}", await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
         });
 
         group.MapGet("/organizations/{id:guid}", async (
             Guid id,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -637,13 +650,208 @@ public static class PlatformEndpoints
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
             return organization is null
                 ? EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound)
-                : Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, organization, cancellationToken));
+                : Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
+        });
+
+        group.MapGet("/organizations/{id:guid}/api-keys", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var organizationExists = await dbContext.Organizations.IgnoreQueryFilters()
+                .AnyAsync(item => item.Id == id, cancellationToken);
+            if (!organizationExists)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var keys = await dbContext.ApiKeys.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Where(item => item.OrganizationId == id)
+                .OrderByDescending(item => item.CreatedAt)
+                .Select(item => new PlatformOrganizationApiKeyResponse(
+                    item.Id,
+                    item.OrganizationId,
+                    item.Name,
+                    item.KeyPrefix,
+                    item.Environment,
+                    item.Scopes,
+                    item.LastUsedAt,
+                    item.ExpiresAt,
+                    item.RevokedAt,
+                    item.CreatedAt))
+                .ToListAsync(cancellationToken);
+            return Results.Ok(new { items = keys });
+        });
+
+        group.MapPost("/organizations/{id:guid}/api-keys", async (
+            Guid id,
+            CreatePlatformOrganizationApiKeyRequest request,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAdminSettingService settings,
+            IEmailService emailService,
+            IConfiguration configuration,
+            ISecretHasher secretHasher,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var organization = await dbContext.Organizations.IgnoreQueryFilters()
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (organization is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var environment = request.Environment ?? ApiKeyEnvironment.Production;
+            if (!Enum.IsDefined(environment))
+            {
+                return EndpointHelpers.Problem("validation_failed", "API key environment is invalid.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (string.IsNullOrWhiteSpace(request.Name))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Name is required.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (environment == ApiKeyEnvironment.Production)
+            {
+                var feature = await entitlements.HasFeatureAsync(organization.Id, clock.UtcNow, "api_and_webhooks", cancellationToken);
+                if (!feature.Allowed)
+                {
+                    return EndpointHelpers.EntitlementProblem(feature);
+                }
+
+                organization.DeveloperAccessStatus = DeveloperAccessStatus.ProductionApproved;
+                organization.DeveloperProductionApprovedAt ??= clock.UtcNow;
+                organization.DeveloperProductionRejectedAt = null;
+            }
+
+            var scopes = NormalizePlatformApiKeyScopes(request.Scopes, environment);
+            var secret = EndpointHelpers.NewApiKey(environment, out var keyPrefix);
+            var apiKeyDefaultDays = EndpointHelpers.ReadPositiveIntSetting(
+                (await settings.GetAsync(organization.Id, "developer", "apiKeyDefaultDays", cancellationToken))?.ValueJson,
+                180);
+            var apiKey = new ApiKey
+            {
+                OrganizationId = id,
+                Name = request.Name.Trim(),
+                KeyPrefix = keyPrefix,
+                SecretHash = secretHasher.HashSecret(secret),
+                Environment = environment,
+                Scopes = scopes,
+                ExpiresAt = request.ExpiresAt ?? clock.UtcNow.AddDays(apiKeyDefaultDays),
+                CreatedAt = clock.UtcNow
+            };
+
+            dbContext.ApiKeys.Add(apiKey);
+            AddPlatformAudit(
+                dbContext,
+                access.Staff!.Id,
+                "platform.organization_api_key_created",
+                new
+                {
+                    OrganizationId = organization.Id,
+                    ApiKeyId = apiKey.Id,
+                    apiKey.Name,
+                    apiKey.KeyPrefix,
+                    apiKey.Environment,
+                    apiKey.Scopes
+                },
+                httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            EmailSendResult? notification = null;
+            if (!string.IsNullOrWhiteSpace(request.NotifyEmail))
+            {
+                var appBaseUrl = await EndpointHelpers.BuildAppBaseUrlAsync(settings, configuration, organization.Id, httpContext, cancellationToken);
+                var email = TransactionalEmailTemplates.ApiKeyCreatedNotification(
+                    FirstNameFromEmail(request.NotifyEmail),
+                    organization.Name,
+                    apiKey.Name,
+                    apiKey.KeyPrefix,
+                    apiKey.ExpiresAt?.ToString("MMMM d, yyyy", System.Globalization.CultureInfo.InvariantCulture),
+                    appBaseUrl);
+                notification = await emailService.SendAsync(
+                    request.NotifyEmail.Trim().ToLowerInvariant(),
+                    email.Subject,
+                    email.TextBody,
+                    email.HtmlBody,
+                    "requests@reqara.com",
+                    cancellationToken: cancellationToken,
+                    headers: new Dictionary<string, string>
+                    {
+                        ["X-Atlas-Email-Type"] = "api-key-created",
+                        ["X-Atlas-Organization-Id"] = organization.Id.ToString(),
+                        ["X-Atlas-Api-Key-Id"] = apiKey.Id.ToString()
+                    });
+            }
+
+            return Results.Created(
+                $"/v1/platform/organizations/{organization.Id}/api-keys/{apiKey.Id}",
+                new PlatformOrganizationApiKeyCreatedResponse(
+                    apiKey.Id,
+                    apiKey.OrganizationId,
+                    apiKey.Name,
+                    apiKey.KeyPrefix,
+                    apiKey.Environment,
+                    secret,
+                    apiKey.Scopes,
+                    apiKey.LastUsedAt,
+                    apiKey.ExpiresAt,
+                    apiKey.RevokedAt,
+                    apiKey.CreatedAt,
+                    notification?.Sent ?? false,
+                    notification?.Error));
+        });
+
+        group.MapDelete("/organizations/{organizationId:guid}/api-keys/{apiKeyId:guid}", async (
+            Guid organizationId,
+            Guid apiKeyId,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var apiKey = await dbContext.ApiKeys.IgnoreQueryFilters()
+                .FirstOrDefaultAsync(item => item.Id == apiKeyId && item.OrganizationId == organizationId, cancellationToken);
+            if (apiKey is null)
+            {
+                return EndpointHelpers.Problem("not_found", "API key was not found.", StatusCodes.Status404NotFound);
+            }
+
+            apiKey.RevokedAt ??= clock.UtcNow;
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_api_key_revoked", new { organizationId, apiKey.Id, apiKey.Name, apiKey.KeyPrefix }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.NoContent();
         });
 
         group.MapPatch("/organizations/{id:guid}", async (
             Guid id,
             UpdatePlatformOrganizationRequest request,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -682,12 +890,14 @@ public static class PlatformEndpoints
 
             AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_updated", new { organization.Id, organization.Name, organization.Status }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, organization, cancellationToken));
+            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
         });
 
         group.MapPost("/organizations/{id:guid}/approve", async (
             Guid id,
             AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -707,7 +917,73 @@ public static class PlatformEndpoints
             organization.DeletedAt = null;
             AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_approved", new { organization.Id, organization.Name }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, organization, cancellationToken));
+            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
+        });
+
+        group.MapPost("/organizations/{id:guid}/developer-access/approve", async (
+            Guid id,
+            PlatformDeveloperAccessDecisionRequest request,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var organization = await dbContext.Organizations.IgnoreQueryFilters().FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (organization is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organization.Id, clock.UtcNow, "api_and_webhooks", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
+            organization.DeveloperAccessStatus = DeveloperAccessStatus.ProductionApproved;
+            organization.DeveloperProductionApprovedAt = clock.UtcNow;
+            organization.DeveloperProductionRejectedAt = null;
+            organization.DeveloperProductionNotes = request.Notes?.Trim();
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_developer_access_approved", new { organization.Id, organization.Name }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
+        });
+
+        group.MapPost("/organizations/{id:guid}/developer-access/reject", async (
+            Guid id,
+            PlatformDeveloperAccessDecisionRequest request,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, CoreRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var organization = await dbContext.Organizations.IgnoreQueryFilters().FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (organization is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
+            }
+
+            organization.DeveloperAccessStatus = DeveloperAccessStatus.ProductionRejected;
+            organization.DeveloperProductionRejectedAt = clock.UtcNow;
+            organization.DeveloperProductionApprovedAt = null;
+            organization.DeveloperProductionNotes = request.Notes?.Trim();
+            AddPlatformAudit(dbContext, access.Staff!.Id, "platform.organization_developer_access_rejected", new { organization.Id, organization.Name }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(await ToPlatformOrganizationResponseAsync(dbContext, entitlements, clock, organization, cancellationToken));
         });
 
         group.MapDelete("/organizations/{id:guid}", async (
@@ -739,6 +1015,43 @@ public static class PlatformEndpoints
 
     private static void MapInterests(RouteGroupBuilder group)
     {
+        group.MapGet("/organization-requests", async (
+            OrganizationInterestStatus? status,
+            Guid? assignedStaffId,
+            string? q,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var query = dbContext.PlatformOrganizationInterests.IgnoreQueryFilters().AsNoTracking();
+            if (status.HasValue)
+            {
+                query = query.Where(item => item.Status == status.Value);
+            }
+            if (assignedStaffId.HasValue)
+            {
+                query = query.Where(item => item.AssignedStaffId == assignedStaffId.Value);
+            }
+            if (!string.IsNullOrWhiteSpace(q))
+            {
+                var search = q.Trim().ToLowerInvariant();
+                query = query.Where(item => item.OrganizationName.ToLower().Contains(search)
+                    || item.ContactEmail.ToLower().Contains(search)
+                    || item.ContactName.ToLower().Contains(search));
+            }
+
+            var interests = await query.OrderByDescending(item => item.CreatedAt)
+                .Select(item => ToInterestResponse(item))
+                .ToListAsync(cancellationToken);
+            return Results.Ok(new { items = interests });
+        });
+
         group.MapGet("/interests", async (
             OrganizationInterestStatus? status,
             Guid? assignedStaffId,
@@ -894,6 +1207,7 @@ public static class PlatformEndpoints
             ApproveOrganizationInterestRequest request,
             AtlasDbContext dbContext,
             HttpContext httpContext,
+            IAdminSettingService settings,
             IAtlasClock clock,
             CancellationToken cancellationToken) =>
         {
@@ -950,6 +1264,9 @@ public static class PlatformEndpoints
                     dbContext.Users.Add(owner);
                 }
 
+                var defaultRetentionDays = EndpointHelpers.ReadPositiveIntSetting(
+                    (await settings.GetAsync(null, "retention", "defaultRetentionDays", cancellationToken))?.ValueJson,
+                    365);
                 organization = new Organization
                 {
                     Name = string.IsNullOrWhiteSpace(request.OrganizationName) ? interest.OrganizationName : request.OrganizationName.Trim(),
@@ -957,6 +1274,7 @@ public static class PlatformEndpoints
                     Status = OrganizationStatus.Active,
                     Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "UTC" : request.Timezone.Trim(),
                     DefaultLanguage = string.IsNullOrWhiteSpace(request.DefaultLanguage) ? "en" : request.DefaultLanguage.Trim(),
+                    RetentionDays = defaultRetentionDays,
                     CreatedAt = clock.UtcNow,
                     UpdatedAt = clock.UtcNow
                 };
@@ -1584,6 +1902,8 @@ public static class PlatformEndpoints
 
     private static async Task<PlatformOrganizationResponse> ToPlatformOrganizationResponseAsync(
         AtlasDbContext dbContext,
+        IEntitlementService entitlements,
+        IAtlasClock clock,
         Organization organization,
         CancellationToken cancellationToken)
     {
@@ -1601,13 +1921,19 @@ public static class PlatformEndpoints
             organization.Timezone,
             organization.DefaultLanguage,
             organization.RetentionDays,
+            organization.DeveloperAccessStatus,
+            organization.DeveloperProductionRequestedAt,
+            organization.DeveloperProductionApprovedAt,
+            organization.DeveloperProductionRejectedAt,
+            organization.DeveloperProductionNotes,
             organization.CreatedAt,
             organization.UpdatedAt,
             organization.DeletedAt,
             await dbContext.OrganizationUsers.IgnoreQueryFilters().CountAsync(item => item.OrganizationId == organization.Id, cancellationToken),
             await dbContext.Actions.IgnoreQueryFilters().CountAsync(item => item.OrganizationId == organization.Id, cancellationToken),
             await dbContext.Submissions.IgnoreQueryFilters().CountAsync(item => item.Action != null && item.Action.OrganizationId == organization.Id, cancellationToken),
-            revenue);
+            revenue,
+            await entitlements.GetOrganizationEntitlementsAsync(organization.Id, clock.UtcNow, cancellationToken));
     }
 
     private static OrganizationInterestResponse ToInterestResponse(PlatformOrganizationInterest interest)
@@ -1651,9 +1977,42 @@ public static class PlatformEndpoints
             revenueEvent.UpdatedAt);
     }
 
+    private static string[] NormalizePlatformApiKeyScopes(
+        IReadOnlyList<string>? requestedScopes,
+        ApiKeyEnvironment environment)
+    {
+        string[] defaults = environment == ApiKeyEnvironment.Sandbox
+            ? ["sandbox:*"]
+            : ["templates:read", "actions:write", "files:write"];
+        var source = requestedScopes is { Count: > 0 } ? requestedScopes : defaults;
+        var scopes = source
+            .Select(scope => scope.Trim())
+            .Where(scope => scope.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (environment != ApiKeyEnvironment.Sandbox)
+        {
+            return scopes.Length == 0 ? defaults : scopes;
+        }
+
+        var sandboxScopes = scopes
+            .Where(scope => scope.Equals("sandbox:*", StringComparison.OrdinalIgnoreCase)
+                || scope.StartsWith("sandbox:", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return sandboxScopes.Length == 0 ? defaults : sandboxScopes;
+    }
+
     private static string NormalizeEmail(string email)
     {
         return email.Trim().ToLowerInvariant();
+    }
+
+    private static string FirstNameFromEmail(string email)
+    {
+        var localPart = NormalizeEmail(email).Split('@')[0];
+        var separators = new[] { '.', '-', '_' };
+        var first = localPart.Split(separators, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+        return string.IsNullOrWhiteSpace(first) ? "there" : first;
     }
 
     private sealed record PlatformAccess(PlatformStaff? Staff, IResult? Problem);
@@ -1731,6 +2090,40 @@ public sealed record UpdatePlatformOrganizationRequest(
     string? PrivacyStatement,
     int? RetentionDays);
 
+public sealed record CreatePlatformOrganizationApiKeyRequest(
+    string Name,
+    IReadOnlyList<string>? Scopes,
+    DateTimeOffset? ExpiresAt,
+    string? NotifyEmail,
+    ApiKeyEnvironment? Environment);
+
+public sealed record PlatformOrganizationApiKeyResponse(
+    Guid Id,
+    Guid OrganizationId,
+    string Name,
+    string KeyPrefix,
+    ApiKeyEnvironment Environment,
+    IReadOnlyList<string> Scopes,
+    DateTimeOffset? LastUsedAt,
+    DateTimeOffset? ExpiresAt,
+    DateTimeOffset? RevokedAt,
+    DateTimeOffset CreatedAt);
+
+public sealed record PlatformOrganizationApiKeyCreatedResponse(
+    Guid Id,
+    Guid OrganizationId,
+    string Name,
+    string KeyPrefix,
+    ApiKeyEnvironment Environment,
+    string Secret,
+    IReadOnlyList<string> Scopes,
+    DateTimeOffset? LastUsedAt,
+    DateTimeOffset? ExpiresAt,
+    DateTimeOffset? RevokedAt,
+    DateTimeOffset CreatedAt,
+    bool NotificationSent,
+    string? NotificationError);
+
 public sealed record PlatformOrganizationResponse(
     Guid Id,
     string Name,
@@ -1739,13 +2132,21 @@ public sealed record PlatformOrganizationResponse(
     string Timezone,
     string DefaultLanguage,
     int RetentionDays,
+    DeveloperAccessStatus DeveloperAccessStatus,
+    DateTimeOffset? DeveloperProductionRequestedAt,
+    DateTimeOffset? DeveloperProductionApprovedAt,
+    DateTimeOffset? DeveloperProductionRejectedAt,
+    string? DeveloperProductionNotes,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt,
     DateTimeOffset? DeletedAt,
     int MemberCount,
     int ActionCount,
     int SubmissionCount,
-    IReadOnlyList<RevenueByCurrency> RevenueAllTime);
+    IReadOnlyList<RevenueByCurrency> RevenueAllTime,
+    OrganizationEntitlementSnapshot Entitlements);
+
+public sealed record PlatformDeveloperAccessDecisionRequest(string? Notes);
 
 public sealed record CreateOrganizationInterestRequest(
     string OrganizationName,

@@ -1,7 +1,9 @@
 using Atlas.Application.Abstractions;
+using Atlas.Application.Billing;
 using Atlas.Application.Email;
 using Atlas.Application.Settings;
 using Atlas.Application.Storage;
+using Atlas.Infrastructure.Billing;
 using Atlas.Infrastructure.Email;
 using Atlas.Infrastructure.Persistence;
 using Atlas.Infrastructure.Security;
@@ -42,6 +44,7 @@ public static class DependencyInjection
         services.AddScoped<DigitalOceanSpacesOptionsResolver>();
         services.AddScoped<IObjectStorageService, DigitalOceanSpacesStorageService>();
         services.AddScoped<IAdminSettingService, AdminSettingService>();
+        services.AddScoped<IEntitlementService, EntitlementService>();
         services.AddScoped<IEmailService, ResendEmailService>();
 
         return services;

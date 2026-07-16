@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Storage;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -20,6 +21,10 @@ public static class SubmissionEndpoints
             if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
             {
                 return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
             }
 
             var submissions = await dbContext.Submissions
@@ -48,6 +53,10 @@ public static class SubmissionEndpoints
             {
                 return problem!;
             }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
 
             var submission = await dbContext.Submissions
                 .AsNoTracking()
@@ -69,11 +78,74 @@ public static class SubmissionEndpoints
                 submission.ReviewedAt,
                 submission.ReviewedByUserId,
                 submission.ReviewComment,
+                submission.DeclarationAcceptedAt,
+                submission.DeclarationIpAddress?.ToString(),
                 Convert.ToHexString(submission.ContentHash).ToLowerInvariant(),
                 submission.Responses.Select(item => new SubmittedResponseValue(
                     item.RequirementId,
                     item.ValueJson == null ? null : JsonSerializer.Deserialize<JsonElement>(item.ValueJson, EndpointHelpers.JsonOptions))).ToList(),
                 submission.Files.Select(item => new SubmittedFileValue(item.RequirementId, item.FileAssetId)).ToList()));
+        });
+
+        group.MapGet("/{id:guid}/export", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
+
+            var submission = await dbContext.Submissions
+                .AsNoTracking()
+                .Include(item => item.Action)
+                .Include(item => item.ActionRecipient)
+                .Include(item => item.Responses)
+                .Include(item => item.Files)
+                .ThenInclude(item => item.FileAsset)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (submission?.Action is null || submission.ActionRecipient is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Submission was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var timeline = await dbContext.AuditEvents
+                .AsNoTracking()
+                .Where(item => item.ActionId == submission.ActionId)
+                .OrderBy(item => item.CreatedAt)
+                .Select(item => new AuditEventResponse(item.Id, item.EventType, item.ActorType, item.ActorId, item.EventData, item.CreatedAt))
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new SubmissionExportResponse(
+                submission.Id,
+                submission.ActionId,
+                submission.Action.Title,
+                submission.ActionRecipientId,
+                submission.ActionRecipient.Name,
+                submission.ActionRecipient.Email,
+                submission.VersionNumber,
+                submission.Status,
+                submission.SubmittedAt,
+                submission.DeclarationAcceptedAt,
+                submission.DeclarationIpAddress?.ToString(),
+                Convert.ToHexString(submission.ContentHash).ToLowerInvariant(),
+                submission.Responses.Select(item => new SubmittedResponseValue(
+                    item.RequirementId,
+                    item.ValueJson == null ? null : JsonSerializer.Deserialize<JsonElement>(item.ValueJson, EndpointHelpers.JsonOptions))).ToList(),
+                submission.Files.Select(item => new SubmittedFileExportValue(
+                    item.RequirementId,
+                    item.FileAssetId,
+                    item.FileAsset?.OriginalFileName ?? string.Empty,
+                    item.FileAsset?.MimeType ?? string.Empty,
+                    item.FileAsset?.SizeBytes ?? 0,
+                    item.FileAsset?.ScanStatus ?? FileScanStatus.Pending)).ToList(),
+                timeline));
         });
 
         group.MapPost("/{id:guid}/accept", async (
@@ -116,6 +188,60 @@ public static class SubmissionEndpoints
                 cancellationToken);
         });
 
+        group.MapDelete("/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IObjectStorageService storage,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+            if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+            {
+                return sandboxProblem;
+            }
+
+            if (!EndpointHelpers.HasScope(tenantContext, "admin:*"))
+            {
+                return EndpointHelpers.Problem("forbidden", "Admin scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            var submission = await dbContext.Submissions
+                .Include(item => item.Action)
+                .Include(item => item.Files)
+                .ThenInclude(item => item.FileAsset)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (submission?.Action is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Submission was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var deletedFileIds = new List<Guid>();
+            foreach (var file in submission.Files.Select(item => item.FileAsset).Where(item => item is not null).Cast<Atlas.Domain.Entities.FileAsset>())
+            {
+                await storage.DeleteObjectAsync(file.StorageKey, cancellationToken);
+                file.DeletedAt = clock.UtcNow;
+                deletedFileIds.Add(file.Id);
+            }
+
+            SecurityEndpoints.AddAudit(
+                dbContext,
+                organizationId,
+                submission.ActionId,
+                tenantContext,
+                "submission.deleted",
+                new { submission.Id, deletedFileIds },
+                httpContext);
+            dbContext.Submissions.Remove(submission);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.NoContent();
+        });
+
         return app;
     }
 
@@ -132,6 +258,10 @@ public static class SubmissionEndpoints
         if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
         {
             return problem!;
+        }
+        if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+        {
+            return sandboxProblem;
         }
 
         var submission = await dbContext.Submissions
@@ -193,12 +323,39 @@ public sealed record SubmissionDetailResponse(
     DateTimeOffset? ReviewedAt,
     Guid? ReviewedByUserId,
     string? ReviewComment,
+    DateTimeOffset? DeclarationAcceptedAt,
+    string? DeclarationIpAddress,
     string ContentHash,
     IReadOnlyList<SubmittedResponseValue> Responses,
     IReadOnlyList<SubmittedFileValue> Files);
 
+public sealed record SubmissionExportResponse(
+    Guid Id,
+    Guid ActionId,
+    string ChecklistTitle,
+    Guid ActionRecipientId,
+    string RecipientName,
+    string RecipientEmail,
+    int VersionNumber,
+    SubmissionStatus Status,
+    DateTimeOffset SubmittedAt,
+    DateTimeOffset? DeclarationAcceptedAt,
+    string? DeclarationIpAddress,
+    string ContentHash,
+    IReadOnlyList<SubmittedResponseValue> Responses,
+    IReadOnlyList<SubmittedFileExportValue> Files,
+    IReadOnlyList<AuditEventResponse> Timeline);
+
 public sealed record SubmittedResponseValue(Guid RequirementId, JsonElement? Value);
 
 public sealed record SubmittedFileValue(Guid RequirementId, Guid FileAssetId);
+
+public sealed record SubmittedFileExportValue(
+    Guid RequirementId,
+    Guid FileAssetId,
+    string OriginalFileName,
+    string MimeType,
+    long SizeBytes,
+    FileScanStatus ScanStatus);
 
 public sealed record ReviewSubmissionRequest(string? Comment);

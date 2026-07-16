@@ -5,6 +5,7 @@ using System.Globalization;
 using Atlas.Api.Email;
 using Atlas.Api.Filters;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Billing;
 using Atlas.Application.Email;
 using Atlas.Application.Settings;
 using Atlas.Application.Storage;
@@ -417,6 +418,7 @@ public static class RecipientEndpoints
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
         IAdminSettingService settings,
+        IEntitlementService entitlements,
         IObjectStorageService storage,
         IAtlasClock clock,
         HttpContext httpContext,
@@ -450,6 +452,12 @@ public static class RecipientEndpoints
             return EndpointHelpers.Problem("upload_too_large", "Upload exceeds configured size limit.", StatusCodes.Status413PayloadTooLarge);
         }
 
+        var storageLimit = await entitlements.CanStoreFileAsync(recipient.Action!.OrganizationId, clock.UtcNow, request.SizeBytes, cancellationToken);
+        if (!storageLimit.Allowed)
+        {
+            return EndpointHelpers.EntitlementProblem(storageLimit);
+        }
+
         var uploadMinutes = EndpointHelpers.ReadPositiveIntSetting(
             (await settings.GetAsync(recipient.Action.OrganizationId, "files", "uploadUrlMinutes", cancellationToken))?.ValueJson,
             10);
@@ -467,6 +475,7 @@ public static class RecipientEndpoints
             Extension = Path.GetExtension(request.FileName),
             SizeBytes = request.SizeBytes,
             ScanStatus = FileScanStatus.Pending,
+            RetentionUntil = clock.UtcNow.AddDays(recipient.Action.Organization!.RetentionDays),
             CreatedAt = clock.UtcNow
         };
         dbContext.FileAssets.Add(file);
@@ -481,7 +490,8 @@ public static class RecipientEndpoints
             storageKey,
             signedUrl.UploadUrl,
             signedUrl.Headers,
-            signedUrl.ExpiresAt));
+            signedUrl.ExpiresAt,
+            file.RetentionUntil));
     }
 
     private static async Task<IResult> CompleteRecipientUpload(
@@ -633,7 +643,9 @@ public static class RecipientEndpoints
             ActionRecipientId = recipient.Id,
             VersionNumber = latestVersion + 1,
             Status = SubmissionStatus.Submitted,
-            SubmittedAt = clock.UtcNow
+            SubmittedAt = clock.UtcNow,
+            DeclarationAcceptedAt = clock.UtcNow,
+            DeclarationIpAddress = httpContext.Connection.RemoteIpAddress
         };
 
         foreach (var draft in drafts)

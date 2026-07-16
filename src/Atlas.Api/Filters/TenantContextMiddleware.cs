@@ -84,7 +84,9 @@ public static class TenantContextMiddleware
         matched.LastUsedAt = clock.UtcNow;
         await dbContext.SaveChangesAsync(context.RequestAborted);
 
-        accessor.SetApiTenant(matched.OrganizationId, matched.Id, matched.Scopes);
+        var scopes = matched.Scopes.ToList();
+        scopes.Add(matched.Environment == ApiKeyEnvironment.Sandbox ? "env:sandbox" : "env:production");
+        accessor.SetApiTenant(matched.OrganizationId, matched.Id, scopes);
         await next(context);
         return true;
     }
