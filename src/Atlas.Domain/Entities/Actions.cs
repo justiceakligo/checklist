@@ -8,6 +8,7 @@ public sealed class ChecklistAction : Entity, ITenantOwned, ISoftDelete
     public Guid OrganizationId { get; set; }
     public Guid? TemplateId { get; set; }
     public Guid? TemplateVersionId { get; set; }
+    public string? ClientReference { get; set; }
     public string PublicReference { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
     public string? Description { get; set; }

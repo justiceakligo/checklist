@@ -41,9 +41,19 @@ public sealed class SubmissionFile : Entity
     public Guid SubmissionId { get; set; }
     public Guid RequirementId { get; set; }
     public Guid FileAssetId { get; set; }
+    public bool IsPreviouslySubmitted { get; set; }
+    public Guid? SourceSubmissionId { get; set; }
+    public Guid? SourceSubmissionFileId { get; set; }
+    public DateTimeOffset? ReuseConfirmedAt { get; set; }
+    public IPAddress? ReuseConsentIpAddress { get; set; }
+    public string? ReuseConsentText { get; set; }
+    public string? DocumentName { get; set; }
+    public DateTimeOffset? DocumentExpiresAt { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
 
     public Submission? Submission { get; set; }
+    public Submission? SourceSubmission { get; set; }
+    public SubmissionFile? SourceSubmissionFile { get; set; }
     public Requirement? Requirement { get; set; }
     public FileAsset? FileAsset { get; set; }
 }

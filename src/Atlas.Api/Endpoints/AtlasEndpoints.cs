@@ -883,6 +883,7 @@ public static class AtlasEndpoints
             return Results.Ok(new ActionDetailResponse(
                 action.Id,
                 action.PublicReference,
+                action.ClientReference,
                 action.Title,
                 action.Description,
                 action.Status,
@@ -983,6 +984,57 @@ public static class AtlasEndpoints
                 }
             }
 
+            var recipientEmail = request.Recipient.Email.Trim().ToLowerInvariant();
+            var clientReference = string.IsNullOrWhiteSpace(request.ClientReference)
+                ? null
+                : request.ClientReference.Trim();
+            if (clientReference is { Length: > 160 })
+            {
+                return EndpointHelpers.Problem("validation_failed", "Client reference must be 160 characters or fewer.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (!string.IsNullOrWhiteSpace(clientReference))
+            {
+                var existingClientReference = await dbContext.Actions
+                    .AsNoTracking()
+                    .Where(action => action.ClientReference == clientReference)
+                    .OrderByDescending(action => action.CreatedAt)
+                    .FirstOrDefaultAsync(cancellationToken);
+                if (existingClientReference is not null)
+                {
+                    return DuplicateActionProblem(
+                        "duplicate_client_reference",
+                        "An action with this client reference already exists.",
+                        existingClientReference);
+                }
+            }
+
+            if (!request.AllowDuplicate)
+            {
+                var duplicateWindowMinutes = EndpointHelpers.ReadPositiveIntSetting(
+                    (await settings.GetAsync(organizationId, "actions", "duplicateWindowMinutes", cancellationToken))?.ValueJson,
+                    10);
+                var duplicateCreatedAfter = clock.UtcNow.AddMinutes(-duplicateWindowMinutes);
+                var possibleDuplicate = await dbContext.Actions
+                    .AsNoTracking()
+                    .Include(action => action.Recipients)
+                    .Where(action => action.CreatedAt >= duplicateCreatedAfter
+                        && action.Status != ChecklistActionStatus.Cancelled
+                        && action.TemplateId == request.TemplateId
+                        && action.Title == request.Title.Trim()
+                        && action.DueAt == request.DueAt
+                        && action.Recipients.Any(recipient => recipient.Email == recipientEmail))
+                    .OrderByDescending(action => action.CreatedAt)
+                    .FirstOrDefaultAsync(cancellationToken);
+                if (possibleDuplicate is not null)
+                {
+                    return DuplicateActionProblem(
+                        "possible_duplicate_action",
+                        "A very similar checklist was just created. Confirm before creating it again.",
+                        possibleDuplicate);
+                }
+            }
+
             var graceDaysSetting = await settings.GetAsync(organizationId, "security", "recipientTokenGraceDays", cancellationToken)
                 ?? await settings.GetAsync(organizationId, "security", "recipientTokenDays", cancellationToken);
             var graceDays = EndpointHelpers.ReadPositiveIntSetting(graceDaysSetting?.ValueJson, 30);
@@ -994,6 +1046,7 @@ public static class AtlasEndpoints
             {
                 OrganizationId = organizationId,
                 TemplateId = request.TemplateId,
+                ClientReference = clientReference,
                 Title = request.Title.Trim(),
                 Description = request.Description,
                 PublicReference = EndpointHelpers.NewPublicReference(),
@@ -1011,7 +1064,7 @@ public static class AtlasEndpoints
             {
                 Action = action,
                 Name = request.Recipient.Name.Trim(),
-                Email = request.Recipient.Email.Trim().ToLowerInvariant(),
+                Email = recipientEmail,
                 Phone = request.Recipient.Phone,
                 OtpRequired = request.Recipient.OtpRequired,
                 AccessTokenHash = secretHasher.HashSecret(rawToken),
@@ -1069,6 +1122,7 @@ public static class AtlasEndpoints
             var response = new ActionResponse(
                 action.Id,
                 action.PublicReference,
+                action.ClientReference,
                 action.Title,
                 action.Status,
                 action.DueAt,
@@ -2067,6 +2121,7 @@ public static class AtlasEndpoints
         return new ActionListItemResponse(
             action.Id,
             action.PublicReference,
+            action.ClientReference,
             action.Title,
             action.Status,
             action.DueAt,
@@ -2089,6 +2144,22 @@ public static class AtlasEndpoints
             action.CreatedAt,
             action.UpdatedAt,
             lastActivityAt);
+    }
+
+    private static IResult DuplicateActionProblem(string code, string title, ChecklistAction action)
+    {
+        return Results.Problem(
+            title: title,
+            statusCode: StatusCodes.Status409Conflict,
+            type: $"https://docs.atlas.example/errors/{code}",
+            extensions: new Dictionary<string, object?>
+            {
+                ["code"] = code,
+                ["existingActionId"] = action.Id,
+                ["publicReference"] = action.PublicReference,
+                ["clientReference"] = action.ClientReference,
+                ["existingActionStatus"] = action.Status.ToString()
+            });
     }
 
     private static string ToOrganizationSlug(string value)
@@ -2428,7 +2499,9 @@ public sealed record CreateActionRequest(
     JsonElement? Settings,
     bool SendImmediately,
     Guid CreatedByUserId,
-    IReadOnlyList<RequirementDefinitionRequest> Requirements);
+    IReadOnlyList<RequirementDefinitionRequest> Requirements,
+    string? ClientReference,
+    bool AllowDuplicate);
 
 public sealed record RecipientRequest(
     string Name,
@@ -2439,6 +2512,7 @@ public sealed record RecipientRequest(
 public sealed record ActionResponse(
     Guid Id,
     string PublicReference,
+    string? ClientReference,
     string Title,
     ChecklistActionStatus Status,
     DateTimeOffset? DueAt,
@@ -2449,6 +2523,7 @@ public sealed record ActionResponse(
 public sealed record ActionListItemResponse(
     Guid Id,
     string PublicReference,
+    string? ClientReference,
     string Title,
     ChecklistActionStatus Status,
     DateTimeOffset? DueAt,
@@ -2475,6 +2550,7 @@ public sealed record ActionListRecipientResponse(
 public sealed record ActionDetailResponse(
     Guid Id,
     string PublicReference,
+    string? ClientReference,
     string Title,
     string? Description,
     ChecklistActionStatus Status,

@@ -210,12 +210,17 @@ public sealed class AtlasDbContext(
             entity.ToTable("actions", table =>
                 table.HasCheckConstraint("ck_actions_due_after_created", "due_at IS NULL OR due_at >= created_at"));
             entity.HasIndex(e => e.PublicReference).IsUnique().HasDatabaseName("uq_actions_public_reference");
+            entity.HasIndex(e => new { e.OrganizationId, e.ClientReference })
+                .IsUnique()
+                .HasDatabaseName("uq_actions_org_client_reference")
+                .HasFilter("client_reference IS NOT NULL");
             entity.HasIndex(e => new { e.OrganizationId, e.Status, e.CreatedAt })
                 .HasDatabaseName("ix_actions_org_status");
             entity.HasIndex(e => new { e.OrganizationId, e.DueAt })
                 .HasDatabaseName("ix_actions_org_due")
                 .HasFilter("deleted_at IS NULL AND due_at IS NOT NULL AND status IN (2, 3)");
             entity.Property(e => e.PublicReference).HasMaxLength(32).IsRequired();
+            entity.Property(e => e.ClientReference).HasMaxLength(160);
             entity.Property(e => e.Title).HasMaxLength(240).IsRequired();
             entity.Property(e => e.Status).HasConversion<short>().IsRequired();
             entity.Property(e => e.SettingsJson).HasColumnType("jsonb").IsRequired();
@@ -376,11 +381,26 @@ public sealed class AtlasDbContext(
         modelBuilder.Entity<SubmissionFile>(entity =>
         {
             entity.ToTable("submission_files");
+            entity.HasIndex(e => e.SourceSubmissionId).HasDatabaseName("ix_submission_files_source_submission");
+            entity.HasIndex(e => e.SourceSubmissionFileId).HasDatabaseName("ix_submission_files_source_file");
+            entity.Property(e => e.DocumentName).HasMaxLength(255);
+            entity.Property(e => e.ReuseConsentText).HasMaxLength(500);
+            entity.Property(e => e.ReuseConsentIpAddress).HasColumnType("inet");
+            entity.Property(e => e.ReuseConfirmedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DocumentExpiresAt).HasColumnType("timestamptz");
             entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
             entity.HasOne(e => e.Submission)
                 .WithMany(e => e.Files)
                 .HasForeignKey(e => e.SubmissionId)
                 .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.SourceSubmission)
+                .WithMany()
+                .HasForeignKey(e => e.SourceSubmissionId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.SourceSubmissionFile)
+                .WithMany()
+                .HasForeignKey(e => e.SourceSubmissionFileId)
+                .OnDelete(DeleteBehavior.SetNull);
             entity.HasOne(e => e.Requirement)
                 .WithMany()
                 .HasForeignKey(e => e.RequirementId)
@@ -957,6 +977,56 @@ public sealed class AtlasDbContext(
                     Category = "retention",
                     Key = "purgeIntervalMinutes",
                     ValueJson = "60",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("2399ef93-7023-43a8-901e-b326ca953d29"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "documentReuse",
+                    Key = "enabled",
+                    ValueJson = "true",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("a54fb28b-f38c-47c2-80f4-aae9943ca573"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "documentReuse",
+                    Key = "maximumAgeDays",
+                    ValueJson = "365",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("b49d89e2-6874-481b-9325-f7f2ed11f2d1"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "documentReuse",
+                    Key = "requireRecipientConfirmation",
+                    ValueJson = "true",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("426602a2-af96-45fd-a44e-f98038f9383d"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "documentReuse",
+                    Key = "reuseExpiredDocuments",
+                    ValueJson = "false",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("24801c38-0bfe-4404-aecb-7b2ce479706a"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "actions",
+                    Key = "duplicateWindowMinutes",
+                    ValueJson = "10",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },

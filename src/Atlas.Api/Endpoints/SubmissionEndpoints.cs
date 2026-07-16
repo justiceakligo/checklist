@@ -235,8 +235,24 @@ public static class SubmissionEndpoints
             }
 
             var deletedFileIds = new List<Guid>();
-            foreach (var file in submission.Files.Select(item => item.FileAsset).Where(item => item is not null).Cast<Atlas.Domain.Entities.FileAsset>())
+            var retainedFileIds = new List<Guid>();
+            foreach (var submissionFile in submission.Files)
             {
+                var file = submissionFile.FileAsset;
+                if (file is null)
+                {
+                    continue;
+                }
+
+                var referencedElsewhere = await dbContext.SubmissionFiles
+                    .IgnoreQueryFilters()
+                    .AnyAsync(item => item.FileAssetId == file.Id && item.SubmissionId != submission.Id, cancellationToken);
+                if (referencedElsewhere)
+                {
+                    retainedFileIds.Add(file.Id);
+                    continue;
+                }
+
                 await storage.DeleteObjectAsync(file.StorageKey, cancellationToken);
                 file.DeletedAt = clock.UtcNow;
                 deletedFileIds.Add(file.Id);
@@ -248,7 +264,7 @@ public static class SubmissionEndpoints
                 submission.ActionId,
                 tenantContext,
                 "submission.deleted",
-                new { submission.Id, deletedFileIds },
+                new { submission.Id, deletedFileIds, retainedFileIds },
                 httpContext);
             dbContext.Submissions.Remove(submission);
             await dbContext.SaveChangesAsync(cancellationToken);

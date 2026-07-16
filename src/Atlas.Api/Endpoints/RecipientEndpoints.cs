@@ -31,6 +31,7 @@ public static class RecipientEndpoints
         group.MapGet("/uploads/{fileId:guid}", GetRecipientUploadStatus);
         group.MapPost("/uploads/{fileId:guid}/complete", CompleteRecipientUpload);
         group.MapDelete("/uploads/{fileId:guid}", DeleteRecipientUpload);
+        group.MapGet("/requirements/{requirementId:guid}/previously-submitted/{fileAssetId:guid}/download-url", GetPreviouslySubmittedDownloadUrl);
         group.MapPost("/return-link", RequestReturnLink);
         group.MapPost("/submit", SubmitChecklist);
         group.MapGet("/receipt", GetReceipt);
@@ -290,6 +291,8 @@ public static class RecipientEndpoints
     private static async Task<IResult> GetChecklist(
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -306,19 +309,30 @@ public static class RecipientEndpoints
             .Where(item => item.ActionId == action.Id)
             .OrderBy(item => item.DisplayOrder)
             .ToListAsync(cancellationToken);
-        var requirements = requirementRows
-            .Select(item => new RecipientRequirementResponse(
-                item.Id,
-                item.Key,
-                item.Type,
-                item.Label,
-                item.Description,
-                item.IsRequired,
-                item.DisplayOrder,
-                ParseJson(item.ConfigurationJson),
-                ParseJson(item.ValidationJson),
-                item.ConditionJson == null ? null : ParseJson(item.ConditionJson)))
-            .ToList();
+        var requirements = new List<RecipientRequirementResponse>();
+        foreach (var requirement in requirementRows)
+        {
+            requirements.Add(new RecipientRequirementResponse(
+                requirement.Id,
+                requirement.Key,
+                requirement.Type,
+                requirement.Label,
+                requirement.Description,
+                requirement.IsRequired,
+                requirement.DisplayOrder,
+                ParseJson(requirement.ConfigurationJson),
+                ParseJson(requirement.ValidationJson),
+                requirement.ConditionJson == null ? null : ParseJson(requirement.ConditionJson),
+                await FindPreviouslySubmittedDocumentAsync(
+                    dbContext,
+                    settings,
+                    organization.Id,
+                    action.Id,
+                    recipient.Email,
+                    requirement,
+                    clock.UtcNow,
+                    cancellationToken)));
+        }
 
         var draftRows = await dbContext.DraftResponses
             .Where(item => item.ActionRecipientId == recipient.Id)
@@ -520,6 +534,80 @@ public static class RecipientEndpoints
         return Results.Ok(new FileStatusResponse(file.Id, file.ScanStatus, file.ScanCompletedAt));
     }
 
+    private static async Task<IResult> GetPreviouslySubmittedDownloadUrl(
+        Guid requirementId,
+        Guid fileAssetId,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireVerifiedRecipientAsync(dbContext, tenantContext, httpContext, cancellationToken);
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var recipient = access.Recipient!;
+        var requirement = await dbContext.Requirements.AsNoTracking()
+            .FirstOrDefaultAsync(item => item.Id == requirementId && item.ActionId == recipient.ActionId, cancellationToken);
+        if (requirement is null || requirement.Type != RequirementType.File)
+        {
+            return EndpointHelpers.Problem("not_found", "File requirement was not found.", StatusCodes.Status404NotFound);
+        }
+
+        var candidate = await FindPreviouslySubmittedDocumentAsync(
+            dbContext,
+            settings,
+            recipient.Action!.OrganizationId,
+            recipient.ActionId,
+            recipient.Email,
+            requirement,
+            clock.UtcNow,
+            cancellationToken);
+        if (candidate is null || candidate.FileAssetId != fileAssetId)
+        {
+            return EndpointHelpers.Problem("not_found", "Previously submitted document was not found.", StatusCodes.Status404NotFound);
+        }
+
+        if (!candidate.CanUse)
+        {
+            return EndpointHelpers.Problem("previous_document_not_usable", candidate.Message, StatusCodes.Status409Conflict);
+        }
+
+        var file = await dbContext.FileAssets.AsNoTracking()
+            .FirstOrDefaultAsync(item => item.Id == fileAssetId, cancellationToken);
+        if (file is null || file.DeletedAt is not null || file.ScanStatus != FileScanStatus.Clean)
+        {
+            return EndpointHelpers.Problem("file_not_available", "Previously submitted document is not available for preview.", StatusCodes.Status409Conflict);
+        }
+
+        var downloadMinutes = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(file.OrganizationId, "files", "downloadUrlMinutes", cancellationToken))?.ValueJson,
+            5);
+        var signedUrl = await storage.CreateDownloadUrlAsync(
+            new PresignedDownloadRequest(
+                file.StorageKey,
+                file.OriginalFileName,
+                file.MimeType,
+                TimeSpan.FromMinutes(downloadMinutes)),
+            cancellationToken);
+
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            file.OrganizationId,
+            recipient.ActionId,
+            tenantContext,
+            "recipient.previous_document_previewed",
+            new { FileId = file.Id, RequirementId = requirement.Id },
+            httpContext);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Results.Ok(signedUrl);
+    }
+
     private static async Task<IResult> CompleteRecipientUpload(
         Guid fileId,
         AtlasDbContext dbContext,
@@ -584,6 +672,13 @@ public static class RecipientEndpoints
             return EndpointHelpers.Problem("not_found", "File was not found.", StatusCodes.Status404NotFound);
         }
 
+        var isSubmitted = await dbContext.SubmissionFiles
+            .AnyAsync(item => item.FileAssetId == file.Id, cancellationToken);
+        if (isSubmitted)
+        {
+            return EndpointHelpers.Problem("state_conflict", "Submitted files cannot be deleted from the recipient portal.", StatusCodes.Status409Conflict);
+        }
+
         await storage.DeleteObjectAsync(file.StorageKey, cancellationToken);
         file.DeletedAt = clock.UtcNow;
         SecurityEndpoints.AddAudit(dbContext, file.OrganizationId, file.ActionId, tenantContext, "file.deleted", new { file.Id }, httpContext);
@@ -595,6 +690,7 @@ public static class RecipientEndpoints
         SubmitRequest request,
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
+        IAdminSettingService settings,
         IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
@@ -641,11 +737,25 @@ public static class RecipientEndpoints
 
         var requirements = await dbContext.Requirements.Where(item => item.ActionId == action.Id).ToListAsync(cancellationToken);
         var drafts = await dbContext.DraftResponses.Where(item => item.ActionRecipientId == recipient.Id).ToListAsync(cancellationToken);
+        var requestedFiles = request.Files ?? Array.Empty<SubmitFileRequest>();
+
+        var submittedFileRequirementIds = requestedFiles.Select(item => item.RequirementId).ToHashSet();
+        var duplicateFileRequirements = requestedFiles
+            .GroupBy(item => item.RequirementId)
+            .Where(grouping => grouping.Count() > 1)
+            .Select(grouping => grouping.Key.ToString())
+            .ToList();
+        if (duplicateFileRequirements.Count > 0)
+        {
+            return EndpointHelpers.Problem("validation_failed", "Only one file choice is allowed per file requirement.", StatusCodes.Status422UnprocessableEntity);
+        }
 
         var missingRequired = requirements
             .Where(requirement => requirement.IsRequired
-                && requirement.Type != RequirementType.File
-                && drafts.All(draft => draft.RequirementId != requirement.Id || string.IsNullOrWhiteSpace(draft.ValueJson)))
+                && ((requirement.Type != RequirementType.File
+                        && drafts.All(draft => draft.RequirementId != requirement.Id || string.IsNullOrWhiteSpace(draft.ValueJson)))
+                    || (requirement.Type == RequirementType.File
+                        && !submittedFileRequirementIds.Contains(requirement.Id))))
             .Select(requirement => requirement.Key)
             .ToList();
         if (missingRequired.Count > 0)
@@ -684,8 +794,74 @@ public static class RecipientEndpoints
             });
         }
 
-        foreach (var file in request.Files)
+        foreach (var file in requestedFiles)
         {
+            var requirement = requirements.FirstOrDefault(item => item.Id == file.RequirementId);
+            if (requirement is null || requirement.Type != RequirementType.File)
+            {
+                return EndpointHelpers.Problem("not_found", "File requirement was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (file.UsePreviouslySubmitted)
+            {
+                var candidate = await FindPreviouslySubmittedDocumentAsync(
+                    dbContext,
+                    settings,
+                    action.OrganizationId,
+                    action.Id,
+                    recipient.Email,
+                    requirement,
+                    clock.UtcNow,
+                    cancellationToken);
+                if (candidate is null || candidate.FileAssetId != file.FileId)
+                {
+                    return EndpointHelpers.Problem("not_found", "Previously submitted document was not found.", StatusCodes.Status404NotFound);
+                }
+
+                if (!candidate.CanUse)
+                {
+                    return EndpointHelpers.Problem("previous_document_not_usable", candidate.Message, StatusCodes.Status409Conflict);
+                }
+
+                var reusedFile = await dbContext.FileAssets.FirstOrDefaultAsync(
+                    item => item.Id == file.FileId && item.OrganizationId == action.OrganizationId,
+                    cancellationToken);
+                if (reusedFile is null || reusedFile.DeletedAt is not null || reusedFile.ScanStatus != FileScanStatus.Clean)
+                {
+                    return EndpointHelpers.Problem("file_not_available", "Previously submitted document is no longer available.", StatusCodes.Status409Conflict);
+                }
+
+                var extendedRetention = clock.UtcNow.AddDays(Math.Max(1, action.Organization?.RetentionDays ?? 365));
+                if (!reusedFile.RetentionUntil.HasValue || reusedFile.RetentionUntil.Value < extendedRetention)
+                {
+                    reusedFile.RetentionUntil = extendedRetention;
+                }
+
+                submission.Files.Add(new SubmissionFile
+                {
+                    RequirementId = file.RequirementId,
+                    FileAssetId = file.FileId,
+                    IsPreviouslySubmitted = true,
+                    SourceSubmissionId = candidate.SourceSubmissionId,
+                    SourceSubmissionFileId = candidate.SourceSubmissionFileId,
+                    ReuseConfirmedAt = clock.UtcNow,
+                    ReuseConsentIpAddress = httpContext.Connection.RemoteIpAddress,
+                    ReuseConsentText = "Recipient confirmed use of a previously submitted document for this checklist.",
+                    DocumentName = string.IsNullOrWhiteSpace(file.DocumentName) ? candidate.DocumentName : file.DocumentName.Trim(),
+                    DocumentExpiresAt = file.DocumentExpiresAt ?? candidate.DocumentExpiresAt,
+                    CreatedAt = clock.UtcNow
+                });
+                SecurityEndpoints.AddAudit(
+                    dbContext,
+                    action.OrganizationId,
+                    action.Id,
+                    tenantContext,
+                    "recipient.previous_document_confirmed",
+                    new { requirement.Id, candidate.FileAssetId, candidate.SourceSubmissionId, candidate.SourceSubmissionFileId },
+                    httpContext);
+                continue;
+            }
+
             var fileAsset = await dbContext.FileAssets.FirstOrDefaultAsync(
                 item => item.Id == file.FileId
                     && item.ActionRecipientId == recipient.Id
@@ -705,6 +881,8 @@ public static class RecipientEndpoints
             {
                 RequirementId = file.RequirementId,
                 FileAssetId = file.FileId,
+                DocumentName = string.IsNullOrWhiteSpace(file.DocumentName) ? null : file.DocumentName.Trim(),
+                DocumentExpiresAt = file.DocumentExpiresAt,
                 CreatedAt = clock.UtcNow
             });
         }
@@ -930,6 +1108,257 @@ public static class RecipientEndpoints
         return SHA256.HashData(Encoding.UTF8.GetBytes(payload));
     }
 
+    private static async Task<PreviouslySubmittedDocumentResponse?> FindPreviouslySubmittedDocumentAsync(
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        Guid organizationId,
+        Guid currentActionId,
+        string recipientEmail,
+        Requirement requirement,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var policy = await ResolveDocumentReusePolicyAsync(settings, organizationId, requirement, cancellationToken);
+        if (!policy.Enabled || !policy.RequirementAllowsReuse)
+        {
+            return null;
+        }
+
+        var normalizedEmail = recipientEmail.Trim().ToLowerInvariant();
+        var candidate = await dbContext.SubmissionFiles
+            .AsNoTracking()
+            .Include(item => item.Submission)
+            .ThenInclude(submission => submission!.Action)
+            .Include(item => item.Submission)
+            .ThenInclude(submission => submission!.ActionRecipient)
+            .Include(item => item.Requirement)
+            .Include(item => item.FileAsset)
+            .Where(item => item.Submission != null
+                && item.Submission.Action != null
+                && item.Submission.ActionRecipient != null
+                && item.Requirement != null
+                && item.FileAsset != null
+                && item.Submission.Status == SubmissionStatus.Accepted
+                && item.Submission.ActionId != currentActionId
+                && item.Submission.Action.OrganizationId == organizationId
+                && item.Submission.ActionRecipient.Email == normalizedEmail
+                && item.Requirement.Type == RequirementType.File
+                && item.FileAsset.OrganizationId == organizationId
+                && item.FileAsset.DeletedAt == null
+                && (requirement.SourceTemplateRequirementId.HasValue
+                    ? item.Requirement.SourceTemplateRequirementId == requirement.SourceTemplateRequirementId
+                        || item.Requirement.Key == requirement.Key
+                    : item.Requirement.Key == requirement.Key))
+            .OrderByDescending(item => item.Submission!.ReviewedAt ?? item.Submission.SubmittedAt)
+            .ThenByDescending(item => item.CreatedAt)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (candidate?.Submission is null || candidate.Requirement is null || candidate.FileAsset is null)
+        {
+            return null;
+        }
+
+        var ageDays = Math.Max(0, (int)Math.Floor((now - candidate.Submission.SubmittedAt).TotalDays));
+        var tooOld = ageDays > policy.MaximumAgeDays;
+        var documentExpired = candidate.DocumentExpiresAt.HasValue && candidate.DocumentExpiresAt.Value <= now;
+        var retentionExpired = candidate.FileAsset.RetentionUntil.HasValue && candidate.FileAsset.RetentionUntil.Value <= now;
+        var fileUnavailable = candidate.FileAsset.ScanStatus != FileScanStatus.Clean || candidate.FileAsset.DeletedAt.HasValue || retentionExpired;
+        var canUse = !fileUnavailable
+            && !tooOld
+            && (!documentExpired || policy.ReuseExpiredDocuments);
+        var status = canUse
+            ? "Available"
+            : fileUnavailable
+                ? "Unavailable"
+                : documentExpired
+                    ? "Expired"
+                    : "TooOld";
+
+        var documentName = string.IsNullOrWhiteSpace(candidate.DocumentName)
+            ? candidate.FileAsset.OriginalFileName
+            : candidate.DocumentName;
+        var message = status switch
+        {
+            "Available" => $"We found {WithArticle(documentName)} you previously submitted to this organization on {FormatDate(candidate.Submission.SubmittedAt)}.",
+            "Expired" => $"Previous document found, but it expired on {FormatDate(candidate.DocumentExpiresAt)}. Please upload a new one.",
+            "TooOld" => $"Previous document found, but it is older than the {policy.MaximumAgeDays}-day reuse limit. Please upload a new one.",
+            _ => "Previous document found, but it is no longer available. Please upload a new one."
+        };
+
+        return new PreviouslySubmittedDocumentResponse(
+            candidate.FileAssetId,
+            candidate.SubmissionId,
+            candidate.Id,
+            candidate.FileAsset.OriginalFileName,
+            documentName,
+            candidate.Submission.SubmittedAt,
+            candidate.Submission.ReviewedAt,
+            candidate.FileAsset.ScanStatus,
+            candidate.DocumentExpiresAt,
+            candidate.FileAsset.RetentionUntil,
+            ageDays,
+            policy.MaximumAgeDays,
+            canUse,
+            status,
+            message,
+            policy.RequireRecipientConfirmation);
+    }
+
+    private static async Task<DocumentReusePolicy> ResolveDocumentReusePolicyAsync(
+        IAdminSettingService settings,
+        Guid organizationId,
+        Requirement requirement,
+        CancellationToken cancellationToken)
+    {
+        var requirementPolicy = ReadRequirementReusePolicy(requirement);
+        var enabled = EndpointHelpers.ReadBoolSetting(
+            (await settings.GetAsync(organizationId, "documentReuse", "enabled", cancellationToken))?.ValueJson,
+            true);
+        var maximumAgeDays = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(organizationId, "documentReuse", "maximumAgeDays", cancellationToken))?.ValueJson,
+            365);
+        var requireRecipientConfirmation = EndpointHelpers.ReadBoolSetting(
+            (await settings.GetAsync(organizationId, "documentReuse", "requireRecipientConfirmation", cancellationToken))?.ValueJson,
+            true);
+        var reuseExpiredDocuments = EndpointHelpers.ReadBoolSetting(
+            (await settings.GetAsync(organizationId, "documentReuse", "reuseExpiredDocuments", cancellationToken))?.ValueJson,
+            false);
+
+        return new DocumentReusePolicy(
+            enabled,
+            requirementPolicy.AllowReuse,
+            requirementPolicy.MaximumAgeDays ?? maximumAgeDays,
+            requirementPolicy.RequireRecipientConfirmation ?? requireRecipientConfirmation,
+            requirementPolicy.ReuseExpiredDocuments ?? reuseExpiredDocuments);
+    }
+
+    private static RequirementReusePolicy ReadRequirementReusePolicy(Requirement requirement)
+    {
+        if (requirement.Type != RequirementType.File)
+        {
+            return new RequirementReusePolicy(false, null, null, null);
+        }
+
+        try
+        {
+            var config = ParseJson(requirement.ConfigurationJson);
+            var nested = TryGetJsonObject(config, "fileReuse", out var fileReuse)
+                || TryGetJsonObject(config, "previouslySubmitted", out fileReuse)
+                ? fileReuse
+                : default;
+
+            var allowReuse = TryReadBoolProperty(config, "allowReuse", out var rootAllowReuse)
+                ? rootAllowReuse
+                : TryReadBoolProperty(config, "allowPreviouslySubmitted", out var rootAllowPreviouslySubmitted)
+                    ? rootAllowPreviouslySubmitted
+                    : nested.ValueKind == JsonValueKind.Object && TryReadBoolProperty(nested, "allowReuse", out var nestedAllowReuse)
+                        ? nestedAllowReuse
+                        : nested.ValueKind == JsonValueKind.Object && TryReadBoolProperty(nested, "allowPreviouslySubmitted", out var nestedAllowPreviouslySubmitted)
+                            ? nestedAllowPreviouslySubmitted
+                            : false;
+
+            int? maximumAgeDays = null;
+            if (nested.ValueKind == JsonValueKind.Object && TryReadPositiveIntProperty(nested, "maximumAgeDays", out var nestedMaximumAgeDays))
+            {
+                maximumAgeDays = nestedMaximumAgeDays;
+            }
+            else if (nested.ValueKind == JsonValueKind.Object && TryReadPositiveIntProperty(nested, "maxAgeDays", out var nestedMaxAgeDays))
+            {
+                maximumAgeDays = nestedMaxAgeDays;
+            }
+            else if (TryReadPositiveIntProperty(config, "maximumReuseAgeDays", out var rootMaximumAgeDays))
+            {
+                maximumAgeDays = rootMaximumAgeDays;
+            }
+
+            bool? requireRecipientConfirmation = null;
+            if (nested.ValueKind == JsonValueKind.Object && TryReadBoolProperty(nested, "requireRecipientConfirmation", out var nestedRequireConfirmation))
+            {
+                requireRecipientConfirmation = nestedRequireConfirmation;
+            }
+
+            bool? reuseExpiredDocuments = null;
+            if (nested.ValueKind == JsonValueKind.Object && TryReadBoolProperty(nested, "reuseExpiredDocuments", out var nestedReuseExpired))
+            {
+                reuseExpiredDocuments = nestedReuseExpired;
+            }
+
+            return new RequirementReusePolicy(allowReuse, maximumAgeDays, requireRecipientConfirmation, reuseExpiredDocuments);
+        }
+        catch (JsonException)
+        {
+            return new RequirementReusePolicy(false, null, null, null);
+        }
+    }
+
+    private static bool TryGetJsonObject(JsonElement value, string propertyName, out JsonElement property)
+    {
+        property = default;
+        return value.ValueKind == JsonValueKind.Object
+            && value.TryGetProperty(propertyName, out property)
+            && property.ValueKind == JsonValueKind.Object;
+    }
+
+    private static bool TryReadBoolProperty(JsonElement value, string propertyName, out bool result)
+    {
+        result = default;
+        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            result = property.GetBoolean();
+            return true;
+        }
+
+        if (property.ValueKind == JsonValueKind.String && bool.TryParse(property.GetString(), out var parsed))
+        {
+            result = parsed;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadPositiveIntProperty(JsonElement value, string propertyName, out int result)
+    {
+        result = default;
+        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.Number && property.TryGetInt32(out var parsedNumber) && parsedNumber > 0)
+        {
+            result = parsedNumber;
+            return true;
+        }
+
+        if (property.ValueKind == JsonValueKind.String
+            && int.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedString)
+            && parsedString > 0)
+        {
+            result = parsedString;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string WithArticle(string documentName)
+    {
+        var trimmed = documentName.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return "a previously submitted document";
+        }
+
+        var first = char.ToLowerInvariant(trimmed[0]);
+        var article = first is 'a' or 'e' or 'i' or 'o' or 'u' ? "an" : "a";
+        return $"{article} {trimmed}";
+    }
+
     private static DateTimeOffset MinDate(DateTimeOffset? left, DateTimeOffset right)
     {
         return left is not null && left < right ? left.Value : right;
@@ -962,6 +1391,19 @@ public static class RecipientEndpoints
     private sealed record RecipientAccess(ActionRecipient? Recipient, RecipientAccessSession? Session, IResult? Problem);
 
     private sealed record OtpEmailAttempt(IResult? Problem, NotificationDelivery? Delivery);
+
+    private sealed record RequirementReusePolicy(
+        bool AllowReuse,
+        int? MaximumAgeDays,
+        bool? RequireRecipientConfirmation,
+        bool? ReuseExpiredDocuments);
+
+    private sealed record DocumentReusePolicy(
+        bool Enabled,
+        bool RequirementAllowsReuse,
+        int MaximumAgeDays,
+        bool RequireRecipientConfirmation,
+        bool ReuseExpiredDocuments);
 }
 
 public sealed record RecipientAccessResponse(
@@ -999,7 +1441,26 @@ public sealed record RecipientRequirementResponse(
     int DisplayOrder,
     JsonElement Configuration,
     JsonElement Validation,
-    JsonElement? Condition);
+    JsonElement? Condition,
+    PreviouslySubmittedDocumentResponse? PreviouslySubmitted);
+
+public sealed record PreviouslySubmittedDocumentResponse(
+    Guid FileAssetId,
+    Guid SourceSubmissionId,
+    Guid SourceSubmissionFileId,
+    string FileName,
+    string DocumentName,
+    DateTimeOffset SubmittedAt,
+    DateTimeOffset? ReviewedAt,
+    FileScanStatus ScanStatus,
+    DateTimeOffset? DocumentExpiresAt,
+    DateTimeOffset? RetentionUntil,
+    int AgeDays,
+    int MaximumAgeDays,
+    bool CanUse,
+    string Status,
+    string Message,
+    bool RequireRecipientConfirmation);
 
 public sealed record RecipientDraftResponse(
     Guid RequirementId,
@@ -1023,7 +1484,12 @@ public sealed record FileStatusResponse(Guid FileId, FileScanStatus ScanStatus, 
 
 public sealed record SubmitRequest(bool DeclarationAccepted, IReadOnlyList<SubmitFileRequest> Files);
 
-public sealed record SubmitFileRequest(Guid RequirementId, Guid FileId);
+public sealed record SubmitFileRequest(
+    Guid RequirementId,
+    Guid FileId,
+    bool UsePreviouslySubmitted,
+    string? DocumentName,
+    DateTimeOffset? DocumentExpiresAt);
 
 public sealed record SubmissionResultResponse(
     Guid Id,

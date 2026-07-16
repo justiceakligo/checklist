@@ -6,6 +6,8 @@ Platform admin endpoints are documented separately in [PLATFORM_ADMIN_API_IMPLEM
 
 Frontend deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
 
+Recipient autosave, duplicate-send protection, and the "Previously Submitted" document flow are documented in [PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md](PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md).
+
 ## Base URLs
 
 ```text
@@ -674,7 +676,9 @@ When `templateId` is provided, the backend clones the published template require
   "settings": {},
   "sendImmediately": true,
   "createdByUserId": "11111111-1111-1111-1111-111111111111",
-  "requirements": []
+  "requirements": [],
+  "clientReference": "frontend-draft-01J2ZVR8V67M6P3F9W1X2G7F21",
+  "allowDuplicate": false
 }
 ```
 
@@ -684,6 +688,7 @@ When `templateId` is provided, the backend clones the published template require
 {
   "id": "88888888-8888-8888-8888-888888888888",
   "publicReference": "act_5fd67eb7d9c2a001e3a4",
+  "clientReference": "frontend-draft-01J2ZVR8V67M6P3F9W1X2G7F21",
   "title": "Onboarding - Jamie Chen",
   "status": "Sent",
   "dueAt": "2026-08-15T00:00:00Z",
@@ -694,6 +699,12 @@ When `templateId` is provided, the backend clones the published template require
 ```
 
 Do not log the full `recipientUrl`. For support, show only the first six token characters.
+
+Duplicate handling:
+
+- Send a stable `clientReference` for each checklist creation attempt. If the frontend retries the same logical request without an `Idempotency-Key`, the backend returns `409 duplicate_client_reference` with `existingActionId` and `publicReference`.
+- If `clientReference` is omitted, the backend still blocks a very recent same-recipient, same-template/title/due date create with `409 possible_duplicate_action`.
+- Only send `allowDuplicate: true` after showing a confirmation UI to the sender.
 
 ### GET `/v1/actions`
 
@@ -709,6 +720,7 @@ GET /v1/actions?page=1&pageSize=25
     {
       "id": "88888888-8888-8888-8888-888888888888",
       "publicReference": "act_5fd67eb7d9c2a001e3a4",
+      "clientReference": "frontend-draft-01J2ZVR8V67M6P3F9W1X2G7F21",
       "title": "Onboarding - Jamie Chen",
       "status": "Sent",
       "dueAt": "2026-08-15T00:00:00Z",
@@ -984,6 +996,8 @@ OTP errors:
 
 Returns organization branding, checklist metadata, requirements, and draft responses.
 
+File requirements can include a `previouslySubmitted` object when the same recipient email has an accepted, clean prior submission for the same organization and opted-in requirement. See [PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md](PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md) for the full UI flow.
+
 ### PATCH `/v1/recipient/responses/{requirementId}`
 
 Autosave with optimistic concurrency.
@@ -1064,7 +1078,10 @@ Use `Idempotency-Key`.
   "files": [
     {
       "requirementId": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
-      "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc"
+      "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "usePreviouslySubmitted": false,
+      "documentName": "Government ID",
+      "documentExpiresAt": "2028-04-30T00:00:00Z"
     }
   ]
 }

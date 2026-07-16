@@ -202,6 +202,30 @@ internal static class EndpointHelpers
         }
     }
 
+    public static bool ReadBoolSetting(string? valueJson, bool fallback)
+    {
+        if (string.IsNullOrWhiteSpace(valueJson))
+        {
+            return fallback;
+        }
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<JsonElement>(valueJson, JsonOptions);
+            return value.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
+                _ => fallback
+            };
+        }
+        catch (JsonException)
+        {
+            return bool.TryParse(valueJson, out var parsed) ? parsed : fallback;
+        }
+    }
+
     public static string? ReadStringSetting(string? valueJson)
     {
         if (string.IsNullOrWhiteSpace(valueJson))
