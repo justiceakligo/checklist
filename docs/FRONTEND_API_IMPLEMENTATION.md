@@ -603,6 +603,8 @@ Response:
       "description": "Ontario healthcare staffing intake with ID, credentials, immunization proof, vulnerable sector check, availability, and placement acknowledgements.",
       "status": "Published",
       "currentVersionId": "77777777-7777-7777-7777-777777777777",
+      "isGlobal": true,
+      "isEditable": false,
       "title": "Healthcare Staffing Onboarding (Ontario)",
       "instructions": "Use for Ontario healthcare staffing agencies before placement.",
       "settings": {
@@ -623,6 +625,20 @@ Response:
       "region": "Ontario",
       "tags": ["healthcare", "staffing", "employee", "ontario"],
       "searchTerms": ["psw", "nurse", "vulnerable sector", "immunization"],
+      "requirements": [
+        {
+          "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+          "key": "government_id",
+          "type": "File",
+          "label": "Government ID",
+          "description": "Upload a clear image or PDF of your ID.",
+          "required": true,
+          "displayOrder": 1,
+          "configuration": { "allowReuse": true, "maxReuseAgeDays": 365 },
+          "validation": { "allowedMimeTypes": ["application/pdf", "image/jpeg", "image/png"] },
+          "condition": null
+        }
+      ],
       "createdAt": "2026-07-16T05:00:00Z",
       "updatedAt": "2026-07-16T05:00:00Z"
     }
@@ -630,9 +646,23 @@ Response:
 }
 ```
 
+### GET `/v1/templates/{id}`
+
+Returns the same shape as list items, including `requirements`.
+
+Use this when a sender opens a template preview, starts from a template, or opens an organization-owned custom template in the builder.
+
+Important UI fields:
+
+- `isGlobal: true`, `isEditable: false`: show "Use template" and "Customize a copy". Do not show direct edit controls.
+- `isGlobal: false`, `isEditable: true`: show edit, publish, archive, and delete actions if the organization has `custom_workflows`.
+- `status: Draft`: show "Publish" before this saved template can be used by `POST /v1/actions`.
+
 ### POST `/v1/templates`
 
 Requires `custom_workflows` entitlement.
+
+Creates a new organization-owned custom template in `Draft`.
 
 ```json
 {
@@ -663,9 +693,115 @@ Requires `custom_workflows` entitlement.
 }
 ```
 
+### POST `/v1/templates/{id}/clone`
+
+Requires `custom_workflows` entitlement.
+
+Use when a user chooses a global library template and clicks "Customize a copy". The backend creates an organization-owned template. The source global template is never modified.
+
+`additionalRequirements` appends fields to the copied template. For deeper editing, clone first, then call `PUT /v1/templates/{newId}` with the full `requirements` array.
+
+```json
+{
+  "name": "Healthcare Staffing Onboarding - RyvePool",
+  "category": "HR & Recruitment",
+  "description": "RyvePool-specific onboarding checklist based on the Ontario healthcare staffing template.",
+  "title": "Healthcare Staffing Onboarding",
+  "instructions": "Complete all required items before placement.",
+  "settings": {
+    "industry": "HR",
+    "tags": ["healthcare", "staffing", "ryvepool"]
+  },
+  "createdByUserId": "11111111-1111-1111-1111-111111111111",
+  "additionalRequirements": [
+    {
+      "key": "uniform_size",
+      "type": "Text",
+      "label": "Uniform size",
+      "description": "Tell us your preferred uniform size.",
+      "required": false,
+      "displayOrder": 99,
+      "configuration": {},
+      "validation": {},
+      "condition": null
+    }
+  ],
+  "publishImmediately": false
+}
+```
+
+`201` returns the organization-owned template with `isGlobal: false`, `isEditable: true`.
+
+### PUT `/v1/templates/{id}`
+
+Requires `custom_workflows` entitlement.
+
+Only organization-owned templates can be edited. If the user tries to edit a global template directly, the backend returns:
+
+```json
+{
+  "title": "Clone this library template before customizing it for your organization.",
+  "status": 403,
+  "code": "global_template_not_editable"
+}
+```
+
+Send the complete `requirements` list when editing checklist fields. The backend creates a new draft template version and leaves the previously published version intact until publish.
+
+```json
+{
+  "name": "Employee onboarding",
+  "category": "HR",
+  "description": "Collect identity, payroll, and equipment documents.",
+  "title": "Employee onboarding documents",
+  "instructions": "Complete each required item.",
+  "settings": {
+    "industry": "HR",
+    "tags": ["employee", "onboarding"]
+  },
+  "updatedByUserId": "11111111-1111-1111-1111-111111111111",
+  "requirements": [
+    {
+      "key": "legal_name",
+      "type": "Text",
+      "label": "Full legal name",
+      "description": "Enter your full legal name.",
+      "required": true,
+      "displayOrder": 1,
+      "configuration": {},
+      "validation": { "minLength": 2 },
+      "condition": null
+    },
+    {
+      "key": "direct_deposit_form",
+      "type": "File",
+      "label": "Direct deposit form",
+      "description": "Upload a completed direct deposit form.",
+      "required": true,
+      "displayOrder": 2,
+      "configuration": { "allowReuse": true, "maxReuseAgeDays": 365 },
+      "validation": { "allowedMimeTypes": ["application/pdf", "image/jpeg", "image/png"] },
+      "condition": null
+    }
+  ]
+}
+```
+
+`200` returns the updated template with `status: "Draft"`. Show a "Publish changes" CTA.
+
 ### POST `/v1/templates/{id}/publish`
 
 Requires `custom_workflows`. Returns the template response.
+
+Publishes the newest draft version of an organization-owned template. Published templates can be selected by `POST /v1/actions`.
+
+### POST `/v1/templates/{id}/archive`
+
+Requires `custom_workflows`. Archives an organization-owned custom template.
+
+### DELETE `/v1/templates/{id}`
+
+Requires `custom_workflows`. Soft-deletes an organization-owned custom template.
 
 ## Checklist Actions
 
@@ -675,7 +811,11 @@ Use `Idempotency-Key` for create.
 
 Sending immediately consumes monthly checklist quota.
 
-When `templateId` is provided, the backend clones the published template requirements into the action. `requirements: []` is valid and means "use the template requirements only." If `templateId` is omitted, provide explicit `requirements`.
+When `templateId` is provided, the backend clones the published template requirements into the action. `requirements: []` is valid and means "use the template requirements only."
+
+When `templateId` is provided and `requirements` contains items, the backend appends those items as one-off custom fields for this action. It does not modify the saved template.
+
+When `templateId` is omitted, provide explicit `requirements`; this creates a one-off custom checklist action.
 
 ```json
 {
@@ -698,6 +838,47 @@ When `templateId` is provided, the backend clones the published template require
   "allowDuplicate": false
 }
 ```
+
+Example: selected template plus one extra field for this recipient only:
+
+```json
+{
+  "templateId": "66666666-6666-6666-6666-666666666666",
+  "title": "Onboarding - Jamie Chen",
+  "description": "Collect onboarding documents plus uniform preference.",
+  "recipient": {
+    "name": "Jamie Chen",
+    "email": "jamie.chen@example.com",
+    "phone": null,
+    "otpRequired": false
+  },
+  "dueAt": "2026-08-15T00:00:00Z",
+  "expiresAt": null,
+  "settings": {},
+  "sendImmediately": true,
+  "createdByUserId": "11111111-1111-1111-1111-111111111111",
+  "requirements": [
+    {
+      "key": "uniform_size",
+      "type": "Text",
+      "label": "Uniform size",
+      "description": "Tell us your preferred uniform size.",
+      "required": false,
+      "displayOrder": 1,
+      "configuration": {},
+      "validation": {},
+      "condition": null
+    }
+  ],
+  "clientReference": "frontend-draft-01J2ZVR8V67M6P3F9W1X2G7F22",
+  "allowDuplicate": false
+}
+```
+
+Builder UX recommendation:
+
+- Use `POST /v1/actions` with `templateId + requirements` for one-off additions.
+- Use `POST /v1/templates/{id}/clone`, `PUT /v1/templates/{id}`, then `POST /v1/templates/{id}/publish` when the user wants to save a reusable custom workflow.
 
 `201`:
 

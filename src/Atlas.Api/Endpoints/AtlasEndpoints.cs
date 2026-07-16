@@ -652,6 +652,9 @@ public static class AtlasEndpoints
             var templateRows = await dbContext.Templates
                 .AsNoTracking()
                 .Include(template => template.CurrentVersion)
+                .ThenInclude(version => version!.Requirements)
+                .Include(template => template.Versions)
+                .ThenInclude(version => version.Requirements)
                 .OrderBy(template => template.Category)
                 .ThenBy(template => template.Name)
                 .ToListAsync(cancellationToken);
@@ -675,6 +678,24 @@ public static class AtlasEndpoints
             return Results.Ok(new { items = templates });
         });
 
+        group.MapGet("/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            CancellationToken cancellationToken) =>
+        {
+            var template = await dbContext.Templates
+                .AsNoTracking()
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(version => version!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(version => version.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+
+            return template is null
+                ? EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound)
+                : Results.Ok(ToTemplateResponse(template, EffectiveTemplateVersion(template)));
+        });
+
         group.MapPost("", async (
             CreateTemplateRequest request,
             AtlasDbContext dbContext,
@@ -688,25 +709,28 @@ public static class AtlasEndpoints
                 return problem!;
             }
 
-            if (string.IsNullOrWhiteSpace(request.Name) || string.IsNullOrWhiteSpace(request.Title))
-            {
-                return EndpointHelpers.Problem(
-                    "validation_failed",
-                    "Template name and title are required.",
-                    StatusCodes.Status422UnprocessableEntity);
-            }
-
             var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
             if (!feature.Allowed)
             {
                 return EndpointHelpers.EntitlementProblem(feature);
             }
 
+            if (ValidateTemplateDefinition(request.Name, request.Title, request.Requirements) is { } validation)
+            {
+                return validation;
+            }
+
+            var name = request.Name.Trim();
+            if (await TemplateNameExistsAsync(dbContext, organizationId, name, excludingTemplateId: null, cancellationToken))
+            {
+                return EndpointHelpers.Problem("duplicate_template_name", "A template with this name already exists.", StatusCodes.Status409Conflict);
+            }
+
             var now = clock.UtcNow;
             var template = new Template
             {
                 OrganizationId = organizationId,
-                Name = request.Name.Trim(),
+                Name = name,
                 Category = request.Category?.Trim(),
                 Description = request.Description,
                 Status = TemplateStatus.Draft,
@@ -738,6 +762,217 @@ public static class AtlasEndpoints
             return Results.Created($"/v1/templates/{template.Id}", ToTemplateResponse(template, version));
         });
 
+        group.MapPost("/{id:guid}/clone", async (
+            Guid id,
+            CloneTemplateRequest request,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
+            var source = await dbContext.Templates
+                .AsNoTracking()
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(version => version!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(version => version.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            var sourceVersion = source is null ? null : EffectiveTemplateVersion(source);
+            if (source is null || sourceVersion is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var additionalRequirements = request.AdditionalRequirements ?? Array.Empty<RequirementDefinitionRequest>();
+            if (ValidateRequirementDefinitions(additionalRequirements, requireAtLeastOne: false) is { } additionalValidation)
+            {
+                return additionalValidation;
+            }
+
+            var baseRequirements = sourceVersion.Requirements
+                .OrderBy(item => item.DisplayOrder)
+                .Select(CloneTemplateRequirement)
+                .ToList();
+            var nextOrder = baseRequirements.Count == 0 ? 1 : baseRequirements.Max(item => item.DisplayOrder) + 1;
+            foreach (var requirement in additionalRequirements.OrderBy(item => item.DisplayOrder))
+            {
+                var clone = ToTemplateRequirement(requirement);
+                clone.DisplayOrder = nextOrder++;
+                baseRequirements.Add(clone);
+            }
+
+            if (ValidateTemplateRequirements(baseRequirements) is { } combinedValidation)
+            {
+                return combinedValidation;
+            }
+
+            var requestedName = string.IsNullOrWhiteSpace(request.Name)
+                ? $"{source.Name} Copy"
+                : request.Name.Trim();
+            var name = await NextAvailableTemplateNameAsync(dbContext, organizationId, requestedName, cancellationToken);
+            var now = clock.UtcNow;
+            var template = new Template
+            {
+                OrganizationId = organizationId,
+                Name = name,
+                Category = string.IsNullOrWhiteSpace(request.Category) ? source.Category : request.Category.Trim(),
+                Description = request.Description ?? source.Description,
+                Status = request.PublishImmediately ? TemplateStatus.Published : TemplateStatus.Draft,
+                CreatedByUserId = request.CreatedByUserId,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+
+            var version = new TemplateVersion
+            {
+                Template = template,
+                VersionNumber = 1,
+                Title = string.IsNullOrWhiteSpace(request.Title) ? sourceVersion.Title : request.Title.Trim(),
+                Instructions = request.Instructions ?? sourceVersion.Instructions,
+                SettingsJson = request.Settings.HasValue ? EndpointHelpers.JsonOrDefault(request.Settings) : sourceVersion.SettingsJson,
+                PublishedAt = request.PublishImmediately ? now : null,
+                CreatedByUserId = request.CreatedByUserId,
+                CreatedAt = now
+            };
+
+            foreach (var requirement in baseRequirements)
+            {
+                version.Requirements.Add(requirement);
+            }
+
+            dbContext.Templates.Add(template);
+            dbContext.TemplateVersions.Add(version);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            if (request.PublishImmediately)
+            {
+                template.CurrentVersionId = version.Id;
+                await dbContext.SaveChangesAsync(cancellationToken);
+            }
+
+            return Results.Created($"/v1/templates/{template.Id}", ToTemplateResponse(template, version));
+        });
+
+        group.MapPut("/{id:guid}", async (
+            Guid id,
+            UpdateTemplateRequest request,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
+            var template = await dbContext.Templates
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(version => version!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(version => version.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (template.OrganizationId != organizationId)
+            {
+                return EndpointHelpers.Problem("global_template_not_editable", "Clone this library template before customizing it for your organization.", StatusCodes.Status403Forbidden);
+            }
+
+            var latestVersion = EffectiveTemplateVersion(template);
+            var nextName = string.IsNullOrWhiteSpace(request.Name) ? template.Name : request.Name.Trim();
+            var nextTitle = string.IsNullOrWhiteSpace(request.Title) ? latestVersion?.Title : request.Title.Trim();
+            IReadOnlyList<RequirementDefinitionRequest> nextRequirements = request.Requirements
+                ?? (latestVersion?.Requirements
+                    .OrderBy(item => item.DisplayOrder)
+                    .Select(ToRequirementDefinition)
+                    .ToList() as IReadOnlyList<RequirementDefinitionRequest>)
+                ?? Array.Empty<RequirementDefinitionRequest>();
+
+            if (ValidateTemplateDefinition(nextName, nextTitle, nextRequirements) is { } validation)
+            {
+                return validation;
+            }
+
+            if (await TemplateNameExistsAsync(dbContext, organizationId, nextName, excludingTemplateId: template.Id, cancellationToken))
+            {
+                return EndpointHelpers.Problem("duplicate_template_name", "A template with this name already exists.", StatusCodes.Status409Conflict);
+            }
+            if (request.Status == TemplateStatus.Published)
+            {
+                return EndpointHelpers.Problem("use_publish_endpoint", "Use the publish endpoint to publish template changes.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            template.Name = nextName;
+            if (request.Category is not null)
+            {
+                template.Category = string.IsNullOrWhiteSpace(request.Category) ? null : request.Category.Trim();
+            }
+            if (request.Description is not null)
+            {
+                template.Description = request.Description;
+            }
+            if (request.Status.HasValue)
+            {
+                template.Status = request.Status.Value;
+            }
+            template.UpdatedAt = clock.UtcNow;
+
+            var contentChanged = request.Title is not null
+                || request.Instructions is not null
+                || request.Settings.HasValue
+                || request.Requirements is not null;
+            var responseVersion = latestVersion;
+            if (contentChanged)
+            {
+                responseVersion = new TemplateVersion
+                {
+                    Template = template,
+                    VersionNumber = template.Versions.Count == 0 ? 1 : template.Versions.Max(item => item.VersionNumber) + 1,
+                    Title = nextTitle!,
+                    Instructions = request.Instructions ?? latestVersion?.Instructions,
+                    SettingsJson = request.Settings.HasValue
+                        ? EndpointHelpers.JsonOrDefault(request.Settings)
+                        : latestVersion?.SettingsJson ?? "{}",
+                    CreatedByUserId = request.UpdatedByUserId,
+                    CreatedAt = clock.UtcNow
+                };
+
+                foreach (var requirement in nextRequirements.OrderBy(item => item.DisplayOrder))
+                {
+                    responseVersion.Requirements.Add(ToTemplateRequirement(requirement));
+                }
+
+                dbContext.TemplateVersions.Add(responseVersion);
+                template.Status = TemplateStatus.Draft;
+            }
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToTemplateResponse(template, responseVersion));
+        });
+
         group.MapPost("/{id:guid}/publish", async (
             Guid id,
             AtlasDbContext dbContext,
@@ -759,11 +994,16 @@ public static class AtlasEndpoints
 
             var template = await dbContext.Templates
                 .Include(item => item.Versions)
+                .ThenInclude(version => version.Requirements)
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
 
             if (template is null)
             {
                 return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+            if (template.OrganizationId != organizationId)
+            {
+                return EndpointHelpers.Problem("global_template_not_editable", "Clone this library template before publishing a customized version.", StatusCodes.Status403Forbidden);
             }
 
             var version = template.Versions.OrderByDescending(item => item.VersionNumber).FirstOrDefault();
@@ -775,9 +1015,86 @@ public static class AtlasEndpoints
             version.PublishedAt ??= clock.UtcNow;
             template.CurrentVersionId = version.Id;
             template.Status = TemplateStatus.Published;
+            template.UpdatedAt = clock.UtcNow;
 
             await dbContext.SaveChangesAsync(cancellationToken);
             return Results.Ok(ToTemplateResponse(template, version));
+        });
+
+        group.MapPost("/{id:guid}/archive", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
+            var template = await dbContext.Templates
+                .Include(item => item.CurrentVersion)
+                .ThenInclude(version => version!.Requirements)
+                .Include(item => item.Versions)
+                .ThenInclude(version => version.Requirements)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+            if (template.OrganizationId != organizationId)
+            {
+                return EndpointHelpers.Problem("global_template_not_editable", "Only organization-owned custom templates can be archived here.", StatusCodes.Status403Forbidden);
+            }
+
+            template.Status = TemplateStatus.Archived;
+            template.UpdatedAt = clock.UtcNow;
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToTemplateResponse(template, EffectiveTemplateVersion(template)));
+        });
+
+        group.MapDelete("/{id:guid}", async (
+            Guid id,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var feature = await entitlements.HasFeatureAsync(organizationId, clock.UtcNow, "custom_workflows", cancellationToken);
+            if (!feature.Allowed)
+            {
+                return EndpointHelpers.EntitlementProblem(feature);
+            }
+
+            var template = await dbContext.Templates.FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (template is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Template was not found.", StatusCodes.Status404NotFound);
+            }
+            if (template.OrganizationId != organizationId)
+            {
+                return EndpointHelpers.Problem("global_template_not_editable", "Only organization-owned custom templates can be deleted here.", StatusCodes.Status403Forbidden);
+            }
+
+            template.Status = TemplateStatus.Archived;
+            template.DeletedAt = clock.UtcNow;
+            template.UpdatedAt = clock.UtcNow;
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.NoContent();
         });
     }
 
@@ -932,6 +1249,41 @@ public static class AtlasEndpoints
                 return EndpointHelpers.Problem("not_found", "Organization was not found.", StatusCodes.Status404NotFound);
             }
 
+            var requestRequirements = request.Requirements ?? Array.Empty<RequirementDefinitionRequest>();
+            if (!request.TemplateId.HasValue && requestRequirements.Count == 0)
+            {
+                return EndpointHelpers.Problem("validation_failed", "Custom checklist actions require at least one requirement.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (ValidateRequirementDefinitions(requestRequirements, requireAtLeastOne: false) is { } requirementValidation)
+            {
+                return requirementValidation;
+            }
+
+            TemplateVersion? selectedTemplateVersion = null;
+            if (request.TemplateId.HasValue)
+            {
+                var selectedTemplate = await dbContext.Templates
+                    .AsNoTracking()
+                    .Include(item => item.CurrentVersion)
+                    .ThenInclude(version => version!.Requirements)
+                    .FirstOrDefaultAsync(item => item.Id == request.TemplateId.Value, cancellationToken);
+                if (selectedTemplate is null)
+                {
+                    return EndpointHelpers.Problem("template_not_found", "Selected template was not found.", StatusCodes.Status422UnprocessableEntity);
+                }
+                if (selectedTemplate.Status != TemplateStatus.Published || selectedTemplate.CurrentVersion is null)
+                {
+                    return EndpointHelpers.Problem("template_not_published", "Selected template must be published before it can be used to create a checklist.", StatusCodes.Status422UnprocessableEntity);
+                }
+
+                selectedTemplateVersion = selectedTemplate.CurrentVersion;
+                if (ValidateAdditionalRequirementKeys(selectedTemplateVersion.Requirements, requestRequirements) is { } duplicateRequirement)
+                {
+                    return duplicateRequirement;
+                }
+            }
+
             if (request.SendImmediately)
             {
                 if (await SecurityEndpoints.RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
@@ -1054,7 +1406,7 @@ public static class AtlasEndpoints
             };
 
             action.Recipients.Add(recipient);
-            await AddRequirementSnapshotsAsync(action, request, dbContext, cancellationToken);
+            AddRequirementSnapshots(action, requestRequirements, selectedTemplateVersion);
 
             dbContext.Actions.Add(action);
             SecurityEndpoints.AddAudit(dbContext, organizationId, action.Id, tenantContext, "action.created", new { action.Id, action.Title }, httpContext);
@@ -1662,9 +2014,39 @@ public static class AtlasEndpoints
         };
     }
 
+    private static TemplateRequirement CloneTemplateRequirement(TemplateRequirement requirement)
+    {
+        return new TemplateRequirement
+        {
+            Key = requirement.Key,
+            Type = requirement.Type,
+            Label = requirement.Label,
+            Description = requirement.Description,
+            IsRequired = requirement.IsRequired,
+            DisplayOrder = requirement.DisplayOrder,
+            ConfigurationJson = requirement.ConfigurationJson,
+            ValidationJson = requirement.ValidationJson,
+            ConditionJson = requirement.ConditionJson
+        };
+    }
+
+    private static RequirementDefinitionRequest ToRequirementDefinition(TemplateRequirement requirement)
+    {
+        return new RequirementDefinitionRequest(
+            requirement.Key,
+            requirement.Type,
+            requirement.Label,
+            requirement.Description,
+            requirement.IsRequired,
+            requirement.DisplayOrder,
+            ParseJsonOrEmpty(requirement.ConfigurationJson),
+            ParseJsonOrEmpty(requirement.ValidationJson),
+            string.IsNullOrWhiteSpace(requirement.ConditionJson) ? null : ParseJsonOrEmpty(requirement.ConditionJson));
+    }
+
     private static TemplateResponse ToTemplateResponse(Template template, TemplateVersion? version = null)
     {
-        var effectiveVersion = version ?? template.CurrentVersion;
+        var effectiveVersion = version ?? EffectiveTemplateVersion(template);
         var settings = ParseJsonOrEmpty(effectiveVersion?.SettingsJson);
         return new TemplateResponse(
             template.Id,
@@ -1673,6 +2055,8 @@ public static class AtlasEndpoints
             template.Description,
             template.Status,
             template.CurrentVersionId,
+            template.OrganizationId is null,
+            template.OrganizationId is not null,
             effectiveVersion?.Title,
             effectiveVersion?.Instructions,
             settings,
@@ -1684,8 +2068,161 @@ public static class AtlasEndpoints
             ReadJsonString(settings, "region"),
             ReadJsonStringArray(settings, "tags"),
             ReadJsonStringArray(settings, "searchTerms"),
+            effectiveVersion?.Requirements
+                .OrderBy(item => item.DisplayOrder)
+                .Select(ToTemplateRequirementResponse)
+                .ToList() ?? [],
             template.CreatedAt,
             template.UpdatedAt);
+    }
+
+    private static TemplateVersion? EffectiveTemplateVersion(Template template)
+    {
+        return template.CurrentVersion
+            ?? template.Versions.OrderByDescending(item => item.VersionNumber).FirstOrDefault();
+    }
+
+    private static TemplateRequirementResponse ToTemplateRequirementResponse(TemplateRequirement requirement)
+    {
+        return new TemplateRequirementResponse(
+            requirement.Id,
+            requirement.Key,
+            requirement.Type,
+            requirement.Label,
+            requirement.Description,
+            requirement.IsRequired,
+            requirement.DisplayOrder,
+            ParseJsonOrEmpty(requirement.ConfigurationJson),
+            ParseJsonOrEmpty(requirement.ValidationJson),
+            string.IsNullOrWhiteSpace(requirement.ConditionJson) ? null : ParseJsonOrEmpty(requirement.ConditionJson));
+    }
+
+    private static IResult? ValidateTemplateDefinition(
+        string? name,
+        string? title,
+        IReadOnlyList<RequirementDefinitionRequest>? requirements)
+    {
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(title))
+        {
+            return EndpointHelpers.Problem(
+                "validation_failed",
+                "Template name and title are required.",
+                StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (name.Trim().Length > 200 || title.Trim().Length > 200)
+        {
+            return EndpointHelpers.Problem(
+                "validation_failed",
+                "Template name and title must be 200 characters or fewer.",
+                StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return ValidateRequirementDefinitions(requirements, requireAtLeastOne: true);
+    }
+
+    private static IResult? ValidateRequirementDefinitions(
+        IReadOnlyList<RequirementDefinitionRequest>? requirements,
+        bool requireAtLeastOne)
+    {
+        if (requirements is null || requirements.Count == 0)
+        {
+            return requireAtLeastOne
+                ? EndpointHelpers.Problem("validation_failed", "At least one requirement is required.", StatusCodes.Status422UnprocessableEntity)
+                : null;
+        }
+
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var requirement in requirements)
+        {
+            if (string.IsNullOrWhiteSpace(requirement.Key) || string.IsNullOrWhiteSpace(requirement.Label))
+            {
+                return EndpointHelpers.Problem("validation_failed", "Requirement key and label are required.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var key = requirement.Key.Trim();
+            if (key.Length > 100 || requirement.Label.Trim().Length > 300)
+            {
+                return EndpointHelpers.Problem("validation_failed", "Requirement key must be 100 characters or fewer and label must be 300 characters or fewer.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            if (!keys.Add(key))
+            {
+                return EndpointHelpers.Problem("duplicate_requirement_key", $"Requirement key '{key}' is duplicated.", StatusCodes.Status422UnprocessableEntity);
+            }
+        }
+
+        return null;
+    }
+
+    private static IResult? ValidateTemplateRequirements(IReadOnlyList<TemplateRequirement> requirements)
+    {
+        return ValidateRequirementDefinitions(
+            requirements
+                .Select(ToRequirementDefinition)
+                .ToList(),
+            requireAtLeastOne: true);
+    }
+
+    private static IResult? ValidateAdditionalRequirementKeys(
+        IEnumerable<TemplateRequirement> templateRequirements,
+        IReadOnlyList<RequirementDefinitionRequest> additionalRequirements)
+    {
+        if (additionalRequirements.Count == 0)
+        {
+            return null;
+        }
+
+        var existing = templateRequirements
+            .Select(item => item.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var duplicate = additionalRequirements
+            .Select(item => item.Key?.Trim())
+            .FirstOrDefault(key => !string.IsNullOrWhiteSpace(key) && existing.Contains(key));
+        return duplicate is null
+            ? null
+            : EndpointHelpers.Problem("duplicate_requirement_key", $"Additional requirement key '{duplicate}' already exists in the selected template.", StatusCodes.Status422UnprocessableEntity);
+    }
+
+    private static async Task<bool> TemplateNameExistsAsync(
+        AtlasDbContext dbContext,
+        Guid organizationId,
+        string name,
+        Guid? excludingTemplateId,
+        CancellationToken cancellationToken)
+    {
+        return await dbContext.Templates
+            .AnyAsync(item => item.OrganizationId == organizationId
+                && item.Id != excludingTemplateId
+                && item.Name == name,
+                cancellationToken);
+    }
+
+    private static async Task<string> NextAvailableTemplateNameAsync(
+        AtlasDbContext dbContext,
+        Guid organizationId,
+        string requestedName,
+        CancellationToken cancellationToken)
+    {
+        var baseName = string.IsNullOrWhiteSpace(requestedName) ? "Custom Template" : requestedName.Trim();
+        if (baseName.Length > 190)
+        {
+            baseName = baseName[..190].TrimEnd();
+        }
+
+        var name = baseName;
+        var suffix = 2;
+        while (await TemplateNameExistsAsync(dbContext, organizationId, name, excludingTemplateId: null, cancellationToken))
+        {
+            var suffixText = $" {suffix}";
+            var prefix = baseName.Length + suffixText.Length <= 200
+                ? baseName
+                : baseName[..(200 - suffixText.Length)].TrimEnd();
+            name = $"{prefix}{suffixText}";
+            suffix++;
+        }
+
+        return name;
     }
 
     private static IReadOnlyList<string> SplitSearchTerms(string? query)
@@ -1969,43 +2506,34 @@ public static class AtlasEndpoints
         }
     }
 
-    private static async Task AddRequirementSnapshotsAsync(
+    private static void AddRequirementSnapshots(
         ChecklistAction action,
-        CreateActionRequest request,
-        AtlasDbContext dbContext,
-        CancellationToken cancellationToken)
+        IReadOnlyList<RequirementDefinitionRequest> requestRequirements,
+        TemplateVersion? selectedTemplateVersion)
     {
-        if (request.TemplateId.HasValue)
+        var nextDisplayOrder = 1;
+        if (selectedTemplateVersion is not null)
         {
-            var template = await dbContext.Templates
-                .Include(item => item.CurrentVersion)
-                .ThenInclude(version => version!.Requirements)
-                .FirstOrDefaultAsync(item => item.Id == request.TemplateId.Value, cancellationToken);
-
-            if (template?.CurrentVersion is not null)
+            action.TemplateVersionId = selectedTemplateVersion.Id;
+            foreach (var requirement in selectedTemplateVersion.Requirements.OrderBy(item => item.DisplayOrder))
             {
-                action.TemplateVersionId = template.CurrentVersion.Id;
-                foreach (var requirement in template.CurrentVersion.Requirements.OrderBy(item => item.DisplayOrder))
+                action.Requirements.Add(new Requirement
                 {
-                    action.Requirements.Add(new Requirement
-                    {
-                        SourceTemplateRequirementId = requirement.Id,
-                        Key = requirement.Key,
-                        Type = requirement.Type,
-                        Label = requirement.Label,
-                        Description = requirement.Description,
-                        IsRequired = requirement.IsRequired,
-                        DisplayOrder = requirement.DisplayOrder,
-                        ConfigurationJson = requirement.ConfigurationJson,
-                        ValidationJson = requirement.ValidationJson,
-                        ConditionJson = requirement.ConditionJson
-                    });
-                }
-                return;
+                    SourceTemplateRequirementId = requirement.Id,
+                    Key = requirement.Key,
+                    Type = requirement.Type,
+                    Label = requirement.Label,
+                    Description = requirement.Description,
+                    IsRequired = requirement.IsRequired,
+                    DisplayOrder = nextDisplayOrder++,
+                    ConfigurationJson = requirement.ConfigurationJson,
+                    ValidationJson = requirement.ValidationJson,
+                    ConditionJson = requirement.ConditionJson
+                });
             }
         }
 
-        foreach (var requirement in request.Requirements.OrderBy(item => item.DisplayOrder))
+        foreach (var requirement in requestRequirements.OrderBy(item => item.DisplayOrder))
         {
             action.Requirements.Add(new Requirement
             {
@@ -2014,7 +2542,7 @@ public static class AtlasEndpoints
                 Label = requirement.Label.Trim(),
                 Description = requirement.Description,
                 IsRequired = requirement.Required,
-                DisplayOrder = requirement.DisplayOrder,
+                DisplayOrder = selectedTemplateVersion is null ? requirement.DisplayOrder : nextDisplayOrder++,
                 ConfigurationJson = EndpointHelpers.JsonOrDefault(requirement.Configuration),
                 ValidationJson = EndpointHelpers.JsonOrDefault(requirement.Validation),
                 ConditionJson = requirement.Condition is null ? null : requirement.Condition.Value.GetRawText()
@@ -2538,6 +3066,28 @@ public sealed record CreateTemplateRequest(
     Guid? CreatedByUserId,
     IReadOnlyList<RequirementDefinitionRequest> Requirements);
 
+public sealed record CloneTemplateRequest(
+    string? Name,
+    string? Category,
+    string? Description,
+    string? Title,
+    string? Instructions,
+    JsonElement? Settings,
+    Guid? CreatedByUserId,
+    IReadOnlyList<RequirementDefinitionRequest>? AdditionalRequirements,
+    bool PublishImmediately);
+
+public sealed record UpdateTemplateRequest(
+    string? Name,
+    string? Category,
+    string? Description,
+    string? Title,
+    string? Instructions,
+    JsonElement? Settings,
+    Guid? UpdatedByUserId,
+    TemplateStatus? Status,
+    IReadOnlyList<RequirementDefinitionRequest>? Requirements);
+
 public sealed record RequirementDefinitionRequest(
     string Key,
     RequirementType Type,
@@ -2556,6 +3106,8 @@ public sealed record TemplateResponse(
     string? Description,
     TemplateStatus Status,
     Guid? CurrentVersionId,
+    bool IsGlobal,
+    bool IsEditable,
     string? Title,
     string? Instructions,
     JsonElement Settings,
@@ -2567,8 +3119,21 @@ public sealed record TemplateResponse(
     string? Region,
     IReadOnlyList<string> Tags,
     IReadOnlyList<string> SearchTerms,
+    IReadOnlyList<TemplateRequirementResponse> Requirements,
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
+
+public sealed record TemplateRequirementResponse(
+    Guid Id,
+    string Key,
+    RequirementType Type,
+    string Label,
+    string? Description,
+    bool Required,
+    int DisplayOrder,
+    JsonElement Configuration,
+    JsonElement Validation,
+    JsonElement? Condition);
 
 internal sealed record TemplateSearchRow(Template Template, TemplateResponse Response, string SearchText);
 
