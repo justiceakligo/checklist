@@ -1147,6 +1147,15 @@ Then call the API:
 
 Validates token, creates recipient cookie, sends OTP if required.
 
+Because this is a cross-origin API call from `https://reqara.com` to `https://api.reqara.com`, call it with credentials enabled. The cookie is HttpOnly and intentionally not readable by JavaScript.
+
+```ts
+await fetch(`${apiBaseUrl}/c/${token}`, {
+  method: "GET",
+  credentials: "include"
+});
+```
+
 ```json
 {
   "otpRequired": true,
@@ -1160,6 +1169,17 @@ Validates token, creates recipient cookie, sends OTP if required.
 If `otpRequired` is `true` and `otpVerified` is `false`, show the OTP screen immediately. The code has already been emailed.
 
 ### POST `/v1/recipient/access/verify`
+
+Must also include credentials so the backend receives the recipient session cookie created by `/c/{token}`. The code alone is not enough.
+
+```ts
+await fetch(`${apiBaseUrl}/v1/recipient/access/verify`, {
+  method: "POST",
+  credentials: "include",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ code })
+});
+```
 
 ```json
 {
@@ -1193,6 +1213,8 @@ OTP errors:
 ### GET `/v1/recipient/checklist`
 
 Returns organization branding, checklist metadata, requirements, and draft responses.
+
+All `/v1/recipient/*` calls need `credentials: "include"`. If the user is also signed into the dashboard in the same browser, the backend now prefers the recipient session cookie for recipient endpoints.
 
 File requirements can include a `previouslySubmitted` object when the same recipient email has an accepted, clean prior submission for the same organization and opted-in requirement. See [PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md](PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md) for the full UI flow.
 

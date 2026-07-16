@@ -23,6 +23,13 @@ public static class TenantContextMiddleware
             var clock = context.RequestServices.GetRequiredService<IAtlasClock>();
             accessor.ClearTenant();
 
+            var isRecipientEndpoint = context.Request.Path.StartsWithSegments("/v1/recipient", StringComparison.OrdinalIgnoreCase);
+            if (isRecipientEndpoint
+                && await TrySetRecipientTenantAsync(context, accessor, dbContext, secretHasher, clock, next))
+            {
+                return;
+            }
+
             if (await TrySetApiTenantAsync(context, accessor, dbContext, secretHasher, clock, next))
             {
                 return;
@@ -33,7 +40,8 @@ public static class TenantContextMiddleware
                 return;
             }
 
-            if (await TrySetRecipientTenantAsync(context, accessor, dbContext, secretHasher, clock, next))
+            if (!isRecipientEndpoint
+                && await TrySetRecipientTenantAsync(context, accessor, dbContext, secretHasher, clock, next))
             {
                 return;
             }

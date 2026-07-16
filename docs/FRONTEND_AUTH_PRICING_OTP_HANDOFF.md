@@ -419,6 +419,15 @@ Then call:
 
 If OTP is required, the backend sends the OTP email during this call.
 
+Use `credentials: "include"` so the browser stores the HttpOnly recipient session cookie from `api.reqara.com`.
+
+```ts
+await fetch(`${apiBaseUrl}/c/${token}`, {
+  method: "GET",
+  credentials: "include"
+});
+```
+
 `200`:
 
 ```json
@@ -434,6 +443,17 @@ If OTP is required, the backend sends the OTP email during this call.
 If `otpRequired` is `true` and `otpVerified` is `false`, show the OTP screen and do not request checklist details yet.
 
 ### POST `/v1/recipient/access/verify`
+
+Use `credentials: "include"` here too. The backend verifies the code against the recipient session created by `/c/{token}`; sending only `{ code }` without the cookie returns `401 recipient_session_required`.
+
+```ts
+await fetch(`${apiBaseUrl}/v1/recipient/access/verify`, {
+  method: "POST",
+  credentials: "include",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ code })
+});
+```
 
 ```json
 {
