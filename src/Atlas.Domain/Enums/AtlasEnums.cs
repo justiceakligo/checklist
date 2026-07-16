@@ -180,3 +180,9 @@ public enum DeveloperAccessStatus : short
     ProductionApproved = 3,
     ProductionRejected = 4
 }
+
+public enum UserAuthTokenPurpose : short
+{
+    EmailVerification = 1,
+    PasswordReset = 2
+}

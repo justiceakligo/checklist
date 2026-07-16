@@ -45,6 +45,7 @@ public static class AtlasEndpoints
             IAdminSettingService settings,
             IEmailService emailService,
             IConfiguration configuration,
+            ISecretHasher secretHasher,
             IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
@@ -127,53 +128,27 @@ public static class AtlasEndpoints
             dbContext.AddRange(user, organization, membership);
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            var welcomeEmail = TransactionalEmailTemplates.AccountCreated(
-                FirstName(user.FullName),
+            var verificationResult = await SecurityEndpoints.SendEmailVerificationAsync(
+                user,
+                organization.Id,
                 organization.Name,
-                await EndpointHelpers.BuildAppBaseUrlAsync(settings, configuration, organization.Id, httpContext, cancellationToken));
-            var welcomeResult = await emailService.SendAsync(
-                user.Email,
-                welcomeEmail.Subject,
-                welcomeEmail.TextBody,
-                welcomeEmail.HtmlBody,
-                "requests@reqara.com",
-                cancellationToken: cancellationToken,
-                headers: new Dictionary<string, string>
-                {
-                    ["X-Atlas-Email-Type"] = "account-created",
-                    ["X-Atlas-Organization-Id"] = organization.Id.ToString(),
-                    ["X-Atlas-User-Id"] = user.Id.ToString()
-                });
-            dbContext.NotificationDeliveries.Add(new NotificationDelivery
-            {
-                OrganizationId = organization.Id,
-                Channel = DeliveryChannel.Email,
-                TemplateKey = "account_created",
-                ProviderMessageId = welcomeResult.MessageId,
-                Status = welcomeResult.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
-                ErrorCode = Truncate(welcomeResult.Error, 100),
-                SentAt = welcomeResult.Sent ? clock.UtcNow : null,
-                DeliveredAt = welcomeResult.Sent ? clock.UtcNow : null,
-                CreatedAt = clock.UtcNow
-            });
-            dbContext.AuditEvents.Add(new AuditEvent
-            {
-                OrganizationId = organization.Id,
-                ActorType = ActorType.User,
-                ActorId = user.Id.ToString(),
-                EventType = welcomeResult.Sent ? "auth.signup_email_sent" : "auth.signup_email_failed",
-                EventData = JsonSerializer.Serialize(new { user.Id, user.Email, welcomeResult.MessageId, welcomeResult.Error }, EndpointHelpers.JsonOptions),
-                IpAddress = httpContext.Connection.RemoteIpAddress,
-                UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
-            });
-            await dbContext.SaveChangesAsync(cancellationToken);
+                dbContext,
+                settings,
+                emailService,
+                configuration,
+                secretHasher,
+                clock,
+                httpContext,
+                cancellationToken);
             await SecurityEndpoints.SignInDashboardUserAsync(httpContext, user);
 
             return Results.Created($"/v1/organizations/{organization.Id}", new SignupResponse(
                 user.Id,
                 organization.Id,
                 organization.Slug,
-                membership.Role));
+                membership.Role,
+                user.EmailVerifiedAt.HasValue,
+                verificationResult.Sent));
         });
 
         group.MapGet("/organizations/{id:guid}", async (
@@ -959,6 +934,11 @@ public static class AtlasEndpoints
 
             if (request.SendImmediately)
             {
+                if (await SecurityEndpoints.RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+                {
+                    return verificationProblem;
+                }
+
                 var limit = await entitlements.CanSendChecklistAsync(organizationId, clock.UtcNow, 1, cancellationToken);
                 if (!limit.Allowed)
                 {
@@ -1060,13 +1040,14 @@ public static class AtlasEndpoints
                 UpdatedAt = now
             };
 
+            var otpRequired = await ResolveRecipientOtpRequiredAsync(request, dbContext, settings, organizationId, cancellationToken);
             var recipient = new ActionRecipient
             {
                 Action = action,
                 Name = request.Recipient.Name.Trim(),
                 Email = recipientEmail,
                 Phone = request.Recipient.Phone,
-                OtpRequired = request.Recipient.OtpRequired,
+                OtpRequired = otpRequired,
                 AccessTokenHash = secretHasher.HashSecret(rawToken),
                 TokenExpiresAt = action.ExpiresAt,
                 CreatedAt = now
@@ -1168,6 +1149,11 @@ public static class AtlasEndpoints
             if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
             {
                 return sandboxProblem;
+            }
+
+            if (await SecurityEndpoints.RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
             }
 
             var action = await dbContext.Actions
@@ -1320,6 +1306,11 @@ public static class AtlasEndpoints
             if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
             {
                 return sandboxProblem;
+            }
+
+            if (await SecurityEndpoints.RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
             }
 
             var action = await dbContext.Actions
@@ -1888,6 +1879,96 @@ public static class AtlasEndpoints
         return retentionDays > 0 ? retentionDays : 365;
     }
 
+    private static async Task<bool> ResolveRecipientOtpRequiredAsync(
+        CreateActionRequest request,
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        Guid organizationId,
+        CancellationToken cancellationToken)
+    {
+        if (request.Recipient.OtpRequired.HasValue)
+        {
+            return request.Recipient.OtpRequired.Value;
+        }
+
+        if (TryReadRecipientOtpRequired(request.Settings, out var actionOtpRequired))
+        {
+            return actionOtpRequired;
+        }
+
+        if (request.TemplateId.HasValue)
+        {
+            var templateSettingsJson = await dbContext.Templates
+                .Where(item => item.Id == request.TemplateId.Value && item.CurrentVersion != null)
+                .Select(item => item.CurrentVersion!.SettingsJson)
+                .FirstOrDefaultAsync(cancellationToken);
+            if (TryReadRecipientOtpRequired(ParseJsonOrEmpty(templateSettingsJson), out var templateOtpRequired))
+            {
+                return templateOtpRequired;
+            }
+        }
+
+        return EndpointHelpers.ReadBoolSetting(
+            (await settings.GetAsync(organizationId, "recipientOtp", "defaultRequired", cancellationToken))?.ValueJson,
+            false);
+    }
+
+    private static bool TryReadRecipientOtpRequired(JsonElement? settings, out bool required)
+    {
+        required = false;
+        return settings.HasValue && TryReadRecipientOtpRequired(settings.Value, out required);
+    }
+
+    private static bool TryReadRecipientOtpRequired(JsonElement settings, out bool required)
+    {
+        required = false;
+        if (settings.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (TryReadJsonBool(settings, "otpRequired", out required)
+            || TryReadJsonBool(settings, "recipientOtpRequired", out required)
+            || TryReadJsonBool(settings, "requireRecipientOtp", out required))
+        {
+            return true;
+        }
+
+        if (settings.TryGetProperty("recipientOtp", out var recipientOtp)
+            && recipientOtp.ValueKind == JsonValueKind.Object
+            && (TryReadJsonBool(recipientOtp, "required", out required)
+                || TryReadJsonBool(recipientOtp, "defaultRequired", out required)))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryReadJsonBool(JsonElement json, string propertyName, out bool value)
+    {
+        value = false;
+        if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        switch (property.ValueKind)
+        {
+            case JsonValueKind.True:
+                value = true;
+                return true;
+            case JsonValueKind.False:
+                value = false;
+                return true;
+            case JsonValueKind.String when bool.TryParse(property.GetString(), out var parsed):
+                value = parsed;
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private static async Task AddRequirementSnapshotsAsync(
         ChecklistAction action,
         CreateActionRequest request,
@@ -2344,7 +2425,9 @@ public sealed record SignupResponse(
     Guid UserId,
     Guid OrganizationId,
     string OrganizationSlug,
-    OrganizationUserRole Role);
+    OrganizationUserRole Role,
+    bool EmailVerified,
+    bool EmailVerificationSent);
 
 public sealed record OrganizationResponse(
     Guid Id,
@@ -2507,7 +2590,7 @@ public sealed record RecipientRequest(
     string Name,
     string Email,
     string? Phone,
-    bool OtpRequired);
+    bool? OtpRequired);
 
 public sealed record ActionResponse(
     Guid Id,

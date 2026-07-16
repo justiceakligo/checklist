@@ -42,6 +42,76 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail("Welcome to Reqara", text, html);
     }
 
+    public static TransactionalEmail EmailVerification(
+        string recipientFirstName,
+        string organizationName,
+        string verificationLink,
+        int expiresInMinutes)
+    {
+        var safeFirstName = CleanName(recipientFirstName, "there");
+        var safeOrganization = CleanName(organizationName, "your organization");
+        var url = verificationLink.Trim();
+        var expiresText = FormatDuration(expiresInMinutes);
+
+        var text =
+            $"Hi {safeFirstName},\n\n" +
+            $"Verify your email address to finish setting up Reqara for {safeOrganization}.\n\n" +
+            "Verify your email:\n" +
+            $"{url}\n\n" +
+            $"This link expires in {expiresText}.\n\n" +
+            "You can sign in before verifying, but sending live checklist requests and creating API keys requires a verified email.\n\n" +
+            "If you did not create this account, you can safely ignore this email.";
+
+        var html = BuildLayout(
+            "Verify your email",
+            $"Hi {Html(safeFirstName)},",
+            $"Verify your email address to finish setting up Reqara for <strong>{Html(safeOrganization)}</strong>.",
+            "Verify email",
+            url,
+            new[]
+            {
+                $"This link expires in {Html(expiresText)}.",
+                "You can sign in before verifying.",
+                "Sending live checklist requests and creating API keys requires a verified email.",
+                $"Fallback link: <a href=\"{HtmlAttribute(url)}\" style=\"color:#2563eb;word-break:break-all\">{Html(url)}</a>"
+            },
+            "If you did not create this account, you can safely ignore this email.");
+
+        return new TransactionalEmail("Verify your Reqara email", text, html);
+    }
+
+    public static TransactionalEmail PasswordReset(
+        string recipientFirstName,
+        string resetLink,
+        int expiresInMinutes)
+    {
+        var safeFirstName = CleanName(recipientFirstName, "there");
+        var url = resetLink.Trim();
+        var expiresText = FormatDuration(expiresInMinutes);
+
+        var text =
+            $"Hi {safeFirstName},\n\n" +
+            "We received a request to reset your Reqara password.\n\n" +
+            "Reset your password:\n" +
+            $"{url}\n\n" +
+            $"This link expires in {expiresText}. If you did not request this, you can safely ignore this email.";
+
+        var html = BuildLayout(
+            "Reset your password",
+            $"Hi {Html(safeFirstName)},",
+            "We received a request to reset your Reqara password.",
+            "Reset password",
+            url,
+            new[]
+            {
+                $"This link expires in {Html(expiresText)}.",
+                $"Fallback link: <a href=\"{HtmlAttribute(url)}\" style=\"color:#2563eb;word-break:break-all\">{Html(url)}</a>"
+            },
+            "If you did not request this, you can safely ignore this email.");
+
+        return new TransactionalEmail("Reset your Reqara password", text, html);
+    }
+
     public static TransactionalEmail RecipientOtp(
         string organizationName,
         string checklistTitle,
@@ -287,6 +357,13 @@ internal static class TransactionalEmailTemplates
     private static string HtmlAttribute(string value)
     {
         return WebUtility.HtmlEncode(value);
+    }
+
+    private static string FormatDuration(int minutes)
+    {
+        return minutes % 60 == 0 && minutes >= 60
+            ? $"{minutes / 60} hour{(minutes == 60 ? string.Empty : "s")}"
+            : $"{minutes} minute{(minutes == 1 ? string.Empty : "s")}";
     }
 }
 

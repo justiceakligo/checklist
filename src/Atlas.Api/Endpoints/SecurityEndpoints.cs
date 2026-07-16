@@ -1,7 +1,9 @@
 using System.Security.Claims;
 using System.Text.Json;
+using Atlas.Api.Email;
 using Atlas.Application.Abstractions;
 using Atlas.Application.Billing;
+using Atlas.Application.Email;
 using Atlas.Application.Settings;
 using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
@@ -70,9 +72,16 @@ public static class SecurityEndpoints
                 user.Id,
                 user.Email,
                 user.FullName,
+                user.EmailVerifiedAt,
+                user.EmailVerifiedAt.HasValue,
                 memberships.Select(ToOrganizationMembership).ToList(),
                 request.OrganizationId ?? memberships[0].OrganizationId));
         });
+
+        auth.MapPost("/email-verification/request", RequestEmailVerification);
+        auth.MapPost("/email-verification/confirm", ConfirmEmailVerification);
+        auth.MapPost("/password-reset/request", RequestPasswordReset);
+        auth.MapPost("/password-reset/confirm", ConfirmPasswordReset);
 
         auth.MapPost("/logout", async (HttpContext httpContext) =>
         {
@@ -109,6 +118,8 @@ public static class SecurityEndpoints
                 user.Id,
                 user.Email,
                 user.FullName,
+                user.EmailVerifiedAt,
+                user.EmailVerifiedAt.HasValue,
                 memberships.Select(ToOrganizationMembership).ToList(),
                 tenantContext.OrganizationId));
         }).WithTags("Auth & org");
@@ -182,6 +193,11 @@ public static class SecurityEndpoints
             if (!EndpointHelpers.HasScope(tenantContext, "developer:*"))
             {
                 return EndpointHelpers.Problem("forbidden", "Developer administration scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            if (await RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
             }
 
             var environment = request.Environment ?? ApiKeyEnvironment.Sandbox;
@@ -566,6 +582,11 @@ public static class SecurityEndpoints
                 return EndpointHelpers.Problem("forbidden", "Developer administration scope is required.", StatusCodes.Status403Forbidden);
             }
 
+            if (await RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
+            }
+
             var productionAllowed = await CanUseProductionDeveloperAccessAsync(dbContext, entitlements, organizationId, clock.UtcNow, cancellationToken);
             if (!productionAllowed.Allowed)
             {
@@ -652,6 +673,11 @@ public static class SecurityEndpoints
                 return EndpointHelpers.Problem("forbidden", "Developer administration scope is required.", StatusCodes.Status403Forbidden);
             }
 
+            if (await RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
+            }
+
             var productionAllowed = await CanUseProductionDeveloperAccessAsync(dbContext, entitlements, organizationId, clock.UtcNow, cancellationToken);
             if (!productionAllowed.Allowed)
             {
@@ -702,6 +728,11 @@ public static class SecurityEndpoints
             if (!EndpointHelpers.HasScope(tenantContext, "developer:*"))
             {
                 return EndpointHelpers.Problem("forbidden", "Developer administration scope is required.", StatusCodes.Status403Forbidden);
+            }
+
+            if (await RequireVerifiedDashboardEmailAsync(dbContext, tenantContext, cancellationToken) is { } verificationProblem)
+            {
+                return verificationProblem;
             }
 
             var productionAllowed = await CanUseProductionDeveloperAccessAsync(dbContext, entitlements, organizationId, clock.UtcNow, cancellationToken);
@@ -812,6 +843,454 @@ public static class SecurityEndpoints
 
         var principal = new ClaimsPrincipal(new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme));
         await httpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, principal);
+    }
+
+    public static async Task<IResult?> RequireVerifiedDashboardEmailAsync(
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(tenantContext.ActorType, "user", StringComparison.OrdinalIgnoreCase)
+            || tenantContext.UserId is null)
+        {
+            return null;
+        }
+
+        var verified = await dbContext.Users.IgnoreQueryFilters()
+            .AnyAsync(item => item.Id == tenantContext.UserId.Value && item.EmailVerifiedAt.HasValue, cancellationToken);
+        return verified
+            ? null
+            : EndpointHelpers.Problem(
+                "email_verification_required",
+                "Verify your email before sending live checklist requests or creating API keys.",
+                StatusCodes.Status403Forbidden);
+    }
+
+    public static async Task<EmailSendResult> SendEmailVerificationAsync(
+        AppUser user,
+        Guid organizationId,
+        string organizationName,
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var now = clock.UtcNow;
+        var expiresInMinutes = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(organizationId, "auth", "emailVerificationMinutes", cancellationToken))?.ValueJson,
+            1440);
+
+        var oldTokens = await dbContext.UserAuthTokens
+            .Where(item => item.UserId == user.Id
+                && item.Purpose == UserAuthTokenPurpose.EmailVerification
+                && item.ConsumedAt == null)
+            .ToListAsync(cancellationToken);
+        foreach (var oldToken in oldTokens)
+        {
+            oldToken.ConsumedAt = now;
+        }
+
+        var rawToken = EndpointHelpers.NewOpaqueToken();
+        var token = new UserAuthToken
+        {
+            UserId = user.Id,
+            Purpose = UserAuthTokenPurpose.EmailVerification,
+            TokenHash = secretHasher.HashSecret(rawToken),
+            Email = user.Email,
+            ExpiresAt = now.AddMinutes(expiresInMinutes),
+            CreatedIpAddress = httpContext.Connection.RemoteIpAddress,
+            CreatedAt = now
+        };
+        dbContext.UserAuthTokens.Add(token);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        var appBaseUrl = await EndpointHelpers.BuildAppBaseUrlAsync(settings, configuration, organizationId, httpContext, cancellationToken);
+        var link = $"{appBaseUrl.TrimEnd('/')}/verify-email/{rawToken}";
+        var email = TransactionalEmailTemplates.EmailVerification(
+            FirstName(user.FullName),
+            organizationName,
+            link,
+            expiresInMinutes);
+        var result = await emailService.SendAsync(
+            user.Email,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            "Reqara",
+            cancellationToken,
+            new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "email-verification",
+                ["X-Atlas-Organization-Id"] = organizationId.ToString(),
+                ["X-Atlas-User-Id"] = user.Id.ToString()
+            });
+
+        dbContext.NotificationDeliveries.Add(new NotificationDelivery
+        {
+            OrganizationId = organizationId,
+            Channel = DeliveryChannel.Email,
+            TemplateKey = "email_verification",
+            ProviderMessageId = result.MessageId,
+            Status = result.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+            ErrorCode = Truncate(result.Error, 100),
+            SentAt = result.Sent ? clock.UtcNow : null,
+            DeliveredAt = result.Sent ? clock.UtcNow : null,
+            CreatedAt = clock.UtcNow
+        });
+        dbContext.AuditEvents.Add(new AuditEvent
+        {
+            OrganizationId = organizationId,
+            ActorType = ActorType.User,
+            ActorId = user.Id.ToString(),
+            EventType = result.Sent ? "auth.email_verification_sent" : "auth.email_verification_failed",
+            EventData = JsonSerializer.Serialize(
+                new { user.Id, user.Email, tokenPrefix = EndpointHelpers.TokenLogPrefix(rawToken), result.MessageId, result.Error },
+                EndpointHelpers.JsonOptions),
+            IpAddress = httpContext.Connection.RemoteIpAddress,
+            UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+        });
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return result;
+    }
+
+    private static async Task<IResult> RequestEmailVerification(
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+        {
+            return problem!;
+        }
+
+        if (tenantContext.UserId is null)
+        {
+            return EndpointHelpers.Problem("authentication_required", "Dashboard authentication is required.", StatusCodes.Status401Unauthorized);
+        }
+
+        var user = await dbContext.Users.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(item => item.Id == tenantContext.UserId.Value, cancellationToken);
+        var organization = await dbContext.Organizations.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(item => item.Id == organizationId, cancellationToken);
+        if (user is null || organization is null)
+        {
+            return EndpointHelpers.Problem("authentication_required", "Dashboard authentication is required.", StatusCodes.Status401Unauthorized);
+        }
+
+        if (user.EmailVerifiedAt.HasValue)
+        {
+            return Results.Ok(new EmailVerificationRequestResponse(true, user.EmailVerifiedAt, false));
+        }
+
+        var result = await SendEmailVerificationAsync(
+            user,
+            organization.Id,
+            organization.Name,
+            dbContext,
+            settings,
+            emailService,
+            configuration,
+            secretHasher,
+            clock,
+            httpContext,
+            cancellationToken);
+        return result.Sent
+            ? Results.Ok(new EmailVerificationRequestResponse(false, null, true))
+            : EndpointHelpers.Problem("email_send_failed", "Verification email could not be sent.", StatusCodes.Status503ServiceUnavailable);
+    }
+
+    private static async Task<IResult> ConfirmEmailVerification(
+        ConfirmEmailVerificationRequest request,
+        AtlasDbContext dbContext,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Token))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Verification token is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var now = clock.UtcNow;
+        var tokenHash = secretHasher.HashSecret(request.Token.Trim());
+        var token = await dbContext.UserAuthTokens
+            .Include(item => item.User)
+            .FirstOrDefaultAsync(item => item.TokenHash == tokenHash
+                && item.Purpose == UserAuthTokenPurpose.EmailVerification,
+                cancellationToken);
+        if (token?.User is null)
+        {
+            return EndpointHelpers.Problem("invalid_token", "Verification token is invalid.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (token.ConsumedAt.HasValue)
+        {
+            return EndpointHelpers.Problem("token_consumed", "Verification token has already been used.", StatusCodes.Status409Conflict);
+        }
+
+        if (token.ExpiresAt <= now)
+        {
+            return EndpointHelpers.Problem("token_expired", "Verification token has expired.", StatusCodes.Status410Gone);
+        }
+
+        token.ConsumedAt = now;
+        token.ConsumedIpAddress = httpContext.Connection.RemoteIpAddress;
+        token.User.EmailVerifiedAt ??= now;
+
+        var otherTokens = await dbContext.UserAuthTokens
+            .Where(item => item.UserId == token.UserId
+                && item.Id != token.Id
+                && item.Purpose == UserAuthTokenPurpose.EmailVerification
+                && item.ConsumedAt == null)
+            .ToListAsync(cancellationToken);
+        foreach (var otherToken in otherTokens)
+        {
+            otherToken.ConsumedAt = now;
+        }
+
+        await AddUserAuditForActiveMembershipsAsync(
+            dbContext,
+            token.UserId,
+            ActorType.User,
+            token.UserId.ToString(),
+            "auth.email_verified",
+            new { token.UserId, token.Email },
+            httpContext,
+            cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Results.Ok(new ConfirmEmailVerificationResponse(true, token.User.EmailVerifiedAt));
+    }
+
+    private static async Task<IResult> RequestPasswordReset(
+        PasswordResetRequest request,
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Email))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Email is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var emailAddress = request.Email.Trim().ToLowerInvariant();
+        var user = await dbContext.Users.IgnoreQueryFilters()
+            .FirstOrDefaultAsync(item => item.Email == emailAddress, cancellationToken);
+        var membership = user is null
+            ? null
+            : await dbContext.OrganizationUsers.IgnoreQueryFilters()
+                .Include(item => item.Organization)
+                .Where(item => item.UserId == user.Id
+                    && item.Status == MembershipStatus.Active
+                    && item.Organization != null
+                    && item.Organization.DeletedAt == null)
+                .OrderBy(item => item.CreatedAt)
+                .FirstOrDefaultAsync(cancellationToken);
+
+        if (user?.PasswordHash is not null && membership?.Organization is not null)
+        {
+            await SendPasswordResetAsync(user, membership.Organization, dbContext, settings, emailService, configuration, secretHasher, clock, httpContext, cancellationToken);
+        }
+
+        return Results.Accepted(value: new PasswordResetRequestResponse(true));
+    }
+
+    private static async Task<IResult> ConfirmPasswordReset(
+        ConfirmPasswordResetRequest request,
+        AtlasDbContext dbContext,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Token) || string.IsNullOrWhiteSpace(request.NewPassword))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Token and new password are required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.NewPassword.Length < 12)
+        {
+            return EndpointHelpers.Problem("validation_failed", "New password must be at least 12 characters.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var now = clock.UtcNow;
+        var tokenHash = secretHasher.HashSecret(request.Token.Trim());
+        var token = await dbContext.UserAuthTokens
+            .Include(item => item.User)
+            .FirstOrDefaultAsync(item => item.TokenHash == tokenHash
+                && item.Purpose == UserAuthTokenPurpose.PasswordReset,
+                cancellationToken);
+        if (token?.User is null)
+        {
+            return EndpointHelpers.Problem("invalid_token", "Password reset token is invalid.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (token.ConsumedAt.HasValue)
+        {
+            return EndpointHelpers.Problem("token_consumed", "Password reset token has already been used.", StatusCodes.Status409Conflict);
+        }
+
+        if (token.ExpiresAt <= now)
+        {
+            return EndpointHelpers.Problem("token_expired", "Password reset token has expired.", StatusCodes.Status410Gone);
+        }
+
+        token.User.PasswordHash = new PasswordHasher<AppUser>().HashPassword(token.User, request.NewPassword);
+        token.ConsumedAt = now;
+        token.ConsumedIpAddress = httpContext.Connection.RemoteIpAddress;
+        var otherTokens = await dbContext.UserAuthTokens
+            .Where(item => item.UserId == token.UserId
+                && item.Id != token.Id
+                && item.Purpose == UserAuthTokenPurpose.PasswordReset
+                && item.ConsumedAt == null)
+            .ToListAsync(cancellationToken);
+        foreach (var otherToken in otherTokens)
+        {
+            otherToken.ConsumedAt = now;
+        }
+
+        await AddUserAuditForActiveMembershipsAsync(
+            dbContext,
+            token.UserId,
+            ActorType.User,
+            token.UserId.ToString(),
+            "auth.password_reset_completed",
+            new { token.UserId, token.Email },
+            httpContext,
+            cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Results.Ok(new ConfirmPasswordResetResponse(true));
+    }
+
+    private static async Task SendPasswordResetAsync(
+        AppUser user,
+        Organization organization,
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var now = clock.UtcNow;
+        var expiresInMinutes = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(organization.Id, "auth", "passwordResetMinutes", cancellationToken))?.ValueJson,
+            30);
+        var oldTokens = await dbContext.UserAuthTokens
+            .Where(item => item.UserId == user.Id
+                && item.Purpose == UserAuthTokenPurpose.PasswordReset
+                && item.ConsumedAt == null)
+            .ToListAsync(cancellationToken);
+        foreach (var oldToken in oldTokens)
+        {
+            oldToken.ConsumedAt = now;
+        }
+
+        var rawToken = EndpointHelpers.NewOpaqueToken();
+        dbContext.UserAuthTokens.Add(new UserAuthToken
+        {
+            UserId = user.Id,
+            Purpose = UserAuthTokenPurpose.PasswordReset,
+            TokenHash = secretHasher.HashSecret(rawToken),
+            Email = user.Email,
+            ExpiresAt = now.AddMinutes(expiresInMinutes),
+            CreatedIpAddress = httpContext.Connection.RemoteIpAddress,
+            CreatedAt = now
+        });
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        var appBaseUrl = await EndpointHelpers.BuildAppBaseUrlAsync(settings, configuration, organization.Id, httpContext, cancellationToken);
+        var link = $"{appBaseUrl.TrimEnd('/')}/reset-password/{rawToken}";
+        var email = TransactionalEmailTemplates.PasswordReset(FirstName(user.FullName), link, expiresInMinutes);
+        var result = await emailService.SendAsync(
+            user.Email,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            "Reqara",
+            cancellationToken,
+            new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "password-reset",
+                ["X-Atlas-Organization-Id"] = organization.Id.ToString(),
+                ["X-Atlas-User-Id"] = user.Id.ToString()
+            });
+
+        dbContext.NotificationDeliveries.Add(new NotificationDelivery
+        {
+            OrganizationId = organization.Id,
+            Channel = DeliveryChannel.Email,
+            TemplateKey = "password_reset",
+            ProviderMessageId = result.MessageId,
+            Status = result.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+            ErrorCode = Truncate(result.Error, 100),
+            SentAt = result.Sent ? clock.UtcNow : null,
+            DeliveredAt = result.Sent ? clock.UtcNow : null,
+            CreatedAt = clock.UtcNow
+        });
+        dbContext.AuditEvents.Add(new AuditEvent
+        {
+            OrganizationId = organization.Id,
+            ActorType = ActorType.User,
+            ActorId = user.Id.ToString(),
+            EventType = result.Sent ? "auth.password_reset_sent" : "auth.password_reset_failed",
+            EventData = JsonSerializer.Serialize(
+                new { user.Id, user.Email, tokenPrefix = EndpointHelpers.TokenLogPrefix(rawToken), result.MessageId, result.Error },
+                EndpointHelpers.JsonOptions),
+            IpAddress = httpContext.Connection.RemoteIpAddress,
+            UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+        });
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private static async Task AddUserAuditForActiveMembershipsAsync(
+        AtlasDbContext dbContext,
+        Guid userId,
+        ActorType actorType,
+        string actorId,
+        string eventType,
+        object eventData,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var organizationIds = await dbContext.OrganizationUsers.IgnoreQueryFilters()
+            .Where(item => item.UserId == userId && item.Status == MembershipStatus.Active)
+            .Select(item => item.OrganizationId)
+            .Distinct()
+            .ToListAsync(cancellationToken);
+
+        foreach (var organizationId in organizationIds)
+        {
+            dbContext.AuditEvents.Add(new AuditEvent
+            {
+                OrganizationId = organizationId,
+                ActorType = actorType,
+                ActorId = actorId,
+                EventType = eventType,
+                EventData = JsonSerializer.Serialize(eventData, EndpointHelpers.JsonOptions),
+                IpAddress = httpContext.Connection.RemoteIpAddress,
+                UserAgent = httpContext.Request.Headers.UserAgent.FirstOrDefault()
+            });
+        }
     }
 
     private static WebhookResponse ToWebhookResponse(WebhookEndpoint webhook)
@@ -946,6 +1425,18 @@ public static class SecurityEndpoints
             membership.Role,
             membership.Status);
     }
+
+    private static string FirstName(string fullName)
+    {
+        var trimmed = fullName.Trim();
+        var space = trimmed.IndexOf(' ', StringComparison.Ordinal);
+        return space > 0 ? trimmed[..space] : trimmed;
+    }
+
+    private static string? Truncate(string? value, int maxLength)
+    {
+        return value is null || value.Length <= maxLength ? value : value[..maxLength];
+    }
 }
 
 public sealed record LoginRequest(string Email, string Password, Guid? OrganizationId);
@@ -954,8 +1445,29 @@ public sealed record MeResponse(
     Guid UserId,
     string Email,
     string FullName,
+    DateTimeOffset? EmailVerifiedAt,
+    bool EmailVerified,
     IReadOnlyList<OrganizationMembershipResponse> Organizations,
     Guid? CurrentOrganizationId);
+
+public sealed record EmailVerificationRequestResponse(
+    bool EmailVerified,
+    DateTimeOffset? EmailVerifiedAt,
+    bool Sent);
+
+public sealed record ConfirmEmailVerificationRequest(string Token);
+
+public sealed record ConfirmEmailVerificationResponse(
+    bool EmailVerified,
+    DateTimeOffset? EmailVerifiedAt);
+
+public sealed record PasswordResetRequest(string Email);
+
+public sealed record PasswordResetRequestResponse(bool Accepted);
+
+public sealed record ConfirmPasswordResetRequest(string Token, string NewPassword);
+
+public sealed record ConfirmPasswordResetResponse(bool PasswordReset);
 
 public sealed record OrganizationMembershipResponse(
     Guid OrganizationId,

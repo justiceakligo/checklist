@@ -8,6 +8,8 @@ Frontend deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUI
 
 Recipient autosave, duplicate-send protection, and the "Previously Submitted" document flow are documented in [PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md](PREVIOUSLY_SUBMITTED_DOCUMENTS_FRONTEND_FLOW.md).
 
+Auth, password reset, recipient OTP, and pricing semantics are documented in [FRONTEND_AUTH_PRICING_OTP_HANDOFF.md](FRONTEND_AUTH_PRICING_OTP_HANDOFF.md).
+
 ## Base URLs
 
 ```text
@@ -154,9 +156,9 @@ Default plan for self-serve signup: `free`.
 Default limits:
 
 ```text
-Free: 10 sent checklists/month, 500 MB storage, team workspace, library, Reqara branding
-Starter: 100 sent checklists/month, 5 GB storage, custom branding, automatic reminders
-Business: 500 sent checklists/month, 25 GB storage, API/webhooks, custom workflows, priority support
+Free: 10 sent recipient checklist requests/month, 500 MB storage, team workspace, library, Reqara branding
+Starter: 100 sent recipient checklist requests/month, 5 GB storage, custom branding, automatic reminders
+Business: 500 sent recipient checklist requests/month, 25 GB storage, API/webhooks, custom workflows, priority support
 Scale: custom volume, SSO/security review/DPA/dedicated onboarding flags, custom retention
 ```
 
@@ -219,7 +221,9 @@ Response:
 
 ## Auth And Organization Signup
 
-Self-serve organizations do not require platform approval. Signup creates an active Free org and sends a welcome email.
+Self-serve organizations do not require platform approval. Signup creates an active Free org, signs the user in, and sends an email verification link.
+
+Users can explore and create drafts before email verification. Sending live checklist requests, creating API keys, and creating/rotating production webhooks require `emailVerified: true`.
 
 ### POST `/v1/auth/signup`
 
@@ -247,9 +251,13 @@ Self-serve organizations do not require platform approval. Signup creates an act
   "userId": "11111111-1111-1111-1111-111111111111",
   "organizationId": "22222222-2222-2222-2222-222222222222",
   "organizationSlug": "northstar-staffing",
-  "role": "Owner"
+  "role": "Owner",
+  "emailVerified": false,
+  "emailVerificationSent": true
 }
 ```
+
+See [FRONTEND_AUTH_PRICING_OTP_HANDOFF.md](FRONTEND_AUTH_PRICING_OTP_HANDOFF.md) for verification, resend, password reset, and UI states.
 
 Invalid JSON or body-binding failures return RFC7807:
 
@@ -281,6 +289,8 @@ Invalid JSON or body-binding failures return RFC7807:
   "userId": "11111111-1111-1111-1111-111111111111",
   "email": "ollie@northstarstaffing.com",
   "fullName": "Ollie Ed",
+  "emailVerifiedAt": null,
+  "emailVerified": false,
   "organizations": [
     {
       "organizationId": "22222222-2222-2222-2222-222222222222",

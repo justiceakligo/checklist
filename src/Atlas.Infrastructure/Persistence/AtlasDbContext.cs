@@ -12,6 +12,7 @@ public sealed class AtlasDbContext(
 {
     public DbSet<Organization> Organizations => Set<Organization>();
     public DbSet<AppUser> Users => Set<AppUser>();
+    public DbSet<UserAuthToken> UserAuthTokens => Set<UserAuthToken>();
     public DbSet<OrganizationUser> OrganizationUsers => Set<OrganizationUser>();
     public DbSet<Template> Templates => Set<Template>();
     public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
@@ -110,6 +111,28 @@ public sealed class AtlasDbContext(
             entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.EmailVerifiedAt).HasColumnType("timestamptz");
             entity.Property(e => e.LastLoginAt).HasColumnType("timestamptz");
+        });
+
+        modelBuilder.Entity<UserAuthToken>(entity =>
+        {
+            entity.ToTable("user_auth_tokens");
+            entity.HasIndex(e => e.TokenHash)
+                .IsUnique()
+                .HasDatabaseName("uq_user_auth_tokens_token_hash");
+            entity.HasIndex(e => new { e.UserId, e.Purpose, e.ExpiresAt })
+                .HasDatabaseName("ix_user_auth_tokens_user_purpose_expiry");
+            entity.Property(e => e.Purpose).HasConversion<short>().IsRequired();
+            entity.Property(e => e.TokenHash).IsRequired();
+            entity.Property(e => e.Email).HasColumnType("citext").IsRequired();
+            entity.Property(e => e.ExpiresAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ConsumedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CreatedIpAddress).HasColumnType("inet");
+            entity.Property(e => e.ConsumedIpAddress).HasColumnType("inet");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.User)
+                .WithMany(e => e.AuthTokens)
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         modelBuilder.Entity<OrganizationUser>(entity =>
@@ -1027,6 +1050,36 @@ public sealed class AtlasDbContext(
                     Category = "actions",
                     Key = "duplicateWindowMinutes",
                     ValueJson = "10",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("38a0758f-080a-4f7f-8ee3-b95e37b61f66"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "auth",
+                    Key = "emailVerificationMinutes",
+                    ValueJson = "1440",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("216922b7-3c5d-4fdd-a4fb-f26878f378f1"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "auth",
+                    Key = "passwordResetMinutes",
+                    ValueJson = "30",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("abf05d8e-6077-4615-8c35-c661fa414cd2"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "recipientOtp",
+                    Key = "defaultRequired",
+                    ValueJson = "false",
                     CreatedAt = seededAt,
                     UpdatedAt = seededAt
                 },
