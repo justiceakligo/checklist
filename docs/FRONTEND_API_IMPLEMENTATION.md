@@ -4,6 +4,8 @@ This guide covers the customer dashboard, recipient checklist portal, public int
 
 Platform-operator endpoints are intentionally documented separately in [PLATFORM_ADMIN_API_IMPLEMENTATION.md](PLATFORM_ADMIN_API_IMPLEMENTATION.md).
 
+Frontend droplet deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
+
 ## Client Basics
 
 Base API origin:

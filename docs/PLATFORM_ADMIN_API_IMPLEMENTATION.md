@@ -4,6 +4,8 @@ This guide covers the platform-operator console: platform staff login, staff man
 
 Customer dashboard and recipient portal endpoints are documented in [FRONTEND_API_IMPLEMENTATION.md](FRONTEND_API_IMPLEMENTATION.md).
 
+Frontend droplet deployment is documented separately in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
+
 ## Client Basics
 
 Base API origin:
