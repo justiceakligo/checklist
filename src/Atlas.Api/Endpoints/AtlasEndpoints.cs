@@ -1757,7 +1757,13 @@ public static class AtlasEndpoints
                 notificationResults.Count(item => item.Sent),
                 notificationResults.Count(item => !item.Sent),
                 notificationResults));
-        });
+        })
+            .Produces<CancelActionResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status401Unauthorized)
+            .ProducesProblem(StatusCodes.Status403Forbidden)
+            .ProducesProblem(StatusCodes.Status404NotFound)
+            .ProducesProblem(StatusCodes.Status409Conflict)
+            .ProducesProblem(StatusCodes.Status422UnprocessableEntity);
 
         group.MapPost("/{id:guid}/reminders", async (
             Guid id,
