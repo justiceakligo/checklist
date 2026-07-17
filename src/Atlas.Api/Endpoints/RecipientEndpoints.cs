@@ -628,6 +628,10 @@ public static class RecipientEndpoints
         Guid fileId,
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        IHttpClientFactory httpClientFactory,
+        IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -638,12 +642,53 @@ public static class RecipientEndpoints
         }
 
         var recipient = access.Recipient!;
-        var file = await dbContext.FileAssets.AsNoTracking().FirstOrDefaultAsync(
+        var file = await dbContext.FileAssets.FirstOrDefaultAsync(
             item => item.Id == fileId && item.ActionRecipientId == recipient.Id,
             cancellationToken);
         if (file is null)
         {
             return EndpointHelpers.Problem("not_found", "File was not found.", StatusCodes.Status404NotFound);
+        }
+
+        if (file.ScanStatus == FileScanStatus.Pending)
+        {
+            var metadata = await storage.GetObjectMetadataAsync(file.StorageKey, cancellationToken);
+            if (metadata is not null)
+            {
+                if (metadata.SizeBytes != file.SizeBytes)
+                {
+                    return EndpointHelpers.Problem(
+                        "upload_mismatch",
+                        "Uploaded object size does not match the declared size.",
+                        StatusCodes.Status409Conflict);
+                }
+
+                var scan = await FileScanPolicy.ApplyAfterUploadCompleteAsync(
+                    file,
+                    settings,
+                    storage,
+                    httpClientFactory,
+                    clock,
+                    cancellationToken);
+                if (scan.Problem is not null)
+                {
+                    await dbContext.SaveChangesAsync(cancellationToken);
+                    return scan.Problem;
+                }
+
+                if (file.ScanStatus != FileScanStatus.Pending)
+                {
+                    SecurityEndpoints.AddAudit(
+                        dbContext,
+                        file.OrganizationId,
+                        file.ActionId,
+                        tenantContext,
+                        "file.scan_completed",
+                        new { file.Id, file.ScanStatus, file.ScanEngine },
+                        httpContext);
+                    await dbContext.SaveChangesAsync(cancellationToken);
+                }
+            }
         }
 
         return Results.Ok(new FileStatusResponse(file.Id, file.ScanStatus, file.ScanCompletedAt));
@@ -656,6 +701,7 @@ public static class RecipientEndpoints
         ITenantContext tenantContext,
         IAdminSettingService settings,
         IObjectStorageService storage,
+        IHttpClientFactory httpClientFactory,
         IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
@@ -729,6 +775,7 @@ public static class RecipientEndpoints
         ITenantContext tenantContext,
         IAdminSettingService settings,
         IObjectStorageService storage,
+        IHttpClientFactory httpClientFactory,
         IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
@@ -759,9 +806,20 @@ public static class RecipientEndpoints
             return EndpointHelpers.Problem("upload_mismatch", "Uploaded object size does not match the declared size.", StatusCodes.Status409Conflict);
         }
 
-        await FileScanPolicy.ApplyAfterUploadCompleteAsync(file, settings, clock, cancellationToken);
+        var scan = await FileScanPolicy.ApplyAfterUploadCompleteAsync(
+            file,
+            settings,
+            storage,
+            httpClientFactory,
+            clock,
+            cancellationToken);
+        if (scan.Problem is not null)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return scan.Problem;
+        }
         SecurityEndpoints.AddAudit(dbContext, file.OrganizationId, file.ActionId, tenantContext, "file.uploaded", new { file.Id, file.OriginalFileName, file.SizeBytes }, httpContext);
-        if (file.ScanStatus == FileScanStatus.Clean)
+        if (file.ScanStatus != FileScanStatus.Pending)
         {
             SecurityEndpoints.AddAudit(dbContext, file.OrganizationId, file.ActionId, tenantContext, "file.scan_completed", new { file.Id, file.ScanStatus, file.ScanEngine }, httpContext);
         }

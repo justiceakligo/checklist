@@ -204,7 +204,7 @@ Use this as the frontend truth table.
 | One final package | Supported | Submissions collect responses/files into one package. |
 | Automatic reminders | Supported | Worker sends before-due and overdue reminders for eligible plans. |
 | API and webhooks | Supported for Business/Scale | Sandbox is self-serve. Production requires platform approval. |
-| Malware scanning | Integration-ready | Files are blocked until marked `Clean`; scanner engine itself is external. |
+| Malware scanning | Supported with ClamAV | Files are scanned after upload completion and blocked unless marked `Clean`. |
 | Audit trail | Supported | Sends, views, uploads, OTP, submissions, reviews, admin events. |
 | Auto-expiration | Supported | Recipient links expire; tokens rotate on resend/reminder. |
 | Rate limiting | Supported broadly | Global fixed-window rate limiting plus OTP attempt caps. |
@@ -1027,7 +1027,7 @@ await fetch(uploadIntent.uploadUrl, {
 
 ### POST `/v1/files/{id}/complete`
 
-Checks object exists and size matches. In the current production `trusted` scan mode, a matching upload returns `Clean` immediately. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until a scanner posts `/scan-result`.
+Checks object exists, verifies size, and scans with ClamAV in the current production `clamav` mode. Clean files return `Clean`; infected files return `Rejected`. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until a scanner posts `/scan-result`.
 
 ```json
 {
@@ -1291,7 +1291,7 @@ Response includes `retentionUntil`, same shape as dashboard upload intents.
 
 ### POST `/v1/recipient/uploads/{fileId}/complete`
 
-Marks upload received. In the current production `trusted` scan mode, a matching upload returns `Clean` immediately. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until the scanner callback arrives.
+Marks upload received, verifies size, and scans with ClamAV in the current production `clamav` mode. Clean files return `Clean`; infected files return `Rejected`. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until the scanner callback arrives.
 
 ```json
 {
@@ -1303,7 +1303,7 @@ Marks upload received. In the current production `trusted` scan mode, a matching
 
 ### GET `/v1/recipient/uploads/{fileId}`
 
-Recipient-safe polling endpoint for async scan state.
+Recipient-safe polling endpoint for scan state. If the file is still `Pending` and the uploaded object exists in storage, the backend attempts to finalize the ClamAV scan during this request and returns the updated status.
 
 ```json
 {
