@@ -232,6 +232,8 @@ public static class RecipientEndpoints
         var recipient = await dbContext.ActionRecipients
             .Include(item => item.Action)
             .ThenInclude(action => action!.Organization)
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.CreatedByUser)
             .FirstOrDefaultAsync(item => item.Id == recipientId, cancellationToken);
         if (session is null || recipient?.Action?.Organization is null)
         {
@@ -873,6 +875,8 @@ public static class RecipientEndpoints
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
         IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
         IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
@@ -1103,7 +1107,177 @@ public static class RecipientEndpoints
 
         await dbContext.SaveChangesAsync(cancellationToken);
 
+        await SendSubmissionSubmittedNotificationsAsync(
+            submission,
+            action,
+            recipient,
+            dbContext,
+            settings,
+            emailService,
+            configuration,
+            tenantContext,
+            clock,
+            httpContext,
+            cancellationToken);
+
         return Results.Created($"/v1/recipient/receipt", response);
+    }
+
+    private static async Task SendSubmissionSubmittedNotificationsAsync(
+        Submission submission,
+        ChecklistAction action,
+        ActionRecipient recipient,
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ITenantContext tenantContext,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var enabled = await ReadOrganizationBoolSettingAsync(
+            settings,
+            action.OrganizationId,
+            "notifications",
+            "submissionSubmittedEnabled",
+            fallback: true,
+            cancellationToken);
+        if (!enabled)
+        {
+            return;
+        }
+
+        var organization = action.Organization!;
+        var notifyCreator = await ReadOrganizationBoolSettingAsync(
+            settings,
+            action.OrganizationId,
+            "notifications",
+            "submissionSubmittedNotifyCreator",
+            fallback: true,
+            cancellationToken);
+        var inboxEmail = await ReadOrganizationStringSettingAsync(
+            settings,
+            action.OrganizationId,
+            "notifications",
+            "submissionSubmittedInboxEmail",
+            cancellationToken);
+        var notifyInbox = await ReadOrganizationBoolSettingAsync(
+            settings,
+            action.OrganizationId,
+            "notifications",
+            "submissionSubmittedNotifyInbox",
+            fallback: true,
+            cancellationToken);
+
+        var destinations = new List<string>();
+        if (notifyCreator && LooksLikeEmail(action.CreatedByUser?.Email))
+        {
+            destinations.Add(action.CreatedByUser!.Email.Trim());
+        }
+        if (notifyInbox && LooksLikeEmail(inboxEmail))
+        {
+            destinations.Add(inboxEmail!.Trim());
+        }
+
+        destinations = destinations
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (destinations.Count == 0)
+        {
+            SecurityEndpoints.AddAudit(
+                dbContext,
+                action.OrganizationId,
+                action.Id,
+                tenantContext,
+                "organization.submission_notification_skipped",
+                new { submission.Id, Reason = "no_destination" },
+                httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        var contentHash = Convert.ToHexString(submission.ContentHash).ToLowerInvariant();
+        var receiptReference = BuildReceiptReference(action.PublicReference, submission.SubmittedAt, contentHash);
+        var appBaseUrl = await EndpointHelpers.BuildAppBaseUrlAsync(
+            settings,
+            configuration,
+            action.OrganizationId,
+            httpContext,
+            cancellationToken);
+        var reviewUrl = $"{appBaseUrl.TrimEnd('/')}/app/actions/{action.Id}/submissions/{submission.Id}";
+        var email = TransactionalEmailTemplates.SubmissionSubmittedToOrganization(
+            organization.Name,
+            action.Title,
+            action.PublicReference,
+            receiptReference,
+            recipient.Name,
+            recipient.Email,
+            submission.SubmittedAt,
+            submission.VersionNumber,
+            submission.Responses.Count,
+            submission.Files.Count,
+            submission.Files.Count(item => item.IsPreviouslySubmitted),
+            reviewUrl);
+
+        foreach (var destination in destinations)
+        {
+            EmailSendResult result;
+            try
+            {
+                result = await emailService.SendAsync(
+                    destination,
+                    email.Subject,
+                    email.TextBody,
+                    email.HtmlBody,
+                    "requests@reqara.com",
+                    $"{organization.Name} via Reqara",
+                    cancellationToken,
+                    new Dictionary<string, string>
+                    {
+                        ["X-Atlas-Email-Type"] = "organization-submission-submitted",
+                        ["X-Atlas-Action-Id"] = action.Id.ToString(),
+                        ["X-Atlas-Recipient-Id"] = recipient.Id.ToString(),
+                        ["X-Atlas-Submission-Id"] = submission.Id.ToString()
+                    },
+                    LooksLikeEmail(recipient.Email) ? recipient.Email : action.CreatedByUser?.Email);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or InvalidOperationException)
+            {
+                result = new EmailSendResult("failed", Error: exception.GetType().Name);
+            }
+
+            dbContext.NotificationDeliveries.Add(new NotificationDelivery
+            {
+                OrganizationId = action.OrganizationId,
+                ActionRecipientId = recipient.Id,
+                Channel = DeliveryChannel.Email,
+                TemplateKey = "organization_submission_submitted",
+                ProviderMessageId = result.MessageId,
+                Status = result.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+                ErrorCode = Truncate(result.Error, 100),
+                SentAt = result.Sent ? clock.UtcNow : null,
+                DeliveredAt = result.Sent ? clock.UtcNow : null,
+                CreatedAt = clock.UtcNow
+            });
+            SecurityEndpoints.AddAudit(
+                dbContext,
+                action.OrganizationId,
+                action.Id,
+                tenantContext,
+                result.Sent ? "organization.submission_notification_sent" : "organization.submission_notification_failed",
+                new
+                {
+                    submission.Id,
+                    RecipientId = recipient.Id,
+                    ToEmail = destination,
+                    result.MessageId,
+                    result.Error
+                },
+                httpContext);
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
     }
 
     private static async Task<IResult> RequestReturnLink(
@@ -1735,6 +1909,32 @@ public static class RecipientEndpoints
         var safe = new string(value.Select(character =>
             char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '-').ToArray());
         return string.IsNullOrWhiteSpace(safe) ? "reqara-submission" : safe.Trim('-');
+    }
+
+    private static async Task<bool> ReadOrganizationBoolSettingAsync(
+        IAdminSettingService settings,
+        Guid organizationId,
+        string category,
+        string key,
+        bool fallback,
+        CancellationToken cancellationToken)
+    {
+        var value = (await settings.GetAsync(organizationId, category, key, cancellationToken))?.ValueJson
+            ?? (await settings.GetAsync(null, category, key, cancellationToken))?.ValueJson;
+        return EndpointHelpers.ReadBoolSetting(value, fallback);
+    }
+
+    private static async Task<string?> ReadOrganizationStringSettingAsync(
+        IAdminSettingService settings,
+        Guid organizationId,
+        string category,
+        string key,
+        CancellationToken cancellationToken)
+    {
+        return EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(organizationId, category, key, cancellationToken))?.ValueJson)
+            ?? EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(null, category, key, cancellationToken))?.ValueJson);
     }
 
     private static bool LooksLikeEmail(string? value)

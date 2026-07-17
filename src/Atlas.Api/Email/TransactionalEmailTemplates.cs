@@ -1,4 +1,5 @@
 using System.Net;
+using System.Globalization;
 
 namespace Atlas.Api.Email;
 
@@ -288,6 +289,67 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail($"{safeOrganization} cancelled this checklist request", text, html);
     }
 
+    public static TransactionalEmail SubmissionSubmittedToOrganization(
+        string organizationName,
+        string checklistTitle,
+        string publicReference,
+        string receiptReference,
+        string recipientName,
+        string recipientEmail,
+        DateTimeOffset submittedAt,
+        int versionNumber,
+        int responseCount,
+        int fileCount,
+        int previouslySubmittedFileCount,
+        string reviewUrl)
+    {
+        var safeOrganization = CleanName(organizationName, "your organization");
+        var safeTitle = CleanName(checklistTitle, "Checklist request");
+        var safePublicReference = CleanName(publicReference, "Not set");
+        var safeReceiptReference = CleanName(receiptReference, "Not set");
+        var safeRecipient = CleanName(recipientName, "Recipient");
+        var safeRecipientEmail = CleanName(recipientEmail, "unknown");
+        var safeReviewUrl = reviewUrl.Trim();
+        var submittedText = submittedAt.ToUniversalTime().ToString("MMMM d, yyyy 'at' h:mm tt 'UTC'", CultureInfo.InvariantCulture);
+        var fileSummary = previouslySubmittedFileCount > 0
+            ? $"{fileCount} file{Plural(fileCount)} ({previouslySubmittedFileCount} previously submitted)"
+            : $"{fileCount} file{Plural(fileCount)}";
+
+        var text =
+            $"A recipient submitted a Reqara checklist for {safeOrganization}.\n\n" +
+            $"Checklist: {safeTitle}\n" +
+            $"Recipient: {safeRecipient} <{safeRecipientEmail}>\n" +
+            $"Receipt: {safeReceiptReference}\n" +
+            $"Public reference: {safePublicReference}\n" +
+            $"Submitted: {submittedText}\n" +
+            $"Version: {versionNumber}\n" +
+            $"Responses: {responseCount}\n" +
+            $"Files: {fileSummary}\n\n" +
+            $"Review submission:\n{safeReviewUrl}\n\n" +
+            "For security, this email does not include submitted answers or file attachments.";
+
+        var html = BuildLayout(
+            "Checklist submitted",
+            $"{Html(safeRecipient)} submitted a checklist.",
+            $"<strong>{Html(safeRecipient)}</strong> submitted <strong>{Html(safeTitle)}</strong> for {Html(safeOrganization)}.",
+            "Review submission",
+            safeReviewUrl,
+            new[]
+            {
+                $"<strong>Recipient:</strong> {Html(safeRecipient)} &lt;{Html(safeRecipientEmail)}&gt;",
+                $"<strong>Receipt:</strong> {Html(safeReceiptReference)}",
+                $"<strong>Public reference:</strong> {Html(safePublicReference)}",
+                $"<strong>Submitted:</strong> {Html(submittedText)}",
+                $"<strong>Version:</strong> {versionNumber}",
+                $"<strong>Responses:</strong> {responseCount}",
+                $"<strong>Files:</strong> {Html(fileSummary)}",
+                $"Fallback link: <a href=\"{HtmlAttribute(safeReviewUrl)}\" style=\"color:#2563eb;word-break:break-all\">{Html(safeReviewUrl)}</a>"
+            },
+            "For security, this email does not include submitted answers or file attachments. Open Reqara to review the submission.");
+
+        return new TransactionalEmail($"{safeRecipient} submitted {safeTitle}", text, html);
+    }
+
     public static TransactionalEmail ReturnLink(
         string recipientFirstName,
         string organizationName,
@@ -503,6 +565,11 @@ internal static class TransactionalEmailTemplates
     private static string HtmlAttribute(string value)
     {
         return WebUtility.HtmlEncode(value);
+    }
+
+    private static string Plural(int value)
+    {
+        return value == 1 ? string.Empty : "s";
     }
 
     private static string FormatDuration(int minutes)

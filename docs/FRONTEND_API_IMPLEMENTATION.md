@@ -14,6 +14,8 @@ Auth, password reset, recipient OTP, and pricing semantics are documented in [FR
 
 Stripe checkout, subscription management, and billing webhooks are documented in [FRONTEND_STRIPE_BILLING_HANDOFF.md](FRONTEND_STRIPE_BILLING_HANDOFF.md).
 
+Recipient submission notification behavior and org notification settings are documented in [FRONTEND_SUBMISSION_NOTIFICATIONS_HANDOFF.md](FRONTEND_SUBMISSION_NOTIFICATIONS_HANDOFF.md).
+
 ## Base URLs
 
 ```text
