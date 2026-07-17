@@ -1389,7 +1389,7 @@ Returns the latest submission receipt as JSON for rendering the success page.
 Frontend success-page guidance:
 
 - Use this JSON to render the submitted state.
-- Prefer `receiptReference`; fall back to `publicReference`; only generate a local fallback if both are empty.
+- Prefer `receiptReference` for all recipient-facing copy. Do not display raw machine-style action references such as `act_...`.
 - Do not render raw JSON to recipients.
 - The status means Reqara received the submission. It does not mean the organization accepted/reviewed it.
 

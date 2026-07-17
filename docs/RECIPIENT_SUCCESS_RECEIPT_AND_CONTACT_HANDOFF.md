@@ -11,7 +11,7 @@ Do not show raw JSON to the recipient.
 Use these fields:
 
 - `receiptReference`: primary visible reference.
-- `publicReference`: fallback reference if `receiptReference` is empty.
+- `publicReference`: internal/action reference fallback only. Prefer `receiptReference` everywhere recipient-facing.
 - `submittedAt`: submitted timestamp.
 - `organizationName`: organization that received the checklist.
 - `checklistTitle`: submitted checklist name.
@@ -73,6 +73,9 @@ Returns:
 
 - `200 application/pdf`
 - backend-generated branded receipt
+- human-readable receipt number and verification code
+- no raw `act_...` machine reference
+- no full content hash
 - filename `{receiptReference}-receipt.pdf`
 
 Fallback download:

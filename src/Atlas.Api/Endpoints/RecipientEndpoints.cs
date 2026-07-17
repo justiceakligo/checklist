@@ -1510,15 +1510,35 @@ public static class RecipientEndpoints
 
     private static string BuildReceiptReference(string publicReference, DateTimeOffset submittedAt, string contentHash)
     {
-        if (!string.IsNullOrWhiteSpace(publicReference))
+        if (IsHumanReadableReference(publicReference))
         {
             return publicReference.Trim();
         }
 
-        var suffix = contentHash.Length >= 6
-            ? contentHash[..6].ToUpperInvariant()
-            : "000000";
+        var suffix = contentHash.Length >= 8
+            ? contentHash[..8].ToUpperInvariant()
+            : "00000000";
         return $"REQ-{submittedAt:yyyyMMdd}-{suffix}";
+    }
+
+    private static bool IsHumanReadableReference(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        if (trimmed.StartsWith("act_", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("sub_", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("chk_", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return trimmed.StartsWith("REQ-", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("REC-", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("RQR-", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildVerificationFingerprint(string contentHash)
@@ -1538,7 +1558,7 @@ public static class RecipientEndpoints
         builder.AppendLine("Reqara Submission Receipt");
         builder.AppendLine("==========================");
         builder.AppendLine();
-        builder.AppendLine($"Reference: {receipt.ReceiptReference}");
+        builder.AppendLine($"Receipt number: {receipt.ReceiptReference}");
         builder.AppendLine($"Status: {receipt.Status}");
         builder.AppendLine($"Submitted: {receipt.SubmittedAt:yyyy-MM-dd HH:mm:ss 'UTC'}");
         builder.AppendLine($"Checklist: {receipt.ChecklistTitle}");
@@ -1549,7 +1569,7 @@ public static class RecipientEndpoints
         builder.AppendLine($"Responses: {receipt.ResponseCount}");
         builder.AppendLine($"Files: {receipt.FileCount}");
         builder.AppendLine($"Previously submitted files used: {receipt.PreviouslySubmittedFileCount}");
-        builder.AppendLine($"Verification fingerprint: {receipt.VerificationFingerprint}");
+        builder.AppendLine($"Verification code: {receipt.VerificationFingerprint}");
         builder.AppendLine();
         builder.AppendLine("This receipt confirms that Reqara received this checklist submission. It does not mean the organization has reviewed or accepted the submission yet.");
         return builder.ToString();
@@ -1577,7 +1597,7 @@ public static class RecipientEndpoints
         commands.AppendLine("1 1 1 rg 42 398 528 274 re f");
         commands.AppendLine("0.86 0.88 0.92 RG 42 398 528 274 re S");
         commands.AppendLine("0.96 0.98 1 rg 42 620 528 52 re f");
-        commands.AppendLine(PdfText("F1", 10, 64, 650, "REFERENCE"));
+        commands.AppendLine(PdfText("F1", 10, 64, 650, "RECEIPT NUMBER"));
         commands.AppendLine(PdfText("F2", 20, 64, 626, receipt.ReceiptReference));
         commands.AppendLine(PdfText("F1", 10, 366, 650, "SUBMITTED"));
         commands.AppendLine(PdfText("F2", 12, 366, 629, receipt.SubmittedAt.ToString("MMM d, yyyy HH:mm 'UTC'", CultureInfo.InvariantCulture)));
@@ -1586,8 +1606,7 @@ public static class RecipientEndpoints
         DrawLabelValue(commands, 64, 550, "Organization", receipt.OrganizationName);
         DrawLabelValue(commands, 64, 510, "Recipient", $"{receipt.RecipientName} <{receipt.RecipientEmail}>");
         DrawLabelValue(commands, 64, 470, "Version", receipt.VersionNumber.ToString(CultureInfo.InvariantCulture));
-        DrawLabelValue(commands, 330, 470, "Verification fingerprint", receipt.VerificationFingerprint);
-        DrawLabelValue(commands, 64, 430, "Content hash", receipt.ContentHash.Length > 36 ? $"{receipt.ContentHash[..36]}..." : receipt.ContentHash);
+        DrawLabelValue(commands, 330, 470, "Verification code", receipt.VerificationFingerprint);
 
         commands.AppendLine("1 1 1 rg 42 222 528 138 re f");
         commands.AppendLine("0.86 0.88 0.92 RG 42 222 528 138 re S");
