@@ -71,7 +71,7 @@ The current checkout flow redirects to Stripe-hosted Checkout, so the frontend d
 
 ## GET `/v1/billing/plans`
 
-Use this as the source of truth for pricing and feature flags.
+Use this as the source of truth for pricing, currency, and feature flags. Do not hardcode `USD`; production plans are configured in the database and currently use `CAD`.
 
 ```json
 {
@@ -82,7 +82,7 @@ Use this as the source of truth for pricing and feature flags.
       "description": "For solo pros and small teams.",
       "monthlyPriceCents": 3900,
       "annualPriceCents": 39000,
-      "currency": "USD",
+      "currency": "CAD",
       "monthlyChecklistLimit": 100,
       "storageBytes": 5368709120,
       "customPricing": false,
@@ -107,6 +107,8 @@ Use this as the source of truth for pricing and feature flags.
 ```
 
 `monthlyChecklistLimit` means sent recipient checklist requests per calendar month, not templates or drafts.
+
+Pricing page copy should not say `Prices in USD`. Render currency from each plan. If all paid plans share one currency, use optional small copy like `Prices shown in CAD.`
 
 ## POST `/v1/billing/checkout-sessions`
 
@@ -224,7 +226,7 @@ Use on the billing success page. This endpoint retrieves the Checkout Session fr
   "planCode": "starter",
   "billingCycle": "annual",
   "amountTotal": 39000,
-  "currency": "USD",
+  "currency": "CAD",
   "stripeCustomerId": "cus_123",
   "stripeSubscriptionId": "sub_123",
   "stripeSubscriptionStatus": "active",
@@ -378,7 +380,7 @@ customer.deleted
 Webhook effects:
 
 - Checkout/subscription events update organization `billing.plan`.
-- Successful invoice payments create Stripe revenue events.
+- Successful invoice payments and successful Checkout session verification create Stripe revenue events.
 - Failed invoice payments mark billing `past_due`.
 - Subscription cancellation removes paid entitlements.
 - Refunds create negative revenue events.
@@ -399,14 +401,16 @@ Stripe event rows use:
 ```json
 {
   "source": "stripe",
-  "externalReference": "stripe:evt_123",
+  "externalReference": "stripe:evt_123 or stripe:checkout_session:cs_123",
   "type": "Subscription",
   "amount": 99.0,
-  "currency": "USD"
+  "currency": "CAD"
 }
 ```
 
 Refunds are negative amounts with `type: "Refund"`.
+
+Use `GET /v1/platform/billing/subscriptions` for current subscription state, cancellation visibility, and normalized MRR. Use `GET /v1/platform/revenue-events` for the cash/revenue ledger.
 
 ## Frontend Checklist
 

@@ -749,6 +749,7 @@ public static class AnalyticsEndpoints
         DateTimeOffset? to,
         AtlasDbContext dbContext,
         HttpContext httpContext,
+        IEntitlementService entitlements,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -762,7 +763,7 @@ public static class AnalyticsEndpoints
             return periodProblem!;
         }
 
-        var stats = await BuildPlatformStatsAsync(dbContext, period.From, period.To, clock.UtcNow, cancellationToken);
+        var stats = await BuildPlatformStatsAsync(dbContext, entitlements, period.From, period.To, clock.UtcNow, cancellationToken);
         return Results.Ok(new PlatformAnalyticsOverviewResponse(
             new AnalyticsPeriod(period.From, period.To),
             stats.Business,
@@ -1003,6 +1004,7 @@ public static class AnalyticsEndpoints
         DateTimeOffset? to,
         AtlasDbContext dbContext,
         HttpContext httpContext,
+        IEntitlementService entitlements,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -1019,11 +1021,11 @@ public static class AnalyticsEndpoints
         var revenue = await dbContext.PlatformRevenueEvents.IgnoreQueryFilters().AsNoTracking()
             .Where(item => item.OccurredAt >= period.From && item.OccurredAt <= period.To)
             .ToListAsync(cancellationToken);
-        var subscription = revenue.Where(item => item.Type == PlatformRevenueEventType.Subscription).ToList();
+        var recurring = await BuildRecurringRevenueSnapshotAsync(dbContext, entitlements, period.To, cancellationToken);
         var creditsAndRefunds = revenue
             .Where(item => item.Type is PlatformRevenueEventType.Credit or PlatformRevenueEventType.Refund)
             .Sum(item => Math.Abs(item.Amount));
-        var closingMrr = subscription.Sum(item => item.Amount);
+        var closingMrr = recurring.Mrr;
 
         return Results.Ok(new PlatformRevenueAnalyticsResponse(
             new AnalyticsPeriod(period.From, period.To),
@@ -1660,6 +1662,7 @@ public static class AnalyticsEndpoints
         DateTimeOffset? to,
         AtlasDbContext dbContext,
         HttpContext httpContext,
+        IEntitlementService entitlements,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -1673,7 +1676,7 @@ public static class AnalyticsEndpoints
             return periodProblem!;
         }
 
-        var stats = await BuildPlatformStatsAsync(dbContext, period.From, period.To, clock.UtcNow, cancellationToken);
+        var stats = await BuildPlatformStatsAsync(dbContext, entitlements, period.From, period.To, clock.UtcNow, cancellationToken);
         return Results.Ok(new InvestorSummaryResponse(
             AsOf: period.To,
             Business: new InvestorBusinessSummary(
@@ -1870,6 +1873,7 @@ public static class AnalyticsEndpoints
         CreateInvestorReportRequest request,
         AtlasDbContext dbContext,
         HttpContext httpContext,
+        IEntitlementService entitlements,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -1884,7 +1888,7 @@ public static class AnalyticsEndpoints
         }
 
         var period = ResolveReportPeriod(request.Period, clock.UtcNow);
-        var stats = await BuildPlatformStatsAsync(dbContext, period.From, period.To, clock.UtcNow, cancellationToken);
+        var stats = await BuildPlatformStatsAsync(dbContext, entitlements, period.From, period.To, clock.UtcNow, cancellationToken);
         var payload = new
         {
             request.ReportType,
@@ -2469,6 +2473,7 @@ public static class AnalyticsEndpoints
 
     private static async Task<PlatformStats> BuildPlatformStatsAsync(
         AtlasDbContext dbContext,
+        IEntitlementService entitlements,
         DateTimeOffset from,
         DateTimeOffset to,
         DateTimeOffset now,
@@ -2481,9 +2486,6 @@ public static class AnalyticsEndpoints
         var submissions = await dbContext.Submissions.IgnoreQueryFilters().AsNoTracking()
             .Include(item => item.Action)
             .Where(item => item.SubmittedAt >= from && item.SubmittedAt <= to)
-            .ToListAsync(cancellationToken);
-        var revenue = await dbContext.PlatformRevenueEvents.IgnoreQueryFilters().AsNoTracking()
-            .Where(item => item.OccurredAt >= from && item.OccurredAt <= to)
             .ToListAsync(cancellationToken);
         var notifications = await dbContext.NotificationDeliveries.IgnoreQueryFilters().AsNoTracking()
             .Where(item => item.CreatedAt >= from && item.CreatedAt <= to)
@@ -2502,9 +2504,8 @@ public static class AnalyticsEndpoints
             : Rate(
                 eligibleFor90DayRetention.Count(item => activeOrganizationIds.Contains(item.Id)),
                 eligibleFor90DayRetention.Count);
-        var mrr = revenue
-            .Where(item => item.Type == PlatformRevenueEventType.Subscription)
-            .Sum(item => item.Amount);
+        var recurringRevenue = await BuildRecurringRevenueSnapshotAsync(dbContext, entitlements, now, cancellationToken);
+        var mrr = recurringRevenue.Mrr;
         var completed = submissions.Count(item => item.Status == SubmissionStatus.Accepted);
         var sent = usage.Sum(item => item.Quantity);
         var activeOrganizationCount = activeOrganizationIds.Count;
@@ -2519,7 +2520,7 @@ public static class AnalyticsEndpoints
             new PlatformBusinessAnalytics(
                 Mrr: mrr,
                 Arr: mrr * 12,
-                PayingOrganizations: revenue.Select(item => item.OrganizationId).Where(item => item.HasValue).Select(item => item!.Value).Distinct().Count(),
+                PayingOrganizations: recurringRevenue.PayingOrganizations,
                 MonthlyActiveOrganizations: activeOrganizationCount,
                 NewOrganizations: organizations.Count(item => item.CreatedAt >= from && item.CreatedAt <= to)),
             new PlatformProductAnalytics(
@@ -2538,6 +2539,73 @@ public static class AnalyticsEndpoints
                 WebhookSuccessRate: Rate(webhooks.Count(item => item.Status == WebhookDeliveryStatus.Succeeded), webhooks.Count),
                 FileScanSuccessRate: Rate(files.Count(item => item.ScanStatus == FileScanStatus.Clean), files.Count(item => item.ScanStatus != FileScanStatus.Pending)),
                 OpenIncidents: null));
+    }
+
+    private static async Task<RecurringRevenueSnapshot> BuildRecurringRevenueSnapshotAsync(
+        AtlasDbContext dbContext,
+        IEntitlementService entitlements,
+        DateTimeOffset asOf,
+        CancellationToken cancellationToken)
+    {
+        var organizations = await dbContext.Organizations.IgnoreQueryFilters().AsNoTracking()
+            .Where(item => item.Status == OrganizationStatus.Active && item.DeletedAt == null)
+            .Select(item => item.Id)
+            .ToListAsync(cancellationToken);
+
+        decimal mrr = 0;
+        var payingOrganizations = 0;
+        foreach (var organizationId in organizations)
+        {
+            var snapshot = await entitlements.GetOrganizationEntitlementsAsync(organizationId, asOf, cancellationToken);
+            if (!HasActiveRecurringRevenue(snapshot, asOf))
+            {
+                continue;
+            }
+
+            var planMrr = MonthlyRecurringRevenue(snapshot.Plan, snapshot.Billing);
+            if (planMrr <= 0)
+            {
+                continue;
+            }
+
+            payingOrganizations++;
+            mrr += planMrr;
+        }
+
+        return new RecurringRevenueSnapshot(Math.Round(mrr, 2), payingOrganizations);
+    }
+
+    private static bool HasActiveRecurringRevenue(OrganizationEntitlementSnapshot snapshot, DateTimeOffset asOf)
+    {
+        var hasConfiguredPrice = (snapshot.Plan.MonthlyPriceCents.HasValue && snapshot.Plan.MonthlyPriceCents.Value > 0)
+            || (snapshot.Plan.AnnualPriceCents.HasValue && snapshot.Plan.AnnualPriceCents.Value > 0);
+        if (!hasConfiguredPrice)
+        {
+            return false;
+        }
+
+        var status = snapshot.Billing.Status.Trim().ToLowerInvariant();
+        if (status is not ("active" or "trialing" or "past_due"))
+        {
+            return false;
+        }
+
+        return !snapshot.Billing.CurrentPeriodEnd.HasValue || snapshot.Billing.CurrentPeriodEnd.Value > asOf;
+    }
+
+    private static decimal MonthlyRecurringRevenue(BillingPlan plan, OrganizationBillingState billing)
+    {
+        var billingCycle = billing.BillingCycle.Trim().ToLowerInvariant();
+        if (billingCycle is "annual" or "yearly" or "year")
+        {
+            return plan.AnnualPriceCents.HasValue
+                ? plan.AnnualPriceCents.Value / 1200m
+                : 0;
+        }
+
+        return plan.MonthlyPriceCents.HasValue
+            ? plan.MonthlyPriceCents.Value / 100m
+            : 0;
     }
 
     private static IReadOnlyList<MetricDefinitionResponse> OrganizationMetricDefinitions()
@@ -2837,6 +2905,8 @@ public static class AnalyticsEndpoints
         PlatformProductAnalytics Product,
         PlatformRetentionAnalytics Retention,
         PlatformOperationsSummary Operations);
+
+    private sealed record RecurringRevenueSnapshot(decimal Mrr, int PayingOrganizations);
 }
 
 public sealed record AnalyticsPeriod(DateTimeOffset From, DateTimeOffset To);

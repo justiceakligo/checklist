@@ -621,7 +621,7 @@ Response includes entitlement snapshot and developer access state.
       "actionCount": 18,
       "submissionCount": 12,
       "revenueAllTime": [
-        { "currency": "USD", "amount": 499.00 }
+        { "currency": "CAD", "amount": 499.00 }
       ],
       "entitlements": {
         "plan": { "code": "business", "name": "Business" },
@@ -917,7 +917,7 @@ Deletes the lead.
 
 ## Revenue
 
-Stripe subscription webhooks now create revenue events automatically. Platform admins can still create manual adjustments, credits, refunds, or imported revenue records.
+Stripe subscription webhooks and successful Checkout session verification create revenue events automatically. Platform admins can still create manual adjustments, credits, refunds, or imported revenue records.
 
 ### GET `/v1/platform/revenue-events`
 
@@ -930,6 +930,10 @@ from: ISO timestamp
 to: ISO timestamp
 ```
 
+Omit `type` for all revenue event types. Do not send `type=all`.
+
+Revenue events are a cash/payment ledger. Use `/v1/platform/billing/subscriptions` for current billing state, cancellation visibility, and normalized MRR.
+
 ### POST `/v1/platform/revenue-events`
 
 ```json
@@ -937,7 +941,7 @@ to: ISO timestamp
   "organizationId": "30000000-0000-0000-0000-000000000001",
   "type": "Subscription",
   "amount": 99.00,
-  "currency": "USD",
+  "currency": "CAD",
   "source": "manual",
   "externalReference": "INV-1001",
   "occurredAt": "2026-07-16T00:00:00Z",
@@ -949,7 +953,57 @@ to: ISO timestamp
 }
 ```
 
-Stripe-created rows use `source: "stripe"` and `externalReference: "stripe:evt_..."`. Refunds are stored as negative `Refund` amounts so revenue totals are net of refunds.
+Stripe-created rows use `source: "stripe"` and `externalReference: "stripe:evt_..."` or `stripe:checkout_session:cs_...`. Refunds are stored as negative `Refund` amounts so revenue totals are net of refunds.
+
+### GET `/v1/platform/billing/subscriptions`
+
+Current billing/subscription state for platform Revenue/Billing screens.
+
+Query params:
+
+```text
+page: optional, default 1
+pageSize: optional
+status: optional; examples active, past_due, canceling, canceled
+planCode: optional; examples free, starter, business, scale
+provider: optional; examples manual, stripe
+```
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "organizationId": "f18ace48-e455-48ae-8170-01c2841b36c0",
+      "organizationName": "RyvePool",
+      "organizationSlug": "ryvepool",
+      "organizationStatus": "Active",
+      "planCode": "starter",
+      "planName": "Starter",
+      "billingCycle": "annual",
+      "billingStatus": "active",
+      "displayStatus": "active",
+      "provider": "manual",
+      "cancelAtPeriodEnd": false,
+      "currentPeriodStart": "2026-07-17T01:46:08Z",
+      "currentPeriodEnd": "2027-07-17T01:46:08Z",
+      "stripeCustomerId": null,
+      "stripeSubscriptionId": null,
+      "monthlyRecurringRevenue": 32.5,
+      "currency": "CAD",
+      "monthlyChecklistLimit": 100,
+      "storageBytesLimit": 5368709120,
+      "organizationUpdatedAt": "2026-07-16T04:39:41.631599Z"
+    }
+  ],
+  "page": 1,
+  "pageSize": 25,
+  "total": 1
+}
+```
+
+If `cancelAtPeriodEnd` is true, `displayStatus` is `canceling` while the raw `billingStatus` can still be `active`. MRR continues until `currentPeriodEnd`; historical revenue events remain.
 
 ### GET `/v1/platform/revenue-events/{id}`
 
@@ -990,10 +1044,10 @@ Default range is last 30 days.
   "failedNotifications": 1,
   "usageQuantityInPeriod": 640,
   "revenueInPeriod": [
-    { "currency": "USD", "amount": 14320.00 }
+    { "currency": "CAD", "amount": 14320.00 }
   ],
   "revenueAllTime": [
-    { "currency": "USD", "amount": 58200.00 }
+    { "currency": "CAD", "amount": 58200.00 }
   ]
 }
 ```

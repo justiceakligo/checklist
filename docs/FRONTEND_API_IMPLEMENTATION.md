@@ -376,7 +376,7 @@ Use for pricing UI.
       "description": "Try Reqara on real requests.",
       "monthlyPriceCents": 0,
       "annualPriceCents": 0,
-      "currency": "USD",
+      "currency": "CAD",
       "monthlyChecklistLimit": 10,
       "storageBytes": 524288000,
       "customPricing": false,

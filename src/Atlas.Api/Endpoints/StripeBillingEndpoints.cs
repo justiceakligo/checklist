@@ -109,7 +109,8 @@ internal static class StripeBillingEndpoints
                         ["message"] = $"This workspace is already on the {plan.Name} {billingCycle} plan.",
                         ["planCode"] = plan.Code,
                         ["billingCycle"] = billingCycle,
-                        ["billing"] = currentBilling
+                        ["billing"] = currentBilling,
+                        ["canManageBilling"] = !string.IsNullOrWhiteSpace(currentBilling.StripeCustomerId)
                     });
             }
 
@@ -787,6 +788,27 @@ internal static class StripeBillingEndpoints
         };
 
         await UpsertOrganizationBillingStateAsync(dbContext, clock, organizationId.Value, state, cancellationToken);
+
+        var amountTotal = GetLong(session, "amount_total").GetValueOrDefault();
+        var sessionId = GetString(session, "id");
+        if (isPaid && amountTotal > 0 && !string.IsNullOrWhiteSpace(sessionId))
+        {
+            await AddRevenueEventIfMissingAsync(
+                dbContext,
+                clock,
+                $"checkout_session:{sessionId}",
+                organizationId.Value,
+                PlatformRevenueEventType.Subscription,
+                amountTotal / 100m,
+                GetString(session, "currency")?.ToUpperInvariant() ?? "USD",
+                sessionId,
+                state.CurrentPeriodStart,
+                state.CurrentPeriodEnd,
+                "checkout.session.sync",
+                session,
+                cancellationToken);
+        }
+
         return state;
     }
 
@@ -966,6 +988,7 @@ internal static class StripeBillingEndpoints
         CancellationToken cancellationToken)
     {
         var externalReference = $"stripe:{stripeEventId}";
+        var normalizedCurrency = currency.Length == 3 ? currency : "USD";
         var exists = await dbContext.PlatformRevenueEvents.IgnoreQueryFilters()
             .AnyAsync(item => item.ExternalReference == externalReference, cancellationToken);
         if (exists)
@@ -973,12 +996,29 @@ internal static class StripeBillingEndpoints
             return;
         }
 
+        if (type == PlatformRevenueEventType.Subscription && periodStart.HasValue && periodEnd.HasValue)
+        {
+            var matchingPeriodExists = await dbContext.PlatformRevenueEvents.IgnoreQueryFilters()
+                .AnyAsync(item => item.OrganizationId == organizationId
+                    && item.Type == PlatformRevenueEventType.Subscription
+                    && item.Source == "stripe"
+                    && item.Amount == amount
+                    && item.Currency == normalizedCurrency
+                    && item.PeriodStart == periodStart
+                    && item.PeriodEnd == periodEnd,
+                    cancellationToken);
+            if (matchingPeriodExists)
+            {
+                return;
+            }
+        }
+
         dbContext.PlatformRevenueEvents.Add(new PlatformRevenueEvent
         {
             OrganizationId = organizationId,
             Type = type,
             Amount = amount,
-            Currency = currency.Length == 3 ? currency : "USD",
+            Currency = normalizedCurrency,
             Source = "stripe",
             ExternalReference = externalReference,
             OccurredAt = clock.UtcNow,
@@ -1071,9 +1111,6 @@ internal static class StripeBillingEndpoints
         string requestedBillingCycle)
     {
         return IsActiveSubscriptionStatus(currentBilling.Status)
-            && string.Equals(currentBilling.Provider, "stripe", StringComparison.OrdinalIgnoreCase)
-            && !string.IsNullOrWhiteSpace(currentBilling.StripeCustomerId)
-            && !string.IsNullOrWhiteSpace(currentBilling.StripeSubscriptionId)
             && string.Equals(currentBilling.PlanCode, requestedPlanCode, StringComparison.OrdinalIgnoreCase)
             && string.Equals(NormalizeBillingCycle(currentBilling.BillingCycle), requestedBillingCycle, StringComparison.OrdinalIgnoreCase);
     }

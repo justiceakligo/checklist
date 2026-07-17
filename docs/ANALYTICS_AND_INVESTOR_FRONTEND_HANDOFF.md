@@ -437,7 +437,7 @@ Response:
     "description": "For solo pros and small teams.",
     "monthlyPriceCents": 3900,
     "annualPriceCents": 39000,
-    "currency": "USD",
+    "currency": "CAD",
     "monthlyChecklistLimit": 100,
     "storageBytes": 5368709120,
     "customPricing": false,
@@ -612,7 +612,7 @@ Definitions:
 
 - `activatedOrganizations`: organizations that sent at least one checklist in that interval.
 - `activeOrganizations`: same as activated for Phase 1.
-- `payingOrganizations`: populated from Stripe/manual platform revenue events when available.
+- `payingOrganizations`: populated from active billing state. Manual/admin-granted and Stripe-backed paid plans both count while active.
 
 ### GET `/v1/platform/analytics/activation`
 
@@ -694,14 +694,14 @@ Response:
   "trialToPaidConversionRate": null,
   "revenueByCurrency": [
     {
-      "currency": "USD",
+      "currency": "CAD",
       "amount": 28450
     }
   ]
 }
 ```
 
-Revenue comes from `platform_revenue_events`. Stripe subscription webhooks now write these automatically, and platform admins can still add manual adjustments/imports.
+MRR and ARR come from current billing state normalized to monthly recurring value. `revenueByCurrency` comes from `platform_revenue_events` as the cash/payment ledger. Stripe subscription webhooks and successful Checkout session verification write revenue events automatically, and platform admins can still add manual adjustments/imports.
 
 ### GET `/v1/platform/analytics/retention/cohorts`
 

@@ -1746,13 +1746,68 @@ public static class PlatformEndpoints
             var normalizedPage = EndpointHelpers.NormalizePage(page);
             var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
             var total = await query.CountAsync(cancellationToken);
-            var events = await query
+            var rawEvents = await query
                 .OrderByDescending(item => item.OccurredAt)
                 .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
                 .Take(normalizedPageSize)
-                .Select(item => ToRevenueResponse(item))
                 .ToListAsync(cancellationToken);
+            var organizationLookup = await LoadOrganizationLookupAsync(
+                dbContext,
+                rawEvents.Select(item => item.OrganizationId),
+                cancellationToken);
+            var events = rawEvents
+                .Select(item => ToRevenueResponse(item, FindOrganizationLookup(organizationLookup, item.OrganizationId)))
+                .ToList();
             return Results.Ok(new { items = events, page = normalizedPage, pageSize = normalizedPageSize, total });
+        });
+
+        group.MapGet("/billing/subscriptions", async (
+            int? page,
+            int? pageSize,
+            string? status,
+            string? planCode,
+            string? provider,
+            AtlasDbContext dbContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, FinanceRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var organizations = await dbContext.Organizations.IgnoreQueryFilters().AsNoTracking()
+                .Where(item => item.DeletedAt == null)
+                .OrderBy(item => item.Name)
+                .ToListAsync(cancellationToken);
+            var rows = new List<PlatformBillingSubscriptionResponse>();
+            foreach (var organization in organizations)
+            {
+                var snapshot = await entitlements.GetOrganizationEntitlementsAsync(organization.Id, clock.UtcNow, cancellationToken);
+                if (!MatchesSubscriptionFilter(snapshot, status, planCode, provider))
+                {
+                    continue;
+                }
+
+                rows.Add(ToBillingSubscriptionResponse(organization, snapshot, clock.UtcNow));
+            }
+
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var total = rows.Count;
+            return Results.Ok(new
+            {
+                items = rows
+                    .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                    .Take(normalizedPageSize)
+                    .ToList(),
+                page = normalizedPage,
+                pageSize = normalizedPageSize,
+                total
+            });
         });
 
         group.MapPost("/revenue-events", async (
@@ -1796,7 +1851,8 @@ public static class PlatformEndpoints
             dbContext.PlatformRevenueEvents.Add(revenueEvent);
             AddPlatformAudit(dbContext, access.Staff.Id, "platform.revenue_event_created", new { revenueEvent.Id, revenueEvent.OrganizationId, revenueEvent.Type, revenueEvent.Amount, revenueEvent.Currency }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Created($"/v1/platform/revenue-events/{revenueEvent.Id}", ToRevenueResponse(revenueEvent));
+            var organizationLookup = await LoadOrganizationLookupAsync(dbContext, [revenueEvent.OrganizationId], cancellationToken);
+            return Results.Created($"/v1/platform/revenue-events/{revenueEvent.Id}", ToRevenueResponse(revenueEvent, FindOrganizationLookup(organizationLookup, revenueEvent.OrganizationId)));
         });
 
         group.MapGet("/revenue-events/{id:guid}", async (
@@ -1813,9 +1869,13 @@ public static class PlatformEndpoints
 
             var revenueEvent = await dbContext.PlatformRevenueEvents.IgnoreQueryFilters().AsNoTracking()
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
-            return revenueEvent is null
-                ? EndpointHelpers.Problem("not_found", "Revenue event was not found.", StatusCodes.Status404NotFound)
-                : Results.Ok(ToRevenueResponse(revenueEvent));
+            if (revenueEvent is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Revenue event was not found.", StatusCodes.Status404NotFound);
+            }
+
+            var organizationLookup = await LoadOrganizationLookupAsync(dbContext, [revenueEvent.OrganizationId], cancellationToken);
+            return Results.Ok(ToRevenueResponse(revenueEvent, FindOrganizationLookup(organizationLookup, revenueEvent.OrganizationId)));
         });
 
         group.MapPut("/revenue-events/{id:guid}", async (
@@ -1862,7 +1922,8 @@ public static class PlatformEndpoints
 
             AddPlatformAudit(dbContext, access.Staff!.Id, "platform.revenue_event_updated", new { revenueEvent.Id, revenueEvent.OrganizationId, revenueEvent.Type, revenueEvent.Amount, revenueEvent.Currency }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Ok(ToRevenueResponse(revenueEvent));
+            var organizationLookup = await LoadOrganizationLookupAsync(dbContext, [revenueEvent.OrganizationId], cancellationToken);
+            return Results.Ok(ToRevenueResponse(revenueEvent, FindOrganizationLookup(organizationLookup, revenueEvent.OrganizationId)));
         });
 
         group.MapDelete("/revenue-events/{id:guid}", async (
@@ -2708,7 +2769,124 @@ public static class PlatformEndpoints
             interest.RejectedAt);
     }
 
-    private static PlatformRevenueEventResponse ToRevenueResponse(PlatformRevenueEvent revenueEvent)
+    private sealed record PlatformOrganizationLookup(string Name, string Slug);
+
+    private static async Task<IReadOnlyDictionary<Guid, PlatformOrganizationLookup>> LoadOrganizationLookupAsync(
+        AtlasDbContext dbContext,
+        IEnumerable<Guid?> organizationIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = organizationIds
+            .Where(item => item.HasValue)
+            .Select(item => item!.Value)
+            .Distinct()
+            .ToArray();
+        if (ids.Length == 0)
+        {
+            return new Dictionary<Guid, PlatformOrganizationLookup>();
+        }
+
+        return await dbContext.Organizations.IgnoreQueryFilters().AsNoTracking()
+            .Where(item => ids.Contains(item.Id))
+            .Select(item => new
+            {
+                item.Id,
+                item.Name,
+                item.Slug
+            })
+            .ToDictionaryAsync(
+                item => item.Id,
+                item => new PlatformOrganizationLookup(item.Name, item.Slug),
+                cancellationToken);
+    }
+
+    private static PlatformOrganizationLookup? FindOrganizationLookup(
+        IReadOnlyDictionary<Guid, PlatformOrganizationLookup> lookup,
+        Guid? organizationId)
+    {
+        return organizationId.HasValue && lookup.TryGetValue(organizationId.Value, out var organization)
+            ? organization
+            : null;
+    }
+
+    private static bool MatchesSubscriptionFilter(
+        OrganizationEntitlementSnapshot snapshot,
+        string? status,
+        string? planCode,
+        string? provider)
+    {
+        var displayStatus = BillingDisplayStatus(snapshot.Billing);
+        return (string.IsNullOrWhiteSpace(status)
+                || string.Equals(snapshot.Billing.Status, status.Trim(), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(displayStatus, status.Trim(), StringComparison.OrdinalIgnoreCase))
+            && (string.IsNullOrWhiteSpace(planCode)
+                || string.Equals(snapshot.Plan.Code, planCode.Trim(), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(snapshot.Billing.PlanCode, planCode.Trim(), StringComparison.OrdinalIgnoreCase))
+            && (string.IsNullOrWhiteSpace(provider)
+                || string.Equals(snapshot.Billing.Provider, provider.Trim(), StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static PlatformBillingSubscriptionResponse ToBillingSubscriptionResponse(
+        Organization organization,
+        OrganizationEntitlementSnapshot snapshot,
+        DateTimeOffset asOf)
+    {
+        var hasRevenue = HasActiveRecurringRevenue(snapshot, asOf);
+        return new PlatformBillingSubscriptionResponse(
+            organization.Id,
+            organization.Name,
+            organization.Slug,
+            organization.Status,
+            snapshot.Billing.PlanCode,
+            snapshot.Plan.Name,
+            snapshot.Billing.BillingCycle,
+            snapshot.Billing.Status,
+            BillingDisplayStatus(snapshot.Billing),
+            snapshot.Billing.Provider,
+            snapshot.Billing.CancelAtPeriodEnd,
+            snapshot.Billing.CurrentPeriodStart,
+            snapshot.Billing.CurrentPeriodEnd,
+            snapshot.Billing.StripeCustomerId,
+            snapshot.Billing.StripeSubscriptionId,
+            hasRevenue ? Math.Round(MonthlyRecurringRevenue(snapshot.Plan, snapshot.Billing), 2) : null,
+            snapshot.Plan.Currency,
+            snapshot.Plan.MonthlyChecklistLimit,
+            snapshot.Plan.StorageBytes,
+            organization.UpdatedAt);
+    }
+
+    private static string BillingDisplayStatus(OrganizationBillingState billing)
+    {
+        return billing.CancelAtPeriodEnd && billing.Status.Trim().ToLowerInvariant() is "active" or "trialing" or "past_due"
+            ? "canceling"
+            : billing.Status;
+    }
+
+    private static bool HasActiveRecurringRevenue(OrganizationEntitlementSnapshot snapshot, DateTimeOffset asOf)
+    {
+        if (MonthlyRecurringRevenue(snapshot.Plan, snapshot.Billing) <= 0)
+        {
+            return false;
+        }
+
+        if (snapshot.Billing.Status.Trim().ToLowerInvariant() is not ("active" or "trialing" or "past_due"))
+        {
+            return false;
+        }
+
+        return !snapshot.Billing.CurrentPeriodEnd.HasValue || snapshot.Billing.CurrentPeriodEnd.Value > asOf;
+    }
+
+    private static decimal MonthlyRecurringRevenue(BillingPlan plan, OrganizationBillingState billing)
+    {
+        return billing.BillingCycle.Trim().ToLowerInvariant() is "annual" or "yearly" or "year"
+            ? (plan.AnnualPriceCents ?? 0) / 1200m
+            : (plan.MonthlyPriceCents ?? 0) / 100m;
+    }
+
+    private static PlatformRevenueEventResponse ToRevenueResponse(
+        PlatformRevenueEvent revenueEvent,
+        PlatformOrganizationLookup? organization)
     {
         return new PlatformRevenueEventResponse(
             revenueEvent.Id,
@@ -2724,7 +2902,9 @@ public static class PlatformEndpoints
             JsonSerializer.Deserialize<JsonElement>(revenueEvent.MetadataJson, EndpointHelpers.JsonOptions),
             revenueEvent.RecordedByStaffId,
             revenueEvent.CreatedAt,
-            revenueEvent.UpdatedAt);
+            revenueEvent.UpdatedAt,
+            organization?.Name,
+            organization?.Slug);
     }
 
     private static string[] NormalizePlatformApiKeyScopes(
@@ -3043,7 +3223,31 @@ public sealed record PlatformRevenueEventResponse(
     JsonElement Metadata,
     Guid? RecordedByStaffId,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? OrganizationName,
+    string? OrganizationSlug);
+
+public sealed record PlatformBillingSubscriptionResponse(
+    Guid OrganizationId,
+    string OrganizationName,
+    string OrganizationSlug,
+    OrganizationStatus OrganizationStatus,
+    string PlanCode,
+    string PlanName,
+    string BillingCycle,
+    string BillingStatus,
+    string DisplayStatus,
+    string Provider,
+    bool CancelAtPeriodEnd,
+    DateTimeOffset? CurrentPeriodStart,
+    DateTimeOffset? CurrentPeriodEnd,
+    string? StripeCustomerId,
+    string? StripeSubscriptionId,
+    decimal? MonthlyRecurringRevenue,
+    string Currency,
+    int? MonthlyChecklistLimit,
+    long? StorageBytesLimit,
+    DateTimeOffset OrganizationUpdatedAt);
 
 public sealed record RevenueByCurrency(string Currency, decimal Amount);
 

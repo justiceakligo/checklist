@@ -73,8 +73,8 @@ Important: only `usageQuantityInPeriod` and `revenueInPeriod` are period-based t
 | Qualified leads | `interestsQualified` | Current state | Interested organizations with status `Qualified`. |
 | Files pending scan | `filesPendingScan` | Current state | Uploaded file assets still waiting for scan result. |
 | Failed notifications | `failedNotifications` | All time/current rows | Notification delivery rows with status `Failed`. These may include old failures. |
-| Revenue | `revenueInPeriod` | Selected period | Manual revenue events grouped by currency for selected range. Empty means no recorded revenue events. |
-| Revenue all time | `revenueAllTime` | All time | Manual revenue events grouped by currency across all time. |
+| Revenue | `revenueInPeriod` | Selected period | Stripe and manual revenue events grouped by currency for selected range. Empty means no recorded revenue events in that range. |
+| Revenue all time | `revenueAllTime` | All time | Stripe and manual revenue events grouped by currency across all time. |
 
 ## Why Current Production Shows 3 Created And 0 Sent
 
@@ -244,6 +244,7 @@ Revenue drill-in:
 
 ```text
 GET /v1/platform/revenue-events?page=1&pageSize=25&from=&to=
+GET /v1/platform/billing/subscriptions?page=1&pageSize=25
 ```
 
 Audit drill-in:
@@ -257,5 +258,6 @@ GET /v1/platform/audit?page=1&pageSize=25
 - There is no platform-wide action list endpoint yet. The overview can show counts, but cannot drill into all checklist records from one platform endpoint today.
 - `failedNotifications` is not an unresolved-alert count. It is a count of failed notification delivery rows.
 - `submissionsAccepted` is not period-scoped today.
-- Revenue comes from Stripe subscription webhooks and any manual platform revenue records.
+- Revenue events come from Stripe subscription webhooks, successful Checkout session verification, and any manual platform revenue records.
+- Use `GET /v1/platform/billing/subscriptions` for current subscription/cancellation state and normalized MRR.
 - The metrics endpoint does not return action status breakdown. If the UI wants to explain why total checklists is greater than in-flight, use helper copy or request a backend enhancement.
