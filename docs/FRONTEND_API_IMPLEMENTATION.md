@@ -1315,6 +1315,8 @@ Recipient-safe polling endpoint for scan state. If the file is still `Pending` a
 
 The recipient cannot submit while attached files are `Pending` or `Rejected`; submit returns `409 file_not_available`.
 
+If an upload intent is created but the file never reaches storage, the backend worker leaves it `Pending` during the upload grace window and then marks it `Rejected` with `scanStatus: "Rejected"`. Frontend should show retry/upload-new for `Rejected` files.
+
 ### DELETE `/v1/recipient/uploads/{fileId}`
 
 Deletes a draft upload.

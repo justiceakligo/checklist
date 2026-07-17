@@ -291,6 +291,7 @@ publicContact.toEmail = "hello@nextronyx.com"
 fileScanning.mode = "clamav"
 fileScanning.timeoutSeconds = 30
 fileScanning.dispatchIntervalSeconds = 30
+fileScanning.missingUploadGraceMinutes = 15
 security.recipientTokenGraceDays = 30
 security.otpMinutes = 10
 security.otpResendCooldownSeconds = 60

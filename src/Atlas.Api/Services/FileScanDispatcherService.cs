@@ -63,6 +63,18 @@ public sealed class FileScanDispatcherService(
             var metadata = await storage.GetObjectMetadataAsync(file.StorageKey, cancellationToken);
             if (metadata is null)
             {
+                var missingUploadGraceMinutes = EndpointHelpers.ReadPositiveIntSetting(
+                    (await settings.GetAsync(file.OrganizationId, "fileScanning", "missingUploadGraceMinutes", cancellationToken))?.ValueJson
+                        ?? (await settings.GetAsync(null, "fileScanning", "missingUploadGraceMinutes", cancellationToken))?.ValueJson,
+                    15);
+                if (file.CreatedAt <= clock.UtcNow.AddMinutes(-missingUploadGraceMinutes))
+                {
+                    file.ScanStatus = FileScanStatus.Rejected;
+                    file.ScanEngine = "upload-missing";
+                    file.ScanCompletedAt = clock.UtcNow;
+                    AddScanAudit(dbContext, file, clock);
+                }
+
                 continue;
             }
 
