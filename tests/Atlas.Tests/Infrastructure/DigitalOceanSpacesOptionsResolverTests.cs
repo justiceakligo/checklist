@@ -1,4 +1,5 @@
 using Atlas.Application.Abstractions;
+using Atlas.Application.Storage;
 using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
@@ -73,6 +74,32 @@ public sealed class DigitalOceanSpacesOptionsResolverTests
         Assert.Equal("fallback-bucket", options.BucketName);
         Assert.Equal("fallback-access", options.AccessKey);
         Assert.Equal("fallback-secret", options.SecretKey);
+    }
+
+    [Fact]
+    public async Task CreateUploadUrlAsync_uses_digitalocean_service_url_for_presigned_uploads()
+    {
+        await using var dbContext = CreateContext();
+        dbContext.AdminSettings.AddRange(
+            Setting("ServiceUrl", "\"https://tor1.digitaloceanspaces.com\""),
+            Setting("Region", "\"tor1\""),
+            Setting("BucketName", "\"reqara-bucket\""),
+            Setting("AccessKey", "\"db-access-key\"", isSecret: true),
+            Setting("SecretKey", "\"db-secret-key\"", isSecret: true),
+            Setting("ForcePathStyle", "false"));
+        await dbContext.SaveChangesAsync();
+
+        var resolver = new DigitalOceanSpacesOptionsResolver(
+            dbContext,
+            Options.Create(new DigitalOceanSpacesOptions()));
+        var service = new DigitalOceanSpacesStorageService(resolver, new TestClock());
+
+        var response = await service.CreateUploadUrlAsync(
+            new PresignedUploadRequest("quarantine/test.png", "image/png", 1024, TimeSpan.FromMinutes(10)),
+            CancellationToken.None);
+
+        Assert.Equal("reqara-bucket.tor1.digitaloceanspaces.com", response.UploadUrl.Host);
+        Assert.DoesNotContain("amazonaws.com", response.UploadUrl.Host, StringComparison.OrdinalIgnoreCase);
     }
 
     private static AdminSetting Setting(string key, string valueJson, bool isSecret = false)

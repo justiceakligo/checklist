@@ -1,4 +1,3 @@
-using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -118,10 +117,9 @@ public sealed class DigitalOceanSpacesStorageService(
     {
         var config = new AmazonS3Config
         {
-            ServiceURL = options.ServiceUrl,
+            ServiceURL = options.ServiceUrl.Trim().TrimEnd('/'),
             ForcePathStyle = options.ForcePathStyle,
-            AuthenticationRegion = options.Region,
-            RegionEndpoint = RegionEndpoint.GetBySystemName(options.Region)
+            AuthenticationRegion = options.Region
         };
 
         return new AmazonS3Client(
