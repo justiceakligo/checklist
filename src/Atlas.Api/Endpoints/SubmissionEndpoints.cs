@@ -1,10 +1,14 @@
 using System.Text.Json;
+using Atlas.Api.Email;
 using Atlas.Application.Abstractions;
+using Atlas.Application.Email;
+using Atlas.Application.Settings;
 using Atlas.Application.Storage;
 using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
+using System.Globalization;
 
 namespace Atlas.Api.Endpoints;
 
@@ -169,6 +173,10 @@ public static class SubmissionEndpoints
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             IAtlasClock clock,
+            IAdminSettingService settings,
+            IEmailService emailService,
+            IConfiguration configuration,
+            ISecretHasher secretHasher,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -179,6 +187,10 @@ public static class SubmissionEndpoints
                 dbContext,
                 tenantContext,
                 clock,
+                settings,
+                emailService,
+                configuration,
+                secretHasher,
                 httpContext,
                 cancellationToken);
         });
@@ -189,6 +201,10 @@ public static class SubmissionEndpoints
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             IAtlasClock clock,
+            IAdminSettingService settings,
+            IEmailService emailService,
+            IConfiguration configuration,
+            ISecretHasher secretHasher,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -199,6 +215,10 @@ public static class SubmissionEndpoints
                 dbContext,
                 tenantContext,
                 clock,
+                settings,
+                emailService,
+                configuration,
+                secretHasher,
                 httpContext,
                 cancellationToken);
         });
@@ -298,6 +318,10 @@ public static class SubmissionEndpoints
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
         IAtlasClock clock,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IConfiguration configuration,
+        ISecretHasher secretHasher,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -312,41 +336,190 @@ public static class SubmissionEndpoints
 
         var submission = await dbContext.Submissions
             .Include(item => item.Action)
+            .ThenInclude(action => action!.Organization)
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.CreatedByUser)
+            .Include(item => item.ActionRecipient)
             .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
-        if (submission?.Action is null)
+        if (submission?.Action?.Organization is null || submission.Action.CreatedByUser is null || submission.ActionRecipient is null)
         {
             return EndpointHelpers.Problem("not_found", "Submission was not found.", StatusCodes.Status404NotFound);
         }
 
-        if (submission.Status != SubmissionStatus.Submitted)
+        if (status == SubmissionStatus.Accepted && submission.Status != SubmissionStatus.Submitted)
         {
             return EndpointHelpers.Problem("state_conflict", "Only submitted packages can be reviewed.", StatusCodes.Status409Conflict);
         }
 
+        if (status == SubmissionStatus.ChangesRequested
+            && submission.Status is not (SubmissionStatus.Submitted or SubmissionStatus.ChangesRequested))
+        {
+            return EndpointHelpers.Problem("state_conflict", "Only submitted packages or existing change requests can be sent back to recipients.", StatusCodes.Status409Conflict);
+        }
+
+        var now = clock.UtcNow;
+        var wasAlreadyChangesRequested = submission.Status == SubmissionStatus.ChangesRequested;
         submission.Status = status;
-        submission.ReviewedAt = clock.UtcNow;
+        submission.ReviewedAt = now;
         submission.ReviewedByUserId = tenantContext.UserId;
         submission.ReviewComment = comment;
         if (status == SubmissionStatus.Accepted)
         {
             submission.Action.Status = ChecklistActionStatus.Completed;
-            submission.Action.CompletedAt = clock.UtcNow;
+            submission.Action.CompletedAt = now;
+            submission.Action.UpdatedAt = now;
+            SecurityEndpoints.AddAudit(dbContext, organizationId, submission.ActionId, tenantContext, "submission.accepted", new { submission.Id, submission.VersionNumber }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Results.Ok(ToSummary(submission));
         }
 
-        var eventType = status == SubmissionStatus.Accepted
-            ? "submission.accepted"
-            : "submission.changes_requested";
-        SecurityEndpoints.AddAudit(dbContext, organizationId, submission.ActionId, tenantContext, eventType, new { submission.Id, submission.VersionNumber }, httpContext);
+        submission.Action.Status = ChecklistActionStatus.InProgress;
+        submission.Action.CompletedAt = null;
+        submission.Action.UpdatedAt = now;
+        submission.ActionRecipient.Status = ActionRecipientStatus.Started;
+        submission.ActionRecipient.LastActivityAt = now;
+
+        var graceDaysSetting = await settings.GetAsync(organizationId, "security", "recipientTokenGraceDays", cancellationToken)
+            ?? await settings.GetAsync(organizationId, "security", "recipientTokenDays", cancellationToken);
+        var graceDays = EndpointHelpers.ReadPositiveIntSetting(graceDaysSetting?.ValueJson, 30);
+        submission.Action.ExpiresAt = ResolveRecipientLinkExpiry(submission.Action.DueAt, submission.Action.ExpiresAt, now, graceDays);
+
+        var rawToken = EndpointHelpers.NewOpaqueToken();
+        submission.ActionRecipient.AccessTokenHash = secretHasher.HashSecret(rawToken);
+        submission.ActionRecipient.TokenExpiresAt = submission.Action.ExpiresAt;
+        submission.ActionRecipient.OtpCodeHash = null;
+        submission.ActionRecipient.OtpExpiresAt = null;
+        submission.ActionRecipient.OtpAttemptCount = 0;
+
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            organizationId,
+            submission.ActionId,
+            tenantContext,
+            wasAlreadyChangesRequested ? "submission.changes_requested_updated" : "submission.changes_requested",
+            new { submission.Id, submission.VersionNumber },
+            httpContext);
         await dbContext.SaveChangesAsync(cancellationToken);
 
-        return Results.Ok(new SubmissionSummaryResponse(
+        var recipientLink = await EndpointHelpers.BuildRecipientLinkAsync(
+            settings,
+            configuration,
+            organizationId,
+            httpContext,
+            rawToken,
+            cancellationToken);
+        var email = TransactionalEmailTemplates.SubmissionChangesRequested(
+            FirstName(submission.ActionRecipient.Name),
+            submission.Action.CreatedByUser.FullName,
+            submission.Action.Organization.Name,
+            submission.Action.Title,
+            submission.Action.PublicReference,
+            comment,
+            FormatDate(submission.ActionRecipient.TokenExpiresAt),
+            recipientLink);
+        var send = await emailService.SendAsync(
+            submission.ActionRecipient.Email,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            $"{submission.Action.Organization.Name} via Reqara",
+            cancellationToken,
+            new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "recipient-changes-requested",
+                ["X-Atlas-Action-Id"] = submission.ActionId.ToString(),
+                ["X-Atlas-Recipient-Id"] = submission.ActionRecipientId.ToString(),
+                ["X-Atlas-Submission-Id"] = submission.Id.ToString()
+            },
+            submission.Action.CreatedByUser.Email);
+
+        AddNotificationDelivery(dbContext, organizationId, submission.ActionRecipientId, "recipient_changes_requested", send, clock);
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            organizationId,
+            submission.ActionId,
+            tenantContext,
+            send.Sent ? "recipient.changes_requested_sent" : "recipient.changes_requested_send_failed",
+            new
+            {
+                submission.Id,
+                submission.VersionNumber,
+                TokenPrefix = EndpointHelpers.TokenLogPrefix(rawToken),
+                send.MessageId,
+                send.Error
+            },
+            httpContext);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return send.Sent
+            ? Results.Ok(ToSummary(submission))
+            : EndpointHelpers.Problem("email_send_failed", "Change request email could not be sent. The request is saved and can be resent.", StatusCodes.Status503ServiceUnavailable);
+    }
+
+    private static DateTimeOffset ResolveRecipientLinkExpiry(DateTimeOffset? dueAt, DateTimeOffset? currentExpiresAt, DateTimeOffset now, int graceDays)
+    {
+        if (currentExpiresAt is not null && currentExpiresAt > now)
+        {
+            return currentExpiresAt.Value;
+        }
+
+        var baseDate = dueAt is not null && dueAt > now ? dueAt.Value : now;
+        return baseDate.AddDays(graceDays);
+    }
+
+    private static void AddNotificationDelivery(
+        AtlasDbContext dbContext,
+        Guid organizationId,
+        Guid recipientId,
+        string templateKey,
+        EmailSendResult result,
+        IAtlasClock clock)
+    {
+        dbContext.NotificationDeliveries.Add(new NotificationDelivery
+        {
+            OrganizationId = organizationId,
+            ActionRecipientId = recipientId,
+            Channel = DeliveryChannel.Email,
+            TemplateKey = templateKey,
+            ProviderMessageId = result.MessageId,
+            Status = result.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+            ErrorCode = Truncate(result.Error, 100),
+            SentAt = result.Sent ? clock.UtcNow : null,
+            DeliveredAt = result.Sent ? clock.UtcNow : null,
+            CreatedAt = clock.UtcNow
+        });
+    }
+
+    private static SubmissionSummaryResponse ToSummary(Submission submission)
+    {
+        return new SubmissionSummaryResponse(
             submission.Id,
             submission.ActionId,
             submission.ActionRecipientId,
             submission.VersionNumber,
             submission.Status,
             submission.SubmittedAt,
-            submission.ReviewedAt));
+            submission.ReviewedAt);
+    }
+
+    private static string FirstName(string fullName)
+    {
+        var trimmed = fullName.Trim();
+        var space = trimmed.IndexOf(' ', StringComparison.Ordinal);
+        return space > 0 ? trimmed[..space] : trimmed;
+    }
+
+    private static string FormatDate(DateTimeOffset? value)
+    {
+        return value is null
+            ? "Not set"
+            : value.Value.ToString("MMMM d, yyyy", CultureInfo.InvariantCulture);
+    }
+
+    private static string? Truncate(string? value, int maxLength)
+    {
+        return value is null || value.Length <= maxLength ? value : value[..maxLength];
     }
 }
 

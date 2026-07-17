@@ -386,6 +386,62 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail("Your Reqara checklist link", text, html);
     }
 
+    public static TransactionalEmail SubmissionChangesRequested(
+        string recipientFirstName,
+        string senderFullName,
+        string organizationName,
+        string checklistTitle,
+        string publicReference,
+        string? comment,
+        string expiresAt,
+        string link)
+    {
+        var safeFirstName = CleanName(recipientFirstName, "there");
+        var safeSender = CleanName(senderFullName, "The sender");
+        var safeOrganization = CleanName(organizationName, "the organization");
+        var safeTitle = CleanName(checklistTitle, "your checklist");
+        var safePublicReference = CleanName(publicReference, "Not set");
+        var safeComment = CleanName(comment, string.Empty);
+        var safeExpiresAt = CleanName(expiresAt, "Not set");
+        var url = link.Trim();
+
+        var noteText = string.IsNullOrWhiteSpace(safeComment)
+            ? string.Empty
+            : $"Requested change:\n{safeComment}\n\n";
+        var text =
+            $"Hi {safeFirstName},\n\n" +
+            $"{safeSender} at {safeOrganization} reviewed \"{safeTitle}\" and requested a change.\n\n" +
+            noteText +
+            $"Return to your secure checklist:\n{url}\n\n" +
+            $"Reference: {safePublicReference}\n" +
+            $"This private link expires on {safeExpiresAt}. Please do not forward it.\n\n" +
+            $"If you have questions, reply to this email to reach {safeSender} directly.";
+
+        var details = new List<string>
+        {
+            $"<strong>Checklist:</strong> {Html(safeTitle)}",
+            $"<strong>Reference:</strong> {Html(safePublicReference)}",
+            $"<strong>Expires:</strong> {Html(safeExpiresAt)}"
+        };
+        if (!string.IsNullOrWhiteSpace(safeComment))
+        {
+            details.Add($"<strong>Requested change:</strong><br><span style=\"white-space:pre-line\">{Html(safeComment)}</span>");
+        }
+
+        details.Add($"Fallback link: <a href=\"{HtmlAttribute(url)}\" style=\"color:#2563eb;word-break:break-all\">{Html(url)}</a>");
+
+        var html = BuildLayout(
+            "Changes requested",
+            $"Hi {Html(safeFirstName)},",
+            $"{Html(safeSender)} at {Html(safeOrganization)} reviewed <strong>{Html(safeTitle)}</strong> and requested a change.",
+            "Return to checklist",
+            url,
+            details,
+            "This link is private to you. If you have questions, reply to this email to reach the sender directly.");
+
+        return new TransactionalEmail($"Changes requested for {safeTitle}", text, html);
+    }
+
     public static TransactionalEmail RecipientContactOrganization(
         string recipientName,
         string recipientEmail,
