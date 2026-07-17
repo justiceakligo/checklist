@@ -8,6 +8,12 @@ This file documents the implemented full analytics API surface for:
 - Investor reports.
 - Event tracking.
 
+Dedicated benchmarking handoff:
+
+```text
+docs/BENCHMARKING_ORG_ADMIN_FRONTEND_HANDOFF.md
+```
+
 Production API origin:
 
 ```text
@@ -84,7 +90,7 @@ All requested phases now have concrete endpoints:
 | Vertical intelligence | `GET /v1/platform/analytics/segments` |
 | Time-saved estimates | `GET /v1/platform/analytics/time-saved` |
 | Predictive insights | `GET /v1/platform/analytics/predictive-insights` |
-| Benchmarking | `GET /v1/platform/analytics/benchmarks` |
+| Benchmarking | `GET /v1/analytics/benchmarks`, `GET /v1/platform/analytics/benchmarks` |
 
 Some advanced metrics return `null` where Reqara does not yet have a trusted data source. Do not substitute fake values in the UI.
 

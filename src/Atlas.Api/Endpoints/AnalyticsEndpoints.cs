@@ -18,6 +18,9 @@ public static class AnalyticsEndpoints
     private static readonly PlatformStaffRole[] InvestorRoles =
         [PlatformStaffRole.Owner, PlatformStaffRole.Admin, PlatformStaffRole.Finance];
 
+    private const int MinimumBenchmarkCohortSize = 5;
+    private const string BenchmarkPrivacyNote = "Benchmarks are anonymized and aggregated. Reqara never exposes another organization's name, recipient, checklist, file, or raw activity to a customer dashboard.";
+
     public static IEndpointRouteBuilder MapAtlasAnalyticsEndpoints(this IEndpointRouteBuilder app)
     {
         var v1 = app.MapGroup("/v1");
@@ -30,6 +33,7 @@ public static class AnalyticsEndpoints
         organization.MapGet("/reminders", GetOrganizationReminderAnalytics);
         organization.MapGet("/recipient-experience", GetOrganizationRecipientExperience);
         organization.MapGet("/compliance", GetOrganizationCompliance);
+        organization.MapGet("/benchmarks", GetOrganizationBenchmarks);
         organization.MapGet("/metric-definitions", GetOrganizationMetricDefinitions);
         organization.MapPost("/events", TrackOrganizationAnalyticsEvent);
 
@@ -616,6 +620,55 @@ public static class AnalyticsEndpoints
             FilesQuarantined: files.Count(item => item.ScanStatus == FileScanStatus.Rejected),
             RetentionDeletionsUpcoming: files.Count(item => item.RetentionUntil.HasValue && item.RetentionUntil.Value >= now && item.RetentionUntil.Value <= now.AddDays(30)),
             ReusedPreviousSubmissions: documents.Count(item => item.IsPreviouslySubmitted)));
+    }
+
+    private static async Task<IResult> GetOrganizationBenchmarks(
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IAtlasClock clock,
+        CancellationToken cancellationToken)
+    {
+        if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+        {
+            return problem!;
+        }
+        if (EndpointHelpers.RequireProductionApiOrDashboard(tenantContext) is { } sandboxProblem)
+        {
+            return sandboxProblem;
+        }
+        if (!EndpointHelpers.HasScope(tenantContext, "dashboard:read"))
+        {
+            return EndpointHelpers.Problem("forbidden", "Organization analytics access is required.", StatusCodes.Status403Forbidden);
+        }
+        if (!TryResolvePeriod(from, to, clock.UtcNow, out var period, out var periodProblem))
+        {
+            return periodProblem!;
+        }
+
+        var rows = await BuildBenchmarkRowsAsync(dbContext, period, cancellationToken);
+        var current = rows.FirstOrDefault(item => item.OrganizationId == organizationId)
+            ?? OrganizationBenchmarkRow.Empty(organizationId, "free");
+        var cohortRows = rows
+            .Where(item => item.OrganizationId != organizationId
+                && item.SentRecipients > 0
+                && string.Equals(item.PlanCode, current.PlanCode, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var benchmarksAvailable = cohortRows.Count >= MinimumBenchmarkCohortSize;
+        var metrics = BuildOrganizationBenchmarkMetrics(current, cohortRows, benchmarksAvailable);
+
+        return Results.Ok(new OrganizationBenchmarkAnalyticsResponse(
+            new AnalyticsPeriod(period.From, period.To),
+            Cohort: $"same_plan:{current.PlanCode}",
+            CohortLabel: $"Similar {current.PlanCode} workspaces",
+            CohortSampleSize: cohortRows.Count,
+            MinimumCohortSize: MinimumBenchmarkCohortSize,
+            BenchmarksAvailable: benchmarksAvailable,
+            Metrics: metrics,
+            DelayDrivers: BuildBenchmarkDelayDrivers(current),
+            Insights: BuildOrganizationBenchmarkInsights(current, metrics, benchmarksAvailable),
+            PrivacyNote: BenchmarkPrivacyNote));
     }
 
     private static async Task<IResult> GetOrganizationUsageCurrent(
@@ -1394,17 +1447,21 @@ public static class AnalyticsEndpoints
             return periodProblem!;
         }
 
-        var organizationUsage = await dbContext.UsageEvents.IgnoreQueryFilters().AsNoTracking()
-            .Where(item => item.EventType == "action_sent" && item.OccurredAt >= period.From && item.OccurredAt <= period.To)
-            .GroupBy(item => item.OrganizationId)
-            .Select(group => new { OrganizationId = group.Key, Sent = group.Sum(item => item.Quantity) })
-            .ToListAsync(cancellationToken);
-        var values = organizationUsage.Select(item => item.Sent).OrderBy(item => item).ToList();
+        var rows = await BuildBenchmarkRowsAsync(dbContext, period, cancellationToken);
+        var activeRows = rows.Where(item => item.SentRecipients > 0).ToList();
+        var metrics = BuildPlatformBenchmarkMetrics(activeRows);
+        var sentValues = activeRows
+            .Select(item => (decimal)item.SentRecipients)
+            .OrderBy(item => item)
+            .ToList();
 
         return Results.Ok(new BenchmarkAnalyticsResponse(
             new AnalyticsPeriod(period.From, period.To),
-            new BenchmarkItem("checklists_sent_per_org", "Checklists sent per organization", Percentile(values, 50), Percentile(values, 75), Percentile(values, 90), "count"),
-            Notes: "Benchmarks are internal platform distribution benchmarks for the selected period. Industry-specific benchmarks require more segment data."));
+            new BenchmarkItem("checklists_sent_per_org", "Checklists sent per active organization", Percentile(sentValues, 50), Percentile(sentValues, 75), Percentile(sentValues, 90), "count"),
+            Metrics: metrics,
+            Cohorts: BuildPlatformBenchmarkCohorts(activeRows),
+            DelayDrivers: BuildBenchmarkDelayDrivers(activeRows),
+            Notes: "Benchmarks are internal anonymized platform distribution benchmarks for the selected period. Customer-facing benchmarks use same-plan cohorts with privacy thresholds; industry cohorts should be enabled after structured organization vertical data is collected."));
     }
 
     private static async Task<IResult> GetPlatformOperations(
@@ -1911,6 +1968,455 @@ public static class AnalyticsEndpoints
         return Results.Ok(new { items = PlatformMetricDefinitions() });
     }
 
+    private static async Task<IReadOnlyList<OrganizationBenchmarkRow>> BuildBenchmarkRowsAsync(
+        AtlasDbContext dbContext,
+        AnalyticsPeriod period,
+        CancellationToken cancellationToken)
+    {
+        var organizations = await dbContext.Organizations.IgnoreQueryFilters().AsNoTracking()
+            .Where(item => item.DeletedAt == null && item.Status == OrganizationStatus.Active)
+            .Select(item => new { item.Id })
+            .ToListAsync(cancellationToken);
+
+        var recipients = await dbContext.ActionRecipients.IgnoreQueryFilters().AsNoTracking()
+            .Include(item => item.Action)
+            .Where(item => item.Action != null
+                && item.Action.DeletedAt == null
+                && item.Action.SentAt.HasValue
+                && item.Action.SentAt.Value >= period.From
+                && item.Action.SentAt.Value <= period.To)
+            .ToListAsync(cancellationToken);
+        var sentActionIds = recipients.Select(item => item.ActionId).ToHashSet();
+        var submissions = sentActionIds.Count == 0
+            ? new List<Submission>()
+            : await dbContext.Submissions.IgnoreQueryFilters().AsNoTracking()
+                .Include(item => item.Action)
+                .Where(item => sentActionIds.Contains(item.ActionId))
+                .ToListAsync(cancellationToken);
+        var submissionIds = submissions.Select(item => item.Id).ToHashSet();
+        var submissionFiles = submissionIds.Count == 0
+            ? new List<SubmissionFile>()
+            : await dbContext.SubmissionFiles.IgnoreQueryFilters().AsNoTracking()
+                .Where(item => submissionIds.Contains(item.SubmissionId))
+                .ToListAsync(cancellationToken);
+        var fileAssets = await dbContext.FileAssets.IgnoreQueryFilters().AsNoTracking()
+            .Where(item => item.CreatedAt >= period.From && item.CreatedAt <= period.To)
+            .ToListAsync(cancellationToken);
+        var reminders = await dbContext.ReminderSchedules.IgnoreQueryFilters().AsNoTracking()
+            .Include(item => item.ActionRecipient)
+            .ThenInclude(item => item!.Action)
+            .Where(item => item.SentAt.HasValue
+                && item.SentAt.Value >= period.From
+                && item.SentAt.Value <= period.To)
+            .ToListAsync(cancellationToken);
+        var planCodes = await BuildBenchmarkPlanCodesAsync(dbContext, cancellationToken);
+
+        var recipientsByOrg = recipients
+            .Where(item => item.Action is not null)
+            .GroupBy(item => item.Action!.OrganizationId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var submissionsByOrg = submissions
+            .Where(item => item.Action is not null)
+            .GroupBy(item => item.Action!.OrganizationId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var submissionOrgById = submissions
+            .Where(item => item.Action is not null)
+            .ToDictionary(item => item.Id, item => item.Action!.OrganizationId);
+        var submissionFilesByOrg = submissionFiles
+            .Where(item => submissionOrgById.ContainsKey(item.SubmissionId))
+            .GroupBy(item => submissionOrgById[item.SubmissionId])
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var fileAssetsByOrg = fileAssets
+            .GroupBy(item => item.OrganizationId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+        var remindersByOrg = reminders
+            .Where(item => item.ActionRecipient?.Action is not null)
+            .GroupBy(item => item.ActionRecipient!.Action!.OrganizationId)
+            .ToDictionary(group => group.Key, group => group.ToList());
+
+        var rows = new List<OrganizationBenchmarkRow>();
+        foreach (var organization in organizations)
+        {
+            var orgRecipients = recipientsByOrg.TryGetValue(organization.Id, out var foundRecipients)
+                ? foundRecipients
+                : new List<ActionRecipient>();
+            var orgSubmissions = submissionsByOrg.TryGetValue(organization.Id, out var foundSubmissions)
+                ? foundSubmissions
+                : new List<Submission>();
+            var orgSubmissionFiles = submissionFilesByOrg.TryGetValue(organization.Id, out var foundSubmissionFiles)
+                ? foundSubmissionFiles
+                : new List<SubmissionFile>();
+            var orgFileAssets = fileAssetsByOrg.TryGetValue(organization.Id, out var foundFileAssets)
+                ? foundFileAssets
+                : new List<FileAsset>();
+            var orgReminders = remindersByOrg.TryGetValue(organization.Id, out var foundReminders)
+                ? foundReminders
+                : new List<ReminderSchedule>();
+
+            var sent = orgRecipients.Count;
+            var viewed = orgRecipients.Count(item => item.FirstViewedAt.HasValue);
+            var started = orgRecipients.Count(item => item.StartedAt.HasValue || item.Status is ActionRecipientStatus.Started or ActionRecipientStatus.Submitted);
+            var submitted = orgRecipients.Count(item => item.SubmittedAt.HasValue || item.Status == ActionRecipientStatus.Submitted);
+            var accepted = orgSubmissions.Count(item => item.Status == SubmissionStatus.Accepted);
+            var completionDurations = orgRecipients
+                .Where(item => item.SubmittedAt.HasValue
+                    && item.Action?.SentAt is not null
+                    && item.SubmittedAt.Value >= item.Action.SentAt.Value)
+                .Select(item => item.SubmittedAt!.Value - item.Action!.SentAt!.Value);
+            var firstOpenDurations = orgRecipients
+                .Where(item => item.FirstViewedAt.HasValue
+                    && item.Action?.SentAt is not null
+                    && item.FirstViewedAt.Value >= item.Action.SentAt.Value)
+                .Select(item => item.FirstViewedAt!.Value - item.Action!.SentAt!.Value);
+            var reminderRecipientCount = orgReminders
+                .Where(item => item.SentAt.HasValue)
+                .Select(item => item.ActionRecipientId)
+                .Distinct()
+                .Count();
+
+            rows.Add(new OrganizationBenchmarkRow(
+                organization.Id,
+                planCodes.PlansByOrganization.TryGetValue(organization.Id, out var planCode) ? planCode : planCodes.DefaultPlanCode,
+                sent,
+                viewed,
+                started,
+                submitted,
+                accepted,
+                reminderRecipientCount,
+                orgSubmissionFiles.Count,
+                orgSubmissionFiles.Count(item => item.IsPreviouslySubmitted),
+                orgFileAssets.Count(item => item.ScanStatus == FileScanStatus.Pending),
+                Rate(submitted, sent),
+                Rate(viewed, sent),
+                MedianMinutes(completionDurations),
+                MedianMinutes(firstOpenDurations),
+                Rate(orgSubmissionFiles.Count(item => item.IsPreviouslySubmitted), orgSubmissionFiles.Count),
+                Rate(reminderRecipientCount, sent)));
+        }
+
+        return rows;
+    }
+
+    private static async Task<BenchmarkPlanCodes> BuildBenchmarkPlanCodesAsync(
+        AtlasDbContext dbContext,
+        CancellationToken cancellationToken)
+    {
+        var billingSettings = await dbContext.AdminSettings.IgnoreQueryFilters().AsNoTracking()
+            .Where(item => item.Category == "billing"
+                && (item.Key == "defaultPlanCode" || item.Key == "plan" || item.Key == "planCode"))
+            .ToListAsync(cancellationToken);
+        var defaultPlanCode = billingSettings
+            .Where(item => item.OrganizationId == null && item.Key == "defaultPlanCode")
+            .Select(item => ReadBenchmarkPlanCode(item.ValueJson, "free"))
+            .FirstOrDefault() ?? "free";
+        var plansByOrg = billingSettings
+            .Where(item => item.OrganizationId.HasValue && (item.Key == "plan" || item.Key == "planCode"))
+            .GroupBy(item => item.OrganizationId!.Value)
+            .ToDictionary(
+                group => group.Key,
+                group => ReadBenchmarkPlanCode(
+                    group.OrderByDescending(item => item.Key == "plan").First().ValueJson,
+                    defaultPlanCode));
+
+        return new BenchmarkPlanCodes(defaultPlanCode, plansByOrg);
+    }
+
+    private static IReadOnlyList<OrganizationBenchmarkMetric> BuildOrganizationBenchmarkMetrics(
+        OrganizationBenchmarkRow current,
+        IReadOnlyList<OrganizationBenchmarkRow> cohortRows,
+        bool benchmarksAvailable)
+    {
+        return
+        [
+            BuildOrganizationBenchmarkMetric("recipient_completion_rate", "Recipient completion rate", "percent", current.CompletionRate, cohortRows, item => item.CompletionRate, benchmarksAvailable, higherIsBetter: true),
+            BuildOrganizationBenchmarkMetric("median_completion_minutes", "Median completion time", "minutes", current.MedianCompletionMinutes, cohortRows, item => item.MedianCompletionMinutes, benchmarksAvailable, higherIsBetter: false),
+            BuildOrganizationBenchmarkMetric("median_first_open_minutes", "Median time to first open", "minutes", current.MedianFirstOpenMinutes, cohortRows, item => item.MedianFirstOpenMinutes, benchmarksAvailable, higherIsBetter: false),
+            BuildOrganizationBenchmarkMetric("document_reuse_rate", "Previously submitted document reuse", "percent", current.DocumentReuseRate, cohortRows, item => item.DocumentReuseRate, benchmarksAvailable, higherIsBetter: true),
+            BuildOrganizationBenchmarkMetric("reminder_coverage_rate", "Reminder coverage", "percent", current.ReminderCoverageRate, cohortRows, item => item.ReminderCoverageRate, benchmarksAvailable, higherIsBetter: true),
+            BuildOrganizationBenchmarkMetric("checklists_sent", "Checklists sent", "count", current.SentRecipients, cohortRows, item => item.SentRecipients, benchmarksAvailable, higherIsBetter: true)
+        ];
+    }
+
+    private static OrganizationBenchmarkMetric BuildOrganizationBenchmarkMetric(
+        string key,
+        string label,
+        string unit,
+        decimal? organizationValue,
+        IReadOnlyList<OrganizationBenchmarkRow> cohortRows,
+        Func<OrganizationBenchmarkRow, decimal?> selector,
+        bool benchmarksAvailable,
+        bool higherIsBetter)
+    {
+        var values = benchmarksAvailable
+            ? cohortRows.Select(selector)
+                .Where(item => item.HasValue)
+                .Select(item => item.GetValueOrDefault())
+                .OrderBy(item => item)
+                .ToList()
+            : new List<decimal>();
+        var metricAvailable = values.Count >= MinimumBenchmarkCohortSize;
+        var median = metricAvailable ? Percentile(values, 50) : null;
+        var delta = organizationValue.HasValue && median.HasValue
+            ? Math.Round(organizationValue.Value - median.Value, 2)
+            : (decimal?)null;
+
+        return new OrganizationBenchmarkMetric(
+            key,
+            label,
+            unit,
+            organizationValue,
+            median,
+            metricAvailable ? Percentile(values, 75) : null,
+            metricAvailable ? Percentile(values, 90) : null,
+            delta,
+            ResolveBenchmarkDirection(delta, higherIsBetter),
+            higherIsBetter,
+            Suppressed: !metricAvailable);
+    }
+
+    private static IReadOnlyList<PlatformBenchmarkMetric> BuildPlatformBenchmarkMetrics(
+        IReadOnlyList<OrganizationBenchmarkRow> rows)
+    {
+        return
+        [
+            BuildPlatformBenchmarkMetric("checklists_sent_per_active_org", "Checklists sent per active organization", "count", rows, item => item.SentRecipients, higherIsBetter: true),
+            BuildPlatformBenchmarkMetric("recipient_completion_rate", "Recipient completion rate", "percent", rows, item => item.CompletionRate, higherIsBetter: true),
+            BuildPlatformBenchmarkMetric("median_completion_minutes", "Median completion time", "minutes", rows, item => item.MedianCompletionMinutes, higherIsBetter: false),
+            BuildPlatformBenchmarkMetric("median_first_open_minutes", "Median time to first open", "minutes", rows, item => item.MedianFirstOpenMinutes, higherIsBetter: false),
+            BuildPlatformBenchmarkMetric("document_reuse_rate", "Previously submitted document reuse", "percent", rows, item => item.DocumentReuseRate, higherIsBetter: true),
+            BuildPlatformBenchmarkMetric("reminder_coverage_rate", "Reminder coverage", "percent", rows, item => item.ReminderCoverageRate, higherIsBetter: true)
+        ];
+    }
+
+    private static PlatformBenchmarkMetric BuildPlatformBenchmarkMetric(
+        string key,
+        string label,
+        string unit,
+        IReadOnlyList<OrganizationBenchmarkRow> rows,
+        Func<OrganizationBenchmarkRow, decimal?> selector,
+        bool higherIsBetter)
+    {
+        var values = rows.Select(selector)
+            .Where(item => item.HasValue)
+            .Select(item => item.GetValueOrDefault())
+            .OrderBy(item => item)
+            .ToList();
+
+        return new PlatformBenchmarkMetric(
+            key,
+            label,
+            unit,
+            OrganizationsWithValue: values.Count,
+            P50: Percentile(values, 50),
+            P75: Percentile(values, 75),
+            P90: Percentile(values, 90),
+            higherIsBetter);
+    }
+
+    private static IReadOnlyList<PlatformBenchmarkCohort> BuildPlatformBenchmarkCohorts(
+        IReadOnlyList<OrganizationBenchmarkRow> rows)
+    {
+        return rows
+            .GroupBy(item => item.PlanCode)
+            .OrderBy(group => group.Key)
+            .Select(group =>
+            {
+                var cohortRows = group.ToList();
+                return new PlatformBenchmarkCohort(
+                    CohortType: "plan",
+                    CohortKey: group.Key,
+                    CohortLabel: $"{group.Key} workspaces",
+                    SampleSize: cohortRows.Count,
+                    Metrics: BuildPlatformBenchmarkMetrics(cohortRows));
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyList<BenchmarkDelayDriver> BuildBenchmarkDelayDrivers(OrganizationBenchmarkRow row)
+    {
+        return BuildBenchmarkDelayDrivers(
+            NotOpened: Math.Max(0, row.SentRecipients - row.ViewedRecipients),
+            StartedNotSubmitted: Math.Max(0, row.StartedRecipients - row.SubmittedRecipients),
+            PendingScans: row.PendingScans,
+            NoReminderSent: Math.Max(0, row.SentRecipients - row.ReminderedRecipients));
+    }
+
+    private static IReadOnlyList<BenchmarkDelayDriver> BuildBenchmarkDelayDrivers(
+        IReadOnlyList<OrganizationBenchmarkRow> rows)
+    {
+        return BuildBenchmarkDelayDrivers(
+            NotOpened: rows.Sum(item => Math.Max(0, item.SentRecipients - item.ViewedRecipients)),
+            StartedNotSubmitted: rows.Sum(item => Math.Max(0, item.StartedRecipients - item.SubmittedRecipients)),
+            PendingScans: rows.Sum(item => item.PendingScans),
+            NoReminderSent: rows.Sum(item => Math.Max(0, item.SentRecipients - item.ReminderedRecipients)));
+    }
+
+    private static IReadOnlyList<BenchmarkDelayDriver> BuildBenchmarkDelayDrivers(
+        int NotOpened,
+        int StartedNotSubmitted,
+        int PendingScans,
+        int NoReminderSent)
+    {
+        var items = new List<BenchmarkDelayDriver>
+        {
+            new("not_opened", "Recipients have not opened", NotOpened, "count", "Use a short reminder or verify the recipient email address."),
+            new("started_not_submitted", "Recipients started but have not submitted", StartedNotSubmitted, "count", "Review confusing requirements and consider simplifying the checklist."),
+            new("files_pending_scan", "Files pending scan", PendingScans, "count", "Check scanner health if this remains above zero for more than a few minutes."),
+            new("no_reminder_sent", "Requests without a sent reminder", NoReminderSent, "count", "Enable automatic reminders for requests that are still waiting.")
+        };
+
+        return items
+            .Where(item => item.Value > 0)
+            .OrderByDescending(item => item.Value)
+            .ThenBy(item => item.Key)
+            .Take(5)
+            .ToList();
+    }
+
+    private static IReadOnlyList<BenchmarkInsight> BuildOrganizationBenchmarkInsights(
+        OrganizationBenchmarkRow current,
+        IReadOnlyList<OrganizationBenchmarkMetric> metrics,
+        bool benchmarksAvailable)
+    {
+        var insights = new List<BenchmarkInsight>();
+        if (current.SentRecipients == 0)
+        {
+            insights.Add(new BenchmarkInsight(
+                "send_first_request",
+                "No sent checklists in this period",
+                "info",
+                "Benchmarks become more useful after this workspace sends real requests.",
+                "Send a checklist or change the date range to a period with activity."));
+            return insights;
+        }
+
+        if (!benchmarksAvailable)
+        {
+            insights.Add(new BenchmarkInsight(
+                "cohort_building",
+                "Benchmark cohort is still building",
+                "info",
+                $"Reqara needs at least {MinimumBenchmarkCohortSize} comparable workspaces before showing customer-facing benchmark values.",
+                "Keep using operational metrics here; benchmark comparison will unlock automatically."));
+        }
+
+        var completion = metrics.FirstOrDefault(item => item.Key == "recipient_completion_rate");
+        if (completion?.DeltaFromMedian is < -5)
+        {
+            insights.Add(new BenchmarkInsight(
+                "completion_below_cohort",
+                "Completion is below similar workspaces",
+                "warning",
+                $"This workspace is {Math.Abs(completion.DeltaFromMedian.Value):0.##} percentage points below the same-plan median.",
+                "Look at the delay drivers and simplify the highest-friction requirements first."));
+        }
+
+        var firstOpen = metrics.FirstOrDefault(item => item.Key == "median_first_open_minutes");
+        if (firstOpen?.DeltaFromMedian is > 120)
+        {
+            insights.Add(new BenchmarkInsight(
+                "slow_first_open",
+                "Recipients are slower to open",
+                "warning",
+                "The first-open time is materially slower than the same-plan median.",
+                "Review invite subject lines, sender identity, and reminder timing."));
+        }
+
+        if (current.SubmissionFiles > 0 && current.DocumentReuseRate.GetValueOrDefault() < 10)
+        {
+            insights.Add(new BenchmarkInsight(
+                "document_reuse_opportunity",
+                "Previously submitted documents can reduce repeat work",
+                "opportunity",
+                "File reuse is low for this period.",
+                "Enable previously submitted documents on stable requirements such as IDs, licences, certificates, and insurance."));
+        }
+
+        if (current.ReminderCoverageRate.GetValueOrDefault() < 50)
+        {
+            insights.Add(new BenchmarkInsight(
+                "reminder_coverage_opportunity",
+                "Reminder coverage is low",
+                "opportunity",
+                "Many sent requests have not had a reminder in this period.",
+                "Use automatic before-due and overdue reminders for waiting recipients."));
+        }
+
+        return insights
+            .Take(4)
+            .ToList();
+    }
+
+    private static string ResolveBenchmarkDirection(decimal? delta, bool higherIsBetter)
+    {
+        if (!delta.HasValue)
+        {
+            return "not_available";
+        }
+
+        if (Math.Abs(delta.Value) < 0.01m)
+        {
+            return "at_benchmark";
+        }
+
+        var better = higherIsBetter ? delta.Value > 0 : delta.Value < 0;
+        return better ? "above_benchmark" : "below_benchmark";
+    }
+
+    private static string ReadBenchmarkPlanCode(string? valueJson, string fallback)
+    {
+        if (EndpointHelpers.ReadStringSetting(valueJson) is { } configuredPlan)
+        {
+            return NormalizeBenchmarkPlanCode(configuredPlan, fallback);
+        }
+
+        if (string.IsNullOrWhiteSpace(valueJson))
+        {
+            return NormalizeBenchmarkPlanCode(fallback, "free");
+        }
+
+        try
+        {
+            var state = JsonSerializer.Deserialize<OrganizationBillingState>(valueJson, EndpointHelpers.JsonOptions);
+            if (state is not null)
+            {
+                return NormalizeBenchmarkPlanCode(state.PlanCode, fallback);
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(valueJson);
+            if (document.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var propertyName in new[] { "planCode", "PlanCode", "code" })
+                {
+                    if (document.RootElement.TryGetProperty(propertyName, out var value)
+                        && value.ValueKind == JsonValueKind.String)
+                    {
+                        return NormalizeBenchmarkPlanCode(value.GetString(), fallback);
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return NormalizeBenchmarkPlanCode(fallback, "free");
+    }
+
+    private static string NormalizeBenchmarkPlanCode(string? planCode, string fallback)
+    {
+        var value = string.IsNullOrWhiteSpace(planCode) ? fallback : planCode;
+        return string.IsNullOrWhiteSpace(value)
+            ? "free"
+            : value.Trim().ToLowerInvariant();
+    }
+
     private static bool TryRequireOrganizationAnalytics(ITenantContext tenantContext, out IResult? problem)
     {
         if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out _, out problem))
@@ -2039,11 +2545,14 @@ public static class AnalyticsEndpoints
         return
         [
             Definition("active_checklists", "Active Checklists", "Checklists currently sent, in progress, or submitted but not completed.", "count", "actions", "near_real_time", "Product", false),
-            Definition("recipient_completion_rate", "Recipient Completion Rate", "Accepted submissions divided by sent checklist requests for the period.", "percent", "actions, submissions", "near_real_time", "Product", false),
+            Definition("recipient_completion_rate", "Recipient Completion Rate", "Recipients who submitted divided by sent checklist requests for the period.", "percent", "action_recipients", "near_real_time", "Product", false),
             Definition("median_completion_minutes", "Median Completion Time", "Median elapsed minutes between checklist sent time and recipient submission time.", "minutes", "actions, submissions", "near_real_time", "Product", false),
+            Definition("median_first_open_minutes", "Median Time To First Open", "Median elapsed minutes between checklist sent time and the recipient's first view.", "minutes", "action_recipients", "near_real_time", "Benchmarking", false),
+            Definition("document_reuse_rate", "Previously Submitted Document Reuse Rate", "Submission files reused with recipient confirmation divided by all submitted files.", "percent", "submission_files", "near_real_time", "Benchmarking", false),
             Definition("files_pending_scan", "Files Pending Scan", "Uploaded files waiting for malware scan result.", "count", "file_assets", "near_real_time", "Operations", false),
             Definition("completion_funnel", "Completion Funnel", "Recipients moving from sent, viewed, started, submitted, reviewed, and accepted.", "count", "action_recipients, submissions", "near_real_time", "Product", false),
             Definition("reminder_conversion_rate", "Reminder Conversion Rate", "Reminder attempts followed by recipient submission within seven days.", "percent", "reminder_schedules, submissions", "daily", "Product", false),
+            Definition("benchmark_same_plan", "Same-Plan Benchmarking", "Anonymized comparison against workspaces on the same billing plan, hidden until the cohort has enough organizations.", "mixed", "action_recipients, submissions, reminders, submission_files, billing settings", "daily", "Benchmarking", false),
             Definition("reused_previous_submissions", "Previously Submitted Documents Used", "Submission files linked to a previously accepted file asset with recipient consent.", "count", "submission_files", "near_real_time", "Product", false)
         ];
     }
@@ -2063,7 +2572,7 @@ public static class AnalyticsEndpoints
             Definition("unit_economics", "Unit Economics", "Revenue per active organization, cost placeholders, and contribution-margin-ready fields.", "currency", "platform_revenue_events, settings", "daily", "Finance", true),
             Definition("template_conversion_rate", "Template Conversion Rate", "Accepted submissions divided by sent checklists grouped by template.", "percent", "templates, actions, submissions", "daily", "Product", true),
             Definition("requirement_completion_rate", "Requirement Completion Rate", "Requirements completed divided by requirements presented, grouped by requirement type and key.", "percent", "requirements, submissions", "daily", "Product", true),
-            Definition("benchmark_checklists_sent_per_org", "Benchmark Checklists Sent Per Organization", "Organization checklist volume compared against same-plan and same-industry platform medians.", "count", "usage_events, organizations", "daily", "Benchmarking", true),
+            Definition("benchmark_checklists_sent_per_org", "Benchmark Checklists Sent Per Organization", "Organization checklist volume compared against same-plan platform medians. Industry cohorts require structured organization vertical data.", "count", "action_recipients, organizations, billing settings", "daily", "Benchmarking", true),
             Definition("estimated_time_saved_minutes", "Estimated Time Saved", "Directional estimate derived from completed requests, reused files, and avoided reminder work.", "minutes", "submissions, submission_files, reminders", "daily", "Executive", true),
             Definition("email_delivery_success_rate", "Email Delivery Success Rate", "Notification delivery rows marked delivered divided by all notification delivery rows for the period.", "percent", "notification_deliveries", "near_real_time", "Operations", false)
         ];
@@ -2274,6 +2783,52 @@ public static class AnalyticsEndpoints
             0,
             TimeSpan.Zero);
         return (month, month.AddMonths(1));
+    }
+
+    private sealed record BenchmarkPlanCodes(
+        string DefaultPlanCode,
+        IReadOnlyDictionary<Guid, string> PlansByOrganization);
+
+    private sealed record OrganizationBenchmarkRow(
+        Guid OrganizationId,
+        string PlanCode,
+        int SentRecipients,
+        int ViewedRecipients,
+        int StartedRecipients,
+        int SubmittedRecipients,
+        int AcceptedSubmissions,
+        int ReminderedRecipients,
+        int SubmissionFiles,
+        int ReusedSubmissionFiles,
+        int PendingScans,
+        decimal? CompletionRate,
+        decimal? FirstOpenRate,
+        decimal? MedianCompletionMinutes,
+        decimal? MedianFirstOpenMinutes,
+        decimal? DocumentReuseRate,
+        decimal? ReminderCoverageRate)
+    {
+        public static OrganizationBenchmarkRow Empty(Guid organizationId, string planCode)
+        {
+            return new OrganizationBenchmarkRow(
+                organizationId,
+                planCode,
+                SentRecipients: 0,
+                ViewedRecipients: 0,
+                StartedRecipients: 0,
+                SubmittedRecipients: 0,
+                AcceptedSubmissions: 0,
+                ReminderedRecipients: 0,
+                SubmissionFiles: 0,
+                ReusedSubmissionFiles: 0,
+                PendingScans: 0,
+                CompletionRate: null,
+                FirstOpenRate: null,
+                MedianCompletionMinutes: null,
+                MedianFirstOpenMinutes: null,
+                DocumentReuseRate: null,
+                ReminderCoverageRate: null);
+        }
     }
 
     private sealed record PlatformAccess(PlatformStaff? Staff, IResult? Problem);
@@ -2728,6 +3283,9 @@ public sealed record PredictiveInsightItem(
 public sealed record BenchmarkAnalyticsResponse(
     AnalyticsPeriod Period,
     BenchmarkItem ChecklistsSentPerOrganization,
+    IReadOnlyList<PlatformBenchmarkMetric> Metrics,
+    IReadOnlyList<PlatformBenchmarkCohort> Cohorts,
+    IReadOnlyList<BenchmarkDelayDriver> DelayDrivers,
     string Notes);
 
 public sealed record BenchmarkItem(
@@ -2737,6 +3295,62 @@ public sealed record BenchmarkItem(
     decimal? P75,
     decimal? P90,
     string Unit);
+
+public sealed record OrganizationBenchmarkAnalyticsResponse(
+    AnalyticsPeriod Period,
+    string Cohort,
+    string CohortLabel,
+    int CohortSampleSize,
+    int MinimumCohortSize,
+    bool BenchmarksAvailable,
+    IReadOnlyList<OrganizationBenchmarkMetric> Metrics,
+    IReadOnlyList<BenchmarkDelayDriver> DelayDrivers,
+    IReadOnlyList<BenchmarkInsight> Insights,
+    string PrivacyNote);
+
+public sealed record OrganizationBenchmarkMetric(
+    string Key,
+    string Label,
+    string Unit,
+    decimal? OrganizationValue,
+    decimal? BenchmarkMedian,
+    decimal? BenchmarkP75,
+    decimal? BenchmarkP90,
+    decimal? DeltaFromMedian,
+    string Direction,
+    bool HigherIsBetter,
+    bool Suppressed);
+
+public sealed record PlatformBenchmarkMetric(
+    string Key,
+    string Label,
+    string Unit,
+    int OrganizationsWithValue,
+    decimal? P50,
+    decimal? P75,
+    decimal? P90,
+    bool HigherIsBetter);
+
+public sealed record PlatformBenchmarkCohort(
+    string CohortType,
+    string CohortKey,
+    string CohortLabel,
+    int SampleSize,
+    IReadOnlyList<PlatformBenchmarkMetric> Metrics);
+
+public sealed record BenchmarkDelayDriver(
+    string Key,
+    string Label,
+    int Value,
+    string Unit,
+    string RecommendedAction);
+
+public sealed record BenchmarkInsight(
+    string Key,
+    string Title,
+    string Severity,
+    string Summary,
+    string RecommendedAction);
 
 public sealed record SystemHealthAnalyticsResponse(
     DateTimeOffset AsOf,
