@@ -1027,13 +1027,13 @@ await fetch(uploadIntent.uploadUrl, {
 
 ### POST `/v1/files/{id}/complete`
 
-Checks object exists and size matches. Returns:
+Checks object exists and size matches. In the current production `trusted` scan mode, a matching upload returns `Clean` immediately. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until a scanner posts `/scan-result`.
 
 ```json
 {
   "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-  "scanStatus": "Pending",
-  "scanCompletedAt": null
+  "scanStatus": "Clean",
+  "scanCompletedAt": "2026-07-16T05:10:00Z"
 }
 ```
 
@@ -1291,13 +1291,13 @@ Response includes `retentionUntil`, same shape as dashboard upload intents.
 
 ### POST `/v1/recipient/uploads/{fileId}/complete`
 
-Marks upload received and pending scan.
+Marks upload received. In the current production `trusted` scan mode, a matching upload returns `Clean` immediately. If platform admin changes `fileScanning.mode` to `external`, this returns `Pending` until the scanner callback arrives.
 
 ```json
 {
   "fileId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
-  "scanStatus": "Pending",
-  "scanCompletedAt": null
+  "scanStatus": "Clean",
+  "scanCompletedAt": "2026-07-16T15:05:00Z"
 }
 ```
 

@@ -727,7 +727,9 @@ public static class RecipientEndpoints
         Guid fileId,
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
+        IAdminSettingService settings,
         IObjectStorageService storage,
+        IAtlasClock clock,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -757,8 +759,12 @@ public static class RecipientEndpoints
             return EndpointHelpers.Problem("upload_mismatch", "Uploaded object size does not match the declared size.", StatusCodes.Status409Conflict);
         }
 
-        file.ScanStatus = FileScanStatus.Pending;
+        await FileScanPolicy.ApplyAfterUploadCompleteAsync(file, settings, clock, cancellationToken);
         SecurityEndpoints.AddAudit(dbContext, file.OrganizationId, file.ActionId, tenantContext, "file.uploaded", new { file.Id, file.OriginalFileName, file.SizeBytes }, httpContext);
+        if (file.ScanStatus == FileScanStatus.Clean)
+        {
+            SecurityEndpoints.AddAudit(dbContext, file.OrganizationId, file.ActionId, tenantContext, "file.scan_completed", new { file.Id, file.ScanStatus, file.ScanEngine }, httpContext);
+        }
         await dbContext.SaveChangesAsync(cancellationToken);
         return Results.Ok(new FileStatusResponse(file.Id, file.ScanStatus, file.ScanCompletedAt));
     }

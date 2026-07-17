@@ -288,6 +288,7 @@ recipientOtp.defaultRequired = false
 turnstile.siteKey = "0x4AAAAAAD3PDppjZsCXGkx4"
 turnstile.secretKey = secret
 publicContact.toEmail = "hello@nextronyx.com"
+fileScanning.mode = "trusted"
 security.recipientTokenGraceDays = 30
 security.otpMinutes = 10
 security.otpResendCooldownSeconds = 60
@@ -296,6 +297,11 @@ reminders.beforeDueDays = 3
 reminders.overdueDays = 1
 reminders.dispatchIntervalSeconds = 60
 ```
+
+`fileScanning.mode` values:
+
+- `trusted`: current production mode. After the API verifies the object exists in private storage and the byte size matches, it marks the file `Clean` immediately with scan engine `trusted-upload`.
+- `external`: strict mode. Upload completion returns `Pending` until a scanner/admin integration posts `POST /v1/files/{id}/scan-result`.
 
 ### GET `/v1/platform/settings`
 
