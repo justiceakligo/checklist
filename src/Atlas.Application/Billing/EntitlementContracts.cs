@@ -60,7 +60,11 @@ public sealed record OrganizationBillingState(
     string BillingCycle,
     string Status,
     DateTimeOffset? CurrentPeriodStart,
-    DateTimeOffset? CurrentPeriodEnd);
+    DateTimeOffset? CurrentPeriodEnd,
+    string Provider = "manual",
+    string? StripeCustomerId = null,
+    string? StripeSubscriptionId = null,
+    bool CancelAtPeriodEnd = false);
 
 public sealed record OrganizationUsageSnapshot(
     DateTimeOffset PeriodStart,

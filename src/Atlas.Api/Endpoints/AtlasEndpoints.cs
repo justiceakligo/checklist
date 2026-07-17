@@ -25,6 +25,7 @@ public static class AtlasEndpoints
 
         MapAuthAndOrganization(v1);
         MapBilling(v1);
+        v1.MapStripeBillingEndpoints();
         MapDashboard(v1);
         MapOrganizationMembers(v1);
         MapAdminSettings(v1);

@@ -6,6 +6,8 @@ Platform overview dashboard field mapping is documented in [PLATFORM_ADMIN_DASHB
 
 Customer dashboard, recipient portal, and developer endpoints are documented in [FRONTEND_API_IMPLEMENTATION.md](FRONTEND_API_IMPLEMENTATION.md).
 
+Stripe checkout and subscription flows are documented in [FRONTEND_STRIPE_BILLING_HANDOFF.md](FRONTEND_STRIPE_BILLING_HANDOFF.md).
+
 Frontend deployment is documented in [FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md](FRONTEND_DROPLET_DEPLOYMENT_GUIDE.md).
 
 ## Base URLs
@@ -268,6 +270,11 @@ DigitalOceanSpaces.QuarantinePrefix = "quarantine"
 DigitalOceanSpaces.ForcePathStyle = false
 billing.defaultPlanCode = "free"
 billing.plans = full pricing JSON
+stripe.Enabled = true
+stripe.PublishableKey = "pk_test_..."
+stripe.SecretKey = secret
+stripe.WebhookSigningSecret = secret
+stripe.CustomerPortalReturnUrl = "https://reqara.com/dashboard/billing"
 retention.defaultRetentionDays = 365
 retention.purgeIntervalMinutes = 60
 documentReuse.enabled = true
@@ -345,7 +352,11 @@ Organization plan example:
     "billingCycle": "monthly",
     "status": "active",
     "currentPeriodStart": "2026-07-01T00:00:00Z",
-    "currentPeriodEnd": "2026-08-01T00:00:00Z"
+    "currentPeriodEnd": "2026-08-01T00:00:00Z",
+    "provider": "stripe",
+    "stripeCustomerId": "cus_123",
+    "stripeSubscriptionId": "sub_123",
+    "cancelAtPeriodEnd": false
   },
   "isSecret": false
 }
@@ -896,7 +907,7 @@ Deletes the lead.
 
 ## Revenue
 
-Revenue records are manual today. A future billing integration can write the same data.
+Stripe subscription webhooks now create revenue events automatically. Platform admins can still create manual adjustments, credits, refunds, or imported revenue records.
 
 ### GET `/v1/platform/revenue-events`
 
@@ -927,6 +938,8 @@ to: ISO timestamp
   }
 }
 ```
+
+Stripe-created rows use `source: "stripe"` and `externalReference: "stripe:evt_..."`. Refunds are stored as negative `Refund` amounts so revenue totals are net of refunds.
 
 ### GET `/v1/platform/revenue-events/{id}`
 
@@ -1100,7 +1113,7 @@ Metrics and Audit
 
 - Platform admin MFA is not implemented yet.
 - Password reset and forced password change are not implemented yet.
-- Billing provider integration is not implemented yet; revenue is manual and plan is setting-driven.
+- Stripe Billing is implemented for Starter/Business subscriptions. Scale remains custom/contact-sales.
 - SSO is a Scale plan flag, not an implemented SAML/OIDC login flow yet.
 - Malware scan engine is external; backend supports pending/clean/rejected state and scanner callback.
-- Full e-signature and payments collection are not implemented yet.
+- Full e-signature and recipient-side payment collection are not implemented yet.

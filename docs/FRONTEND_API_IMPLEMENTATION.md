@@ -12,6 +12,8 @@ Recipient autosave, duplicate-send protection, and the "Previously Submitted" do
 
 Auth, password reset, recipient OTP, and pricing semantics are documented in [FRONTEND_AUTH_PRICING_OTP_HANDOFF.md](FRONTEND_AUTH_PRICING_OTP_HANDOFF.md).
 
+Stripe checkout, subscription management, and billing webhooks are documented in [FRONTEND_STRIPE_BILLING_HANDOFF.md](FRONTEND_STRIPE_BILLING_HANDOFF.md).
+
 ## Base URLs
 
 ```text
@@ -179,11 +181,12 @@ Enforced today:
 - Production API keys and webhooks by `api_and_webhooks` plus platform approval.
 - Automatic scheduled reminders only for plans with `automatic_reminders`.
 
-Still not automatic billing:
+Self-serve billing:
 
-- There is no checkout or Stripe subscription sync yet.
-- Admins set organization plan in DB-backed settings: category `billing`, key `plan`.
-- Revenue metrics are manual platform records until billing is integrated.
+- Starter and Business use Stripe Checkout subscriptions.
+- Billing management uses Stripe Customer Portal.
+- Stripe webhooks update organization plan state and revenue records.
+- Free requires no payment method. Scale remains contact sales/custom pricing.
 
 ## Website Claims Matrix
 
@@ -210,7 +213,7 @@ Use this as the frontend truth table.
 | Consent records | Supported | Submission declaration timestamp and IP are stored. |
 | Data export | Supported | Submission export endpoint includes package and timeline. |
 | SSO | Plan flag only | Do not show as self-serve yet. Treat as Scale/sales. |
-| Payments | Not implemented | Mark as coming soon if shown. |
+| Payments | Supported for product subscriptions | Starter/Business use Stripe Checkout; Scale is contact sales. |
 | Signatures | Requirement type exists | Full e-signature workflow is not implemented yet. |
 
 ## Health
@@ -356,6 +359,8 @@ Custom branding requires Starter or higher. Custom retention requires Scale.
 
 ## Billing And Entitlements
 
+Full checkout and subscription flows are documented in [FRONTEND_STRIPE_BILLING_HANDOFF.md](FRONTEND_STRIPE_BILLING_HANDOFF.md).
+
 ### GET `/v1/billing/plans`
 
 Use for pricing UI.
@@ -414,8 +419,12 @@ Use for plan badge, quota meter, feature locks, and upgrade prompts.
     "planCode": "business",
     "billingCycle": "monthly",
     "status": "active",
-    "currentPeriodStart": null,
-    "currentPeriodEnd": null
+    "currentPeriodStart": "2026-07-17T00:00:00Z",
+    "currentPeriodEnd": "2026-08-17T00:00:00Z",
+    "provider": "stripe",
+    "stripeCustomerId": "cus_123",
+    "stripeSubscriptionId": "sub_123",
+    "cancelAtPeriodEnd": false
   },
   "usage": {
     "periodStart": "2026-07-01T00:00:00Z",
@@ -1661,4 +1670,4 @@ publicContact.toEmail = "hello@nextronyx.com"
 - On `402`, show upgrade messaging based on `plan` and `usage`.
 - On `403 production_developer_access_required`, show request/approval status from `/v1/developer/access`.
 - On `403 sandbox_key_not_allowed`, tell developers to use `/v1/sandbox/*` or create a production key after approval.
-- Treat scanner integration, payments, SSO, and e-signatures as not self-serve yet.
+- Treat scanner engine integration, SSO, and full e-signatures as not self-serve yet.

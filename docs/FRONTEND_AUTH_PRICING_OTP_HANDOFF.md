@@ -2,7 +2,8 @@
 
 Use this file for the signup/login, pricing, recipient OTP, and password recovery flows.
 
-Main API guide: [FRONTEND_API_IMPLEMENTATION.md](FRONTEND_API_IMPLEMENTATION.md)  
+Main API guide: [FRONTEND_API_IMPLEMENTATION.md](FRONTEND_API_IMPLEMENTATION.md)
+Stripe billing handoff: [FRONTEND_STRIPE_BILLING_HANDOFF.md](FRONTEND_STRIPE_BILLING_HANDOFF.md)
 Admin guide: [PLATFORM_ADMIN_API_IMPLEMENTATION.md](PLATFORM_ADMIN_API_IMPLEMENTATION.md)
 
 ## Base URLs
@@ -115,6 +116,7 @@ Frontend behavior:
 - Show the pricing cards as "checklists sent per month" in tooltips or plan detail copy.
 - Disable send buttons when entitlements show zero remaining, but still let users draft.
 - On `402`, show the upgrade/contact sales modal using `plan` and `usage`.
+- Starter and Business upgrades use Stripe Checkout. Scale stays contact sales. See the Stripe billing handoff for payloads and success handling.
 
 ## Signup And Email Verification
 

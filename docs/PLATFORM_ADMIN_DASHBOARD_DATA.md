@@ -257,5 +257,5 @@ GET /v1/platform/audit?page=1&pageSize=25
 - There is no platform-wide action list endpoint yet. The overview can show counts, but cannot drill into all checklist records from one platform endpoint today.
 - `failedNotifications` is not an unresolved-alert count. It is a count of failed notification delivery rows.
 - `submissionsAccepted` is not period-scoped today.
-- Revenue is manual until billing provider integration is added.
+- Revenue comes from Stripe subscription webhooks and any manual platform revenue records.
 - The metrics endpoint does not return action status breakdown. If the UI wants to explain why total checklists is greater than in-flight, use helper copy or request a backend enhancement.

@@ -606,7 +606,7 @@ Definitions:
 
 - `activatedOrganizations`: organizations that sent at least one checklist in that interval.
 - `activeOrganizations`: same as activated for Phase 1.
-- `payingOrganizations`: `null` until billing integration or richer plan event history is added.
+- `payingOrganizations`: populated from Stripe/manual platform revenue events when available.
 
 ### GET `/v1/platform/analytics/activation`
 
@@ -695,7 +695,7 @@ Response:
 }
 ```
 
-Revenue currently comes from manual `platform_revenue_events`. The frontend should say `Manual revenue records` somewhere in the revenue page until Stripe/billing integration exists.
+Revenue comes from `platform_revenue_events`. Stripe subscription webhooks now write these automatically, and platform admins can still add manual adjustments/imports.
 
 ### GET `/v1/platform/analytics/retention/cohorts`
 
@@ -762,7 +762,7 @@ Response:
 }
 ```
 
-Unit economics cost inputs are intentionally `null` until cost settings or billing integrations are connected.
+Unit economics cost inputs are intentionally `null` until cost settings are connected.
 
 ### GET `/v1/platform/analytics/requirements`
 

@@ -31,7 +31,8 @@ public sealed class EntitlementService(
     {
         var plans = await ListPlansAsync(cancellationToken);
         var billing = await ResolveBillingStateAsync(organizationId, plans, cancellationToken);
-        var plan = plans.FirstOrDefault(item => string.Equals(item.Code, billing.PlanCode, StringComparison.OrdinalIgnoreCase))
+        var effectivePlanCode = IsEntitledBillingStatus(billing.Status) ? billing.PlanCode : DefaultPlanCode;
+        var plan = plans.FirstOrDefault(item => string.Equals(item.Code, effectivePlanCode, StringComparison.OrdinalIgnoreCase))
             ?? plans.First(item => item.Code == DefaultPlanCode);
         var usage = await BuildUsageSnapshotAsync(organizationId, plan, now, cancellationToken);
         return new OrganizationEntitlementSnapshot(plan, billing, usage);
@@ -162,8 +163,14 @@ public sealed class EntitlementService(
         {
             PlanCode = planCode,
             BillingCycle = string.IsNullOrWhiteSpace(state.BillingCycle) ? "monthly" : state.BillingCycle.Trim().ToLowerInvariant(),
-            Status = string.IsNullOrWhiteSpace(state.Status) ? "active" : state.Status.Trim().ToLowerInvariant()
+            Status = string.IsNullOrWhiteSpace(state.Status) ? "active" : state.Status.Trim().ToLowerInvariant(),
+            Provider = string.IsNullOrWhiteSpace(state.Provider) ? "manual" : state.Provider.Trim().ToLowerInvariant()
         };
+    }
+
+    private static bool IsEntitledBillingStatus(string status)
+    {
+        return status.Trim().ToLowerInvariant() is "active" or "trialing" or "past_due";
     }
 
     private async Task<OrganizationUsageSnapshot> BuildUsageSnapshotAsync(
