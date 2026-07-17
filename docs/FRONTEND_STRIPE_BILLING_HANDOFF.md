@@ -46,9 +46,10 @@ fetch(`${API_BASE_URL}/v1/billing/checkout-sessions`, {
 6. Scale button:
    - Send to contact sales or `POST /v1/public/interests`.
 7. On Stripe success redirect:
-   - Read `session_id` from URL for display/support only.
-   - Call `GET /v1/organizations/{id}/entitlements`.
-   - Show the active plan once webhook sync has completed.
+   - Read `session_id` from URL.
+   - Call `GET /v1/billing/checkout-sessions/{session_id}` once to let the backend verify the Checkout Session with Stripe and reconcile the workspace plan if the webhook has not arrived yet.
+   - Then call `GET /v1/organizations/{id}/entitlements`.
+   - Show the active plan once webhook or session sync has completed.
 
 ## GET `/v1/billing/config`
 
@@ -164,11 +165,54 @@ Suggested route:
 UI behavior:
 
 1. Show a short "Finishing setup..." state.
-2. Poll or refetch `GET /v1/organizations/{id}/entitlements`.
-3. If `billing.status` is `active` or `trialing`, show success.
-4. If still `free` after a few seconds, show "Payment received, plan activation is syncing" with a refresh button.
+2. If `session_id` is present, call `GET /v1/billing/checkout-sessions/{session_id}`.
+3. Refetch `GET /v1/organizations/{id}/entitlements`.
+4. If `billing.status` is `active` or `trialing`, show success.
+5. If still `free` after a few seconds, show "Payment received, plan activation is syncing" with a refresh button.
 
-Do not call Stripe from the browser to verify payment. The backend webhook is the source of truth.
+Do not call Stripe from the browser to verify payment. Use the backend session status endpoint; it verifies the Checkout Session server-side and is safe to call from the success page.
+
+## GET `/v1/billing/checkout-sessions/{sessionId}`
+
+Use on the billing success page. This endpoint retrieves the Checkout Session from Stripe, confirms it belongs to the current organization, and reconciles the local billing state if the session is complete and paid.
+
+`200` for a paid annual Starter checkout:
+
+```json
+{
+  "sessionId": "cs_test_123",
+  "status": "complete",
+  "paymentStatus": "paid",
+  "mode": "subscription",
+  "planCode": "starter",
+  "billingCycle": "annual",
+  "amountTotal": 39000,
+  "currency": "USD",
+  "stripeCustomerId": "cus_123",
+  "stripeSubscriptionId": "sub_123",
+  "stripeSubscriptionStatus": "active",
+  "billing": {
+    "planCode": "starter",
+    "billingCycle": "annual",
+    "status": "active",
+    "provider": "stripe",
+    "stripeCustomerId": "cus_123",
+    "stripeSubscriptionId": "sub_123",
+    "cancelAtPeriodEnd": false
+  }
+}
+```
+
+Expected errors:
+
+```text
+401 authentication_required: user is not signed in or cookie missing
+403 dashboard_user_required: API key/recipient context tried to verify checkout
+404 checkout_session_not_found: session does not belong to this organization
+422 validation_failed: invalid Checkout Session ID
+503 billing_not_configured: Stripe keys/settings missing
+502 stripe_request_failed: Stripe rejected the session lookup
+```
 
 ## POST `/v1/billing/customer-portal-sessions`
 

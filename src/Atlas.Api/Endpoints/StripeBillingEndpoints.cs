@@ -169,6 +169,89 @@ internal static class StripeBillingEndpoints
                 expiresAt));
         });
 
+        group.MapGet("/checkout-sessions/{sessionId}", async (
+            string sessionId,
+            AtlasDbContext dbContext,
+            IAtlasClock clock,
+            IHttpClientFactory httpClientFactory,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            if (tenantContext.ActorType != "user")
+            {
+                return EndpointHelpers.Problem("dashboard_user_required", "A dashboard user session is required to verify billing checkout.", StatusCodes.Status403Forbidden);
+            }
+
+            if (string.IsNullOrWhiteSpace(sessionId) || !sessionId.StartsWith("cs_", StringComparison.Ordinal))
+            {
+                return EndpointHelpers.Problem("validation_failed", "sessionId must be a Stripe Checkout Session ID.", StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var stripe = await ReadStripeSettingsAsync(dbContext, cancellationToken);
+            if (!stripe.Enabled || string.IsNullOrWhiteSpace(stripe.SecretKey))
+            {
+                return EndpointHelpers.Problem("billing_not_configured", "Stripe billing is not configured.", StatusCodes.Status503ServiceUnavailable);
+            }
+
+            var stripeResponse = await GetStripeAsync(
+                httpClientFactory,
+                stripe.SecretKey,
+                $"checkout/sessions/{Uri.EscapeDataString(sessionId)}",
+                [
+                    new("expand[]", "subscription"),
+                    new("expand[]", "customer"),
+                    new("expand[]", "line_items")
+                ],
+                cancellationToken);
+            if (stripeResponse.Problem is not null)
+            {
+                return stripeResponse.Problem;
+            }
+
+            using var document = JsonDocument.Parse(stripeResponse.Body!);
+            var session = document.RootElement.Clone();
+            var sessionOrganizationId = GetSessionOrganizationId(session);
+            if (sessionOrganizationId != organizationId)
+            {
+                return EndpointHelpers.Problem("checkout_session_not_found", "Checkout session was not found for this organization.", StatusCodes.Status404NotFound);
+            }
+
+            var paymentStatus = GetString(session, "payment_status");
+            var status = GetString(session, "status");
+            var mode = GetString(session, "mode");
+            OrganizationBillingState billing;
+            if (string.Equals(mode, "subscription", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(status, "complete", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(paymentStatus, "paid", StringComparison.OrdinalIgnoreCase))
+            {
+                billing = await ApplyCheckoutSessionAsync(dbContext, clock, session, cancellationToken);
+                await dbContext.SaveChangesAsync(cancellationToken);
+            }
+            else
+            {
+                billing = await ReadOrganizationBillingStateAsync(dbContext, organizationId, cancellationToken);
+            }
+
+            return Results.Ok(new StripeCheckoutSessionStatusResponse(
+                sessionId,
+                status,
+                paymentStatus,
+                mode,
+                GetMetadataString(session, "plan_code"),
+                NormalizeBillingCycle(GetMetadataString(session, "billing_cycle")),
+                GetLong(session, "amount_total"),
+                GetString(session, "currency")?.ToUpperInvariant(),
+                GetIdOrString(session, "customer"),
+                GetIdOrString(session, "subscription"),
+                GetNestedObjectString(session, "subscription", "status"),
+                billing));
+        });
+
         group.MapPost("/customer-portal-sessions", async (
             CreateStripeCustomerPortalSessionRequest request,
             AtlasDbContext dbContext,
@@ -457,6 +540,38 @@ internal static class StripeBillingEndpoints
                 $"Stripe returned HTTP {(int)response.StatusCode}."));
     }
 
+    private static async Task<StripeFormResponse> GetStripeAsync(
+        IHttpClientFactory httpClientFactory,
+        string secretKey,
+        string path,
+        IReadOnlyList<KeyValuePair<string, string>> query,
+        CancellationToken cancellationToken)
+    {
+        var client = httpClientFactory.CreateClient();
+        var queryString = query.Count == 0
+            ? string.Empty
+            : "?" + string.Join("&", query.Select(item => $"{Uri.EscapeDataString(item.Key)}={Uri.EscapeDataString(item.Value)}"));
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{StripeApiBaseUrl}/{path}{queryString}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", secretKey);
+        request.Headers.Add("Stripe-Version", "2026-02-25.clover");
+
+        using var response = await client.SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (response.IsSuccessStatusCode)
+        {
+            return new StripeFormResponse(body, null);
+        }
+
+        var message = ReadStripeErrorMessage(body) ?? "Stripe request failed.";
+        return new StripeFormResponse(
+            null,
+            EndpointHelpers.Problem(
+                "stripe_request_failed",
+                message,
+                StatusCodes.Status502BadGateway,
+                $"Stripe returned HTTP {(int)response.StatusCode}."));
+    }
+
     private static string? ReadStripeErrorMessage(string body)
     {
         try
@@ -611,36 +726,52 @@ internal static class StripeBillingEndpoints
         StripeWebhookEvent stripeEvent,
         CancellationToken cancellationToken)
     {
-        var session = stripeEvent.Object;
+        await ApplyCheckoutSessionAsync(dbContext, clock, stripeEvent.Object, cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private static async Task<OrganizationBillingState> ApplyCheckoutSessionAsync(
+        AtlasDbContext dbContext,
+        IAtlasClock clock,
+        JsonElement session,
+        CancellationToken cancellationToken)
+    {
         if (!string.Equals(GetString(session, "mode"), "subscription", StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            return new OrganizationBillingState("free", "monthly", "active", null, null);
         }
 
-        var organizationId = GetMetadataGuid(session, "organization_id")
+        var customerId = GetIdOrString(session, "customer");
+        var subscriptionId = GetIdOrString(session, "subscription");
+        var organizationId = GetSessionOrganizationId(session)
             ?? await FindOrganizationIdByStripeIdsAsync(
                 dbContext,
-                GetString(session, "customer"),
-                GetString(session, "subscription"),
+                customerId,
+                subscriptionId,
                 cancellationToken);
         if (organizationId is null)
         {
-            return;
+            return new OrganizationBillingState("free", "monthly", "active", null, null);
         }
 
         var current = await ReadOrganizationBillingStateAsync(dbContext, organizationId.Value, cancellationToken);
+        var subscriptionStatus = GetNestedObjectString(session, "subscription", "status");
+        var isPaid = string.Equals(GetString(session, "payment_status"), "paid", StringComparison.OrdinalIgnoreCase);
         var state = current with
         {
             PlanCode = GetMetadataString(session, "plan_code") ?? current.PlanCode,
             BillingCycle = NormalizeBillingCycle(GetMetadataString(session, "billing_cycle") ?? current.BillingCycle),
-            Status = string.Equals(GetString(session, "payment_status"), "paid", StringComparison.OrdinalIgnoreCase) ? "active" : "incomplete",
+            Status = isPaid ? NormalizeStripeBillingStatus(subscriptionStatus) : "incomplete",
+            CurrentPeriodStart = GetNestedObjectUnixTime(session, "subscription", "current_period_start") ?? current.CurrentPeriodStart,
+            CurrentPeriodEnd = GetNestedObjectUnixTime(session, "subscription", "current_period_end") ?? current.CurrentPeriodEnd,
             Provider = "stripe",
-            StripeCustomerId = GetString(session, "customer") ?? current.StripeCustomerId,
-            StripeSubscriptionId = GetString(session, "subscription") ?? current.StripeSubscriptionId
+            StripeCustomerId = customerId ?? current.StripeCustomerId,
+            StripeSubscriptionId = subscriptionId ?? current.StripeSubscriptionId,
+            CancelAtPeriodEnd = GetNestedObjectBoolean(session, "subscription", "cancel_at_period_end") ?? current.CancelAtPeriodEnd
         };
 
         await UpsertOrganizationBillingStateAsync(dbContext, clock, organizationId.Value, state, cancellationToken);
-        await dbContext.SaveChangesAsync(cancellationToken);
+        return state;
     }
 
     private static async Task ApplySubscriptionEventAsync(
@@ -910,6 +1041,14 @@ internal static class StripeBillingEndpoints
             : "monthly";
     }
 
+    private static string NormalizeStripeBillingStatus(string? value)
+    {
+        var normalized = value?.Trim().ToLowerInvariant();
+        return normalized is "active" or "trialing" or "past_due" or "unpaid" or "canceled" or "incomplete"
+            ? normalized
+            : "active";
+    }
+
     private static string? NormalizeReturnUrl(string? value)
     {
         return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
@@ -966,6 +1105,36 @@ internal static class StripeBillingEndpoints
         };
     }
 
+    private static string? GetIdOrString(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind == JsonValueKind.Object
+            ? GetString(value, "id")
+            : GetString(element, propertyName);
+    }
+
+    private static string? GetNestedObjectString(JsonElement element, string propertyName, string nestedPropertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(propertyName, out var nested)
+            && nested.ValueKind == JsonValueKind.Object
+                ? GetString(nested, nestedPropertyName)
+                : null;
+    }
+
+    private static bool? GetNestedObjectBoolean(JsonElement element, string propertyName, string nestedPropertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(propertyName, out var nested)
+            && nested.ValueKind == JsonValueKind.Object
+                ? GetBoolean(nested, nestedPropertyName)
+                : null;
+    }
+
     private static bool? GetBoolean(JsonElement element, string propertyName)
     {
         if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out var value))
@@ -1004,6 +1173,15 @@ internal static class StripeBillingEndpoints
     {
         var value = GetLong(element, propertyName);
         return value.HasValue ? DateTimeOffset.FromUnixTimeSeconds(value.Value) : null;
+    }
+
+    private static DateTimeOffset? GetNestedObjectUnixTime(JsonElement element, string propertyName, string nestedPropertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(propertyName, out var nested)
+            && nested.ValueKind == JsonValueKind.Object
+                ? GetUnixTime(nested, nestedPropertyName)
+                : null;
     }
 
     private static string? GetMetadataString(JsonElement element, string key)
@@ -1063,6 +1241,16 @@ internal static class StripeBillingEndpoints
         return Guid.TryParse(GetMetadataString(element, key), out var parsed) ? parsed : null;
     }
 
+    private static Guid? GetSessionOrganizationId(JsonElement session)
+    {
+        if (GetMetadataGuid(session, "organization_id") is { } metadataOrganizationId)
+        {
+            return metadataOrganizationId;
+        }
+
+        return Guid.TryParse(GetString(session, "client_reference_id"), out var parsed) ? parsed : null;
+    }
+
     private sealed record StripeSettings(
         bool Enabled,
         string? PublishableKey,
@@ -1091,6 +1279,20 @@ public sealed record StripeCheckoutSessionResponse(
     string SessionId,
     string CheckoutUrl,
     DateTimeOffset? ExpiresAt);
+
+public sealed record StripeCheckoutSessionStatusResponse(
+    string SessionId,
+    string? Status,
+    string? PaymentStatus,
+    string? Mode,
+    string? PlanCode,
+    string BillingCycle,
+    long? AmountTotal,
+    string? Currency,
+    string? StripeCustomerId,
+    string? StripeSubscriptionId,
+    string? StripeSubscriptionStatus,
+    OrganizationBillingState Billing);
 
 public sealed record CreateStripeCustomerPortalSessionRequest(string? ReturnUrl);
 
