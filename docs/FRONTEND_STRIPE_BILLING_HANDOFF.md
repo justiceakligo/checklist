@@ -41,7 +41,8 @@ fetch(`${API_BASE_URL}/v1/billing/checkout-sessions`, {
    - Signed-in free org: send to dashboard.
 5. Starter or Business button:
    - If signed out, signup first. Signup creates a Free org.
-   - If the selected plan and billing cycle match the current active/trialing/past-due subscription, do not call Checkout. Show "Current plan" or "You are already subscribed" and offer Manage billing.
+   - If the selected plan and billing cycle match a Stripe-backed active/trialing/past-due subscription, do not call Checkout. Show "Current plan" or "You are already subscribed" and offer Manage billing.
+   - If the current plan is manual/admin-granted and has no Stripe customer, Checkout is allowed so the organization can attach live billing.
    - Otherwise call `POST /v1/billing/checkout-sessions`.
    - Redirect to `checkoutUrl`.
 6. Scale button:
@@ -148,7 +149,7 @@ Expected errors:
 401 authentication_required: user is not signed in or cookie missing
 403 dashboard_user_required: API key/recipient context tried to start checkout
 404 plan_not_found: unknown plan code
-422 already_subscribed: org is already on the requested active plan and billing cycle
+422 already_subscribed: org is already on the requested active Stripe-backed plan and billing cycle
 422 checkout_not_required: Free plan
 422 contact_sales_required: Scale/custom plan
 422 plan_not_purchasable: plan lacks price
@@ -183,9 +184,10 @@ Expected errors:
 
 Frontend behavior for the current plan:
 
-- Disable the matching current plan/cycle button or label it "Current plan".
-- Do not redirect to Stripe for the matching current plan/cycle.
+- Disable the matching current plan/cycle button only when `billing.provider === "stripe"` and Stripe customer/subscription IDs are present.
+- Do not redirect to Stripe for the matching current Stripe-backed plan/cycle.
 - Show "Manage billing" for payment method, invoice, cancellation, or renewal changes.
+- If the current plan is manual/admin-granted and there is no Stripe customer, allow Checkout so the org can start paying in live mode.
 - Allow a different paid plan, for example Starter to Business.
 - Allow a billing-cycle change, for example Starter monthly to Starter annual.
 

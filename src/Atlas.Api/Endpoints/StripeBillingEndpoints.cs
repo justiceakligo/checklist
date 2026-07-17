@@ -1071,6 +1071,9 @@ internal static class StripeBillingEndpoints
         string requestedBillingCycle)
     {
         return IsActiveSubscriptionStatus(currentBilling.Status)
+            && string.Equals(currentBilling.Provider, "stripe", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(currentBilling.StripeCustomerId)
+            && !string.IsNullOrWhiteSpace(currentBilling.StripeSubscriptionId)
             && string.Equals(currentBilling.PlanCode, requestedPlanCode, StringComparison.OrdinalIgnoreCase)
             && string.Equals(NormalizeBillingCycle(currentBilling.BillingCycle), requestedBillingCycle, StringComparison.OrdinalIgnoreCase);
     }
