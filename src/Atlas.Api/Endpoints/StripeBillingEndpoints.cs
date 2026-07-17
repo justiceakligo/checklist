@@ -97,6 +97,22 @@ internal static class StripeBillingEndpoints
 
             var userEmail = await ResolveBillingEmailAsync(dbContext, organizationId, tenantContext.UserId, cancellationToken);
             var currentBilling = await ReadOrganizationBillingStateAsync(dbContext, organizationId, cancellationToken);
+            if (IsSameActiveSubscription(currentBilling, plan.Code, billingCycle))
+            {
+                return Results.Problem(
+                    title: $"This workspace is already subscribed to {plan.Name}.",
+                    statusCode: StatusCodes.Status422UnprocessableEntity,
+                    type: "https://docs.atlas.example/errors/already_subscribed",
+                    extensions: new Dictionary<string, object?>
+                    {
+                        ["code"] = "already_subscribed",
+                        ["message"] = $"This workspace is already on the {plan.Name} {billingCycle} plan.",
+                        ["planCode"] = plan.Code,
+                        ["billingCycle"] = billingCycle,
+                        ["billing"] = currentBilling
+                    });
+            }
+
             var appBaseUrl = await EndpointHelpers.BuildAppBaseUrlAsync(adminSettings, configuration, organizationId, httpContext, cancellationToken);
             var successUrl = NormalizeCheckoutSuccessUrl(request.SuccessUrl)
                 ?? $"{appBaseUrl.TrimEnd('/')}/billing/success?session_id={{CHECKOUT_SESSION_ID}}";
@@ -1047,6 +1063,21 @@ internal static class StripeBillingEndpoints
         return normalized is "active" or "trialing" or "past_due" or "unpaid" or "canceled" or "incomplete"
             ? normalized
             : "active";
+    }
+
+    private static bool IsSameActiveSubscription(
+        OrganizationBillingState currentBilling,
+        string requestedPlanCode,
+        string requestedBillingCycle)
+    {
+        return IsActiveSubscriptionStatus(currentBilling.Status)
+            && string.Equals(currentBilling.PlanCode, requestedPlanCode, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(NormalizeBillingCycle(currentBilling.BillingCycle), requestedBillingCycle, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsActiveSubscriptionStatus(string? status)
+    {
+        return status?.Trim().ToLowerInvariant() is "active" or "trialing" or "past_due";
     }
 
     private static string? NormalizeReturnUrl(string? value)

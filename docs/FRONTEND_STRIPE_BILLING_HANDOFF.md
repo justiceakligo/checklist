@@ -41,7 +41,8 @@ fetch(`${API_BASE_URL}/v1/billing/checkout-sessions`, {
    - Signed-in free org: send to dashboard.
 5. Starter or Business button:
    - If signed out, signup first. Signup creates a Free org.
-   - Then call `POST /v1/billing/checkout-sessions`.
+   - If the selected plan and billing cycle match the current active/trialing/past-due subscription, do not call Checkout. Show "Current plan" or "You are already subscribed" and offer Manage billing.
+   - Otherwise call `POST /v1/billing/checkout-sessions`.
    - Redirect to `checkoutUrl`.
 6. Scale button:
    - Send to contact sales or `POST /v1/public/interests`.
@@ -147,12 +148,46 @@ Expected errors:
 401 authentication_required: user is not signed in or cookie missing
 403 dashboard_user_required: API key/recipient context tried to start checkout
 404 plan_not_found: unknown plan code
+422 already_subscribed: org is already on the requested active plan and billing cycle
 422 checkout_not_required: Free plan
 422 contact_sales_required: Scale/custom plan
 422 plan_not_purchasable: plan lacks price
 503 billing_not_configured: Stripe keys/settings missing
 502 stripe_request_failed: Stripe rejected the checkout request
 ```
+
+`422 already_subscribed` body:
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/already_subscribed",
+  "title": "This workspace is already subscribed to Starter.",
+  "status": 422,
+  "code": "already_subscribed",
+  "message": "This workspace is already on the Starter annual plan.",
+  "planCode": "starter",
+  "billingCycle": "annual",
+  "billing": {
+    "planCode": "starter",
+    "billingCycle": "annual",
+    "status": "active",
+    "currentPeriodStart": "2026-07-17T00:00:00Z",
+    "currentPeriodEnd": "2027-07-17T00:00:00Z",
+    "provider": "stripe",
+    "stripeCustomerId": "cus_123",
+    "stripeSubscriptionId": "sub_123",
+    "cancelAtPeriodEnd": false
+  }
+}
+```
+
+Frontend behavior for the current plan:
+
+- Disable the matching current plan/cycle button or label it "Current plan".
+- Do not redirect to Stripe for the matching current plan/cycle.
+- Show "Manage billing" for payment method, invoice, cancellation, or renewal changes.
+- Allow a different paid plan, for example Starter to Business.
+- Allow a billing-cycle change, for example Starter monthly to Starter annual.
 
 ## Billing Success Page
 
