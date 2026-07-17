@@ -324,6 +324,66 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail("Your Reqara checklist link", text, html);
     }
 
+    public static TransactionalEmail RecipientContactOrganization(
+        string recipientName,
+        string recipientEmail,
+        string organizationName,
+        string checklistTitle,
+        string publicReference,
+        string? receiptReference,
+        string subject,
+        string message)
+    {
+        var safeRecipient = CleanName(recipientName, "Recipient");
+        var safeEmail = CleanName(recipientEmail, "unknown");
+        var safeOrganization = CleanName(organizationName, "the organization");
+        var safeTitle = CleanName(checklistTitle, "Checklist request");
+        var safePublicReference = CleanName(publicReference, "Not set");
+        var safeReceiptReference = CleanName(receiptReference, string.Empty);
+        var safeSubject = CleanName(subject, "Question about checklist submission");
+        var safeMessage = CleanName(message, "No message provided.");
+
+        var referenceLine = string.IsNullOrWhiteSpace(safeReceiptReference)
+            ? $"Checklist reference: {safePublicReference}\n"
+            : $"Checklist reference: {safePublicReference}\nReceipt reference: {safeReceiptReference}\n";
+
+        var text =
+            $"A recipient sent a message to {safeOrganization} through Reqara.\n\n" +
+            $"Recipient: {safeRecipient}\n" +
+            $"Email: {safeEmail}\n" +
+            $"Checklist: {safeTitle}\n" +
+            referenceLine +
+            $"Subject: {safeSubject}\n\n" +
+            $"{safeMessage}\n\n" +
+            "Reply directly to this email to reach the recipient.";
+
+        var details = new List<string>
+        {
+            $"<strong>Recipient:</strong> {Html(safeRecipient)}",
+            $"<strong>Email:</strong> {Html(safeEmail)}",
+            $"<strong>Checklist:</strong> {Html(safeTitle)}",
+            $"<strong>Checklist reference:</strong> {Html(safePublicReference)}"
+        };
+        if (!string.IsNullOrWhiteSpace(safeReceiptReference))
+        {
+            details.Add($"<strong>Receipt reference:</strong> {Html(safeReceiptReference)}");
+        }
+
+        details.Add($"<strong>Subject:</strong> {Html(safeSubject)}");
+        details.Add($"<strong>Message:</strong><br><span style=\"white-space:pre-line\">{Html(safeMessage)}</span>");
+
+        var html = BuildLayout(
+            "Recipient message",
+            $"A recipient sent a message to {Html(safeOrganization)} through Reqara.",
+            $"<strong>{Html(safeRecipient)}</strong> has a question about a checklist submission.",
+            null,
+            null,
+            details,
+            "Reply directly to this email to reach the recipient. Reqara did not expose your staff email in the recipient portal.");
+
+        return new TransactionalEmail($"Recipient question: {safeSubject}", text, html);
+    }
+
     public static TransactionalEmail ApiKeyCreatedNotification(
         string recipientFirstName,
         string organizationName,

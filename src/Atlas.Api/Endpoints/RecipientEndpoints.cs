@@ -36,6 +36,9 @@ public static class RecipientEndpoints
         group.MapPost("/return-link", RequestReturnLink);
         group.MapPost("/submit", SubmitChecklist);
         group.MapGet("/receipt", GetReceipt);
+        group.MapGet("/receipt.txt", GetReceiptText);
+        group.MapGet("/receipt.pdf", GetReceiptPdf);
+        group.MapPost("/contact-organization", ContactOrganization);
         return app;
     }
 
@@ -1073,12 +1076,16 @@ public static class RecipientEndpoints
 
         dbContext.Submissions.Add(submission);
         SecurityEndpoints.AddAudit(dbContext, action.OrganizationId, action.Id, tenantContext, "action.submitted", new { submission.Id, submission.VersionNumber }, httpContext);
+        var contentHash = Convert.ToHexString(submission.ContentHash).ToLowerInvariant();
         var response = new SubmissionResultResponse(
             submission.Id,
             submission.VersionNumber,
             submission.Status,
             submission.SubmittedAt,
-            Convert.ToHexString(submission.ContentHash).ToLowerInvariant());
+            contentHash,
+            action.PublicReference,
+            BuildReceiptReference(action.PublicReference, submission.SubmittedAt, contentHash),
+            BuildVerificationFingerprint(contentHash));
 
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
         {
@@ -1208,22 +1215,520 @@ public static class RecipientEndpoints
             return access.Problem;
         }
 
-        var recipient = access.Recipient!;
-        var submission = await dbContext.Submissions
-            .Where(item => item.ActionRecipientId == recipient.Id)
-            .OrderByDescending(item => item.VersionNumber)
-            .FirstOrDefaultAsync(cancellationToken);
-        if (submission is null)
+        var receipt = await BuildReceiptAsync(dbContext, access.Recipient!.Id, cancellationToken);
+        return receipt is null
+            ? EndpointHelpers.Problem("not_found", "Submission receipt was not found.", StatusCodes.Status404NotFound)
+            : Results.Ok(receipt);
+    }
+
+    private static async Task<IResult> GetReceiptText(
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireVerifiedRecipientAsync(dbContext, tenantContext, httpContext, cancellationToken);
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var receipt = await BuildReceiptAsync(dbContext, access.Recipient!.Id, cancellationToken);
+        if (receipt is null)
         {
             return EndpointHelpers.Problem("not_found", "Submission receipt was not found.", StatusCodes.Status404NotFound);
         }
 
-        return Results.Ok(new SubmissionResultResponse(
+        var fileName = $"{SanitizeFileName(receipt.ReceiptReference)}-receipt.txt";
+        return Results.File(
+            Encoding.UTF8.GetBytes(BuildReceiptText(receipt)),
+            "text/plain; charset=utf-8",
+            fileName);
+    }
+
+    private static async Task<IResult> GetReceiptPdf(
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireVerifiedRecipientAsync(dbContext, tenantContext, httpContext, cancellationToken);
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var receipt = await BuildReceiptAsync(dbContext, access.Recipient!.Id, cancellationToken);
+        if (receipt is null)
+        {
+            return EndpointHelpers.Problem("not_found", "Submission receipt was not found.", StatusCodes.Status404NotFound);
+        }
+
+        var fileName = $"{SanitizeFileName(receipt.ReceiptReference)}-receipt.pdf";
+        return Results.File(BuildReceiptPdf(receipt), "application/pdf", fileName);
+    }
+
+    private static async Task<IResult> ContactOrganization(
+        RecipientContactOrganizationRequest request,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IAdminSettingService settings,
+        IEmailService emailService,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireVerifiedRecipientAsync(dbContext, tenantContext, httpContext, cancellationToken);
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var validation = ValidateRecipientContactRequest(request);
+        if (validation is not null)
+        {
+            return validation;
+        }
+
+        var recipient = await dbContext.ActionRecipients.IgnoreQueryFilters()
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.Organization)
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.CreatedByUser)
+            .FirstOrDefaultAsync(item => item.Id == access.Recipient!.Id, cancellationToken);
+        if (recipient?.Action?.Organization is null)
+        {
+            return EndpointHelpers.Problem("recipient_session_required", "A valid recipient session is required.", StatusCodes.Status401Unauthorized);
+        }
+
+        var cooldownMinutes = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(recipient.Action.OrganizationId, "recipientContact", "cooldownMinutes", cancellationToken))?.ValueJson
+                ?? (await settings.GetAsync(null, "recipientContact", "cooldownMinutes", cancellationToken))?.ValueJson,
+            15);
+        var maxMessages = EndpointHelpers.ReadPositiveIntSetting(
+            (await settings.GetAsync(recipient.Action.OrganizationId, "recipientContact", "maxMessagesPerCooldown", cancellationToken))?.ValueJson
+                ?? (await settings.GetAsync(null, "recipientContact", "maxMessagesPerCooldown", cancellationToken))?.ValueJson,
+            3);
+        var recentCount = await dbContext.AuditEvents.IgnoreQueryFilters()
+            .CountAsync(item => item.OrganizationId == recipient.Action.OrganizationId
+                && item.ActionId == recipient.ActionId
+                && item.ActorType == ActorType.Recipient
+                && item.ActorId == recipient.Email
+                && item.EventType == "recipient.contact_organization_sent"
+                && item.CreatedAt >= clock.UtcNow.AddMinutes(-cooldownMinutes),
+                cancellationToken);
+        if (recentCount >= maxMessages)
+        {
+            return EndpointHelpers.Problem("rate_limited", "Please wait before sending another message.", StatusCodes.Status429TooManyRequests);
+        }
+
+        var contactEmail = await ResolveRecipientContactEmailAsync(
+            dbContext,
+            settings,
+            recipient.Action,
+            cancellationToken);
+        if (string.IsNullOrWhiteSpace(contactEmail))
+        {
+            return EndpointHelpers.Problem("contact_not_configured", "This organization has not configured a contact destination.", StatusCodes.Status409Conflict);
+        }
+
+        var subject = string.IsNullOrWhiteSpace(request.Subject)
+            ? "Question about checklist submission"
+            : request.Subject.Trim();
+        var message = request.Message!.Trim();
+        var receipt = await BuildReceiptAsync(dbContext, recipient.Id, cancellationToken);
+        var email = TransactionalEmailTemplates.RecipientContactOrganization(
+            recipient.Name,
+            recipient.Email,
+            recipient.Action.Organization.Name,
+            recipient.Action.Title,
+            recipient.Action.PublicReference,
+            receipt?.ReceiptReference,
+            subject,
+            message);
+        var send = await emailService.SendAsync(
+            contactEmail,
+            email.Subject,
+            email.TextBody,
+            email.HtmlBody,
+            "requests@reqara.com",
+            $"{recipient.Action.Organization.Name} via Reqara",
+            cancellationToken,
+            new Dictionary<string, string>
+            {
+                ["X-Atlas-Email-Type"] = "recipient-contact-organization",
+                ["X-Atlas-Action-Id"] = recipient.ActionId.ToString(),
+                ["X-Atlas-Recipient-Id"] = recipient.Id.ToString()
+            },
+            recipient.Email);
+
+        dbContext.NotificationDeliveries.Add(new NotificationDelivery
+        {
+            OrganizationId = recipient.Action.OrganizationId,
+            ActionRecipientId = recipient.Id,
+            Channel = DeliveryChannel.Email,
+            TemplateKey = "recipient_contact_organization",
+            ProviderMessageId = send.MessageId,
+            Status = send.Sent ? NotificationDeliveryStatus.Delivered : NotificationDeliveryStatus.Failed,
+            ErrorCode = Truncate(send.Error, 100),
+            SentAt = send.Sent ? clock.UtcNow : null,
+            DeliveredAt = send.Sent ? clock.UtcNow : null,
+            CreatedAt = clock.UtcNow
+        });
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            recipient.Action.OrganizationId,
+            recipient.ActionId,
+            tenantContext,
+            send.Sent ? "recipient.contact_organization_sent" : "recipient.contact_organization_send_failed",
+            new
+            {
+                recipient.Id,
+                Subject = subject,
+                MessagePreview = Truncate(message, 160),
+                send.MessageId,
+                send.Error
+            },
+            httpContext);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return send.Sent
+            ? Results.Accepted("/v1/recipient/contact-organization", new RecipientContactOrganizationResponse(true, clock.UtcNow))
+            : EndpointHelpers.Problem("email_send_failed", "Message could not be sent. Please try again later.", StatusCodes.Status503ServiceUnavailable);
+    }
+
+    private static async Task<SubmissionReceiptResponse?> BuildReceiptAsync(
+        AtlasDbContext dbContext,
+        Guid recipientId,
+        CancellationToken cancellationToken)
+    {
+        var submission = await dbContext.Submissions.AsNoTracking()
+            .Include(item => item.Action)
+            .ThenInclude(action => action!.Organization)
+            .Include(item => item.ActionRecipient)
+            .Include(item => item.Responses)
+            .Include(item => item.Files)
+            .Where(item => item.ActionRecipientId == recipientId)
+            .OrderByDescending(item => item.VersionNumber)
+            .FirstOrDefaultAsync(cancellationToken);
+        if (submission?.Action?.Organization is null || submission.ActionRecipient is null)
+        {
+            return null;
+        }
+
+        var requirementCount = await dbContext.Requirements.AsNoTracking()
+            .CountAsync(item => item.ActionId == submission.ActionId, cancellationToken);
+        var contentHash = Convert.ToHexString(submission.ContentHash).ToLowerInvariant();
+        var receiptReference = BuildReceiptReference(submission.Action.PublicReference, submission.SubmittedAt, contentHash);
+
+        return new SubmissionReceiptResponse(
             submission.Id,
+            submission.ActionId,
+            submission.Action.PublicReference,
+            receiptReference,
+            submission.Action.Title,
+            submission.Action.Organization.Name,
+            submission.ActionRecipient.Name,
+            submission.ActionRecipient.Email,
             submission.VersionNumber,
             submission.Status,
             submission.SubmittedAt,
-            Convert.ToHexString(submission.ContentHash).ToLowerInvariant()));
+            submission.DeclarationAcceptedAt,
+            requirementCount,
+            submission.Responses.Count,
+            submission.Files.Count,
+            submission.Files.Count(item => item.IsPreviouslySubmitted),
+            contentHash,
+            BuildVerificationFingerprint(contentHash));
+    }
+
+    private static async Task<string?> ResolveRecipientContactEmailAsync(
+        AtlasDbContext dbContext,
+        IAdminSettingService settings,
+        ChecklistAction action,
+        CancellationToken cancellationToken)
+    {
+        var configured = EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(action.OrganizationId, "recipientContact", "email", cancellationToken))?.ValueJson)
+            ?? EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(action.OrganizationId, "recipientContact", "toEmail", cancellationToken))?.ValueJson)
+            ?? EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(action.OrganizationId, "support", "contactEmail", cancellationToken))?.ValueJson)
+            ?? EndpointHelpers.ReadStringSetting(
+                (await settings.GetAsync(null, "recipientContact", "email", cancellationToken))?.ValueJson);
+        if (LooksLikeEmail(configured))
+        {
+            return configured!.Trim();
+        }
+
+        if (LooksLikeEmail(action.CreatedByUser?.Email))
+        {
+            return action.CreatedByUser!.Email.Trim();
+        }
+
+        return await dbContext.OrganizationUsers.IgnoreQueryFilters()
+            .AsNoTracking()
+            .Include(item => item.User)
+            .Where(item => item.OrganizationId == action.OrganizationId
+                && item.Status == MembershipStatus.Active
+                && item.User != null
+                && (item.Role == OrganizationUserRole.Owner || item.Role == OrganizationUserRole.Admin))
+            .OrderBy(item => item.Role)
+            .Select(item => item.User!.Email)
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
+    private static IResult? ValidateRecipientContactRequest(RecipientContactOrganizationRequest request)
+    {
+        var errors = new Dictionary<string, string[]>();
+        if (string.IsNullOrWhiteSpace(request.Message))
+        {
+            errors["message"] = ["Message is required."];
+        }
+        else if (request.Message.Trim().Length > 2000)
+        {
+            errors["message"] = ["Message must be 2,000 characters or fewer."];
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.Subject) && request.Subject.Trim().Length > 120)
+        {
+            errors["subject"] = ["Subject must be 120 characters or fewer."];
+        }
+
+        return errors.Count == 0
+            ? null
+            : Results.Problem(
+                title: "Validation failed",
+                statusCode: StatusCodes.Status422UnprocessableEntity,
+                type: "https://docs.atlas.example/errors/validation_failed",
+                extensions: new Dictionary<string, object?>
+                {
+                    ["code"] = "validation_failed",
+                    ["errors"] = errors
+                });
+    }
+
+    private static string BuildReceiptReference(string publicReference, DateTimeOffset submittedAt, string contentHash)
+    {
+        if (!string.IsNullOrWhiteSpace(publicReference))
+        {
+            return publicReference.Trim();
+        }
+
+        var suffix = contentHash.Length >= 6
+            ? contentHash[..6].ToUpperInvariant()
+            : "000000";
+        return $"REQ-{submittedAt:yyyyMMdd}-{suffix}";
+    }
+
+    private static string BuildVerificationFingerprint(string contentHash)
+    {
+        var normalized = new string(contentHash.Where(char.IsAsciiHexDigit).ToArray()).ToUpperInvariant();
+        if (normalized.Length < 16)
+        {
+            normalized = normalized.PadRight(16, '0');
+        }
+
+        return string.Join("-", Enumerable.Range(0, 4).Select(index => normalized.Substring(index * 4, 4)));
+    }
+
+    private static string BuildReceiptText(SubmissionReceiptResponse receipt)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("Reqara Submission Receipt");
+        builder.AppendLine("==========================");
+        builder.AppendLine();
+        builder.AppendLine($"Reference: {receipt.ReceiptReference}");
+        builder.AppendLine($"Status: {receipt.Status}");
+        builder.AppendLine($"Submitted: {receipt.SubmittedAt:yyyy-MM-dd HH:mm:ss 'UTC'}");
+        builder.AppendLine($"Checklist: {receipt.ChecklistTitle}");
+        builder.AppendLine($"Organization: {receipt.OrganizationName}");
+        builder.AppendLine($"Recipient: {receipt.RecipientName} <{receipt.RecipientEmail}>");
+        builder.AppendLine($"Version: {receipt.VersionNumber}");
+        builder.AppendLine($"Requirements: {receipt.RequirementCount}");
+        builder.AppendLine($"Responses: {receipt.ResponseCount}");
+        builder.AppendLine($"Files: {receipt.FileCount}");
+        builder.AppendLine($"Previously submitted files used: {receipt.PreviouslySubmittedFileCount}");
+        builder.AppendLine($"Verification fingerprint: {receipt.VerificationFingerprint}");
+        builder.AppendLine();
+        builder.AppendLine("This receipt confirms that Reqara received this checklist submission. It does not mean the organization has reviewed or accepted the submission yet.");
+        return builder.ToString();
+    }
+
+    private static byte[] BuildReceiptPdf(SubmissionReceiptResponse receipt)
+    {
+        var content = BuildReceiptPdfContent(receipt);
+        return BuildSimplePdf(content);
+    }
+
+    private static string BuildReceiptPdfContent(SubmissionReceiptResponse receipt)
+    {
+        var commands = new StringBuilder();
+        commands.AppendLine("0.99 0.995 1 rg 0 0 612 792 re f");
+        commands.AppendLine("0.11 0.09 0.27 rg 0 704 612 88 re f");
+        commands.AppendLine("0.50 0.44 1.00 rg 48 724 44 44 re f");
+        commands.AppendLine(PdfText("F2", 16, 62, 741, "RQ", "1 1 1"));
+        commands.AppendLine(PdfText("F2", 26, 112, 748, "Submission receipt", "1 1 1"));
+        commands.AppendLine(PdfText("F1", 11, 114, 728, "Secure checklist proof generated by Reqara", "0.78 0.82 0.96"));
+
+        commands.AppendLine("0.02 0.75 0.68 rg 470 736 88 24 re f");
+        commands.AppendLine(PdfText("F2", 10, 492, 744, receipt.Status.ToString().ToUpperInvariant(), "1 1 1"));
+
+        commands.AppendLine("1 1 1 rg 42 398 528 274 re f");
+        commands.AppendLine("0.86 0.88 0.92 RG 42 398 528 274 re S");
+        commands.AppendLine("0.96 0.98 1 rg 42 620 528 52 re f");
+        commands.AppendLine(PdfText("F1", 10, 64, 650, "REFERENCE"));
+        commands.AppendLine(PdfText("F2", 20, 64, 626, receipt.ReceiptReference));
+        commands.AppendLine(PdfText("F1", 10, 366, 650, "SUBMITTED"));
+        commands.AppendLine(PdfText("F2", 12, 366, 629, receipt.SubmittedAt.ToString("MMM d, yyyy HH:mm 'UTC'", CultureInfo.InvariantCulture)));
+
+        DrawLabelValue(commands, 64, 590, "Checklist", receipt.ChecklistTitle);
+        DrawLabelValue(commands, 64, 550, "Organization", receipt.OrganizationName);
+        DrawLabelValue(commands, 64, 510, "Recipient", $"{receipt.RecipientName} <{receipt.RecipientEmail}>");
+        DrawLabelValue(commands, 64, 470, "Version", receipt.VersionNumber.ToString(CultureInfo.InvariantCulture));
+        DrawLabelValue(commands, 330, 470, "Verification fingerprint", receipt.VerificationFingerprint);
+        DrawLabelValue(commands, 64, 430, "Content hash", receipt.ContentHash.Length > 36 ? $"{receipt.ContentHash[..36]}..." : receipt.ContentHash);
+
+        commands.AppendLine("1 1 1 rg 42 222 528 138 re f");
+        commands.AppendLine("0.86 0.88 0.92 RG 42 222 528 138 re S");
+        commands.AppendLine(PdfText("F2", 15, 64, 332, "Submission summary"));
+        DrawMetric(commands, 64, 280, "Requirements", receipt.RequirementCount.ToString(CultureInfo.InvariantCulture));
+        DrawMetric(commands, 190, 280, "Responses", receipt.ResponseCount.ToString(CultureInfo.InvariantCulture));
+        DrawMetric(commands, 316, 280, "Files", receipt.FileCount.ToString(CultureInfo.InvariantCulture));
+        DrawMetric(commands, 442, 280, "Reused files", receipt.PreviouslySubmittedFileCount.ToString(CultureInfo.InvariantCulture));
+
+        commands.AppendLine("0.94 0.98 0.98 rg 42 142 528 52 re f");
+        commands.AppendLine("0.78 0.91 0.91 RG 42 142 528 52 re S");
+        commands.AppendLine(PdfText("F2", 12, 64, 172, "Important"));
+        commands.AppendLine(PdfText("F1", 10, 64, 154, "This confirms receipt of the submission. Review and acceptance are completed by the organization."));
+        commands.AppendLine(PdfText("F1", 9, 42, 74, "Powered by Reqara"));
+        commands.AppendLine(PdfText("F1", 9, 372, 74, $"Generated {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm 'UTC'}"));
+        return commands.ToString();
+    }
+
+    private static void DrawLabelValue(StringBuilder commands, int x, int y, string label, string value)
+    {
+        commands.AppendLine(PdfText("F1", 9, x, y, label.ToUpperInvariant()));
+        var lines = WrapText(value, x > 300 ? 28 : 46).Take(2).ToArray();
+        for (var index = 0; index < lines.Length; index++)
+        {
+            commands.AppendLine(PdfText("F2", 11, x, y - 17 - (index * 13), lines[index]));
+        }
+    }
+
+    private static void DrawMetric(StringBuilder commands, int x, int y, string label, string value)
+    {
+        commands.AppendLine("0.97 0.98 1 rg " + x.ToString(CultureInfo.InvariantCulture) + " " + y.ToString(CultureInfo.InvariantCulture) + " 92 46 re f");
+        commands.AppendLine("0.88 0.90 0.94 RG " + x.ToString(CultureInfo.InvariantCulture) + " " + y.ToString(CultureInfo.InvariantCulture) + " 92 46 re S");
+        commands.AppendLine(PdfText("F2", 17, x + 12, y + 22, value));
+        commands.AppendLine(PdfText("F1", 8, x + 12, y + 9, label.ToUpperInvariant()));
+    }
+
+    private static byte[] BuildSimplePdf(string content)
+    {
+        var contentBytes = Encoding.ASCII.GetBytes(content);
+        var objects = new[]
+        {
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
+            $"<< /Length {contentBytes.Length} >>\nstream\n{content}\nendstream"
+        };
+
+        var output = new List<byte>();
+        AddAscii(output, "%PDF-1.4\n");
+        var offsets = new List<int> { 0 };
+        for (var index = 0; index < objects.Length; index++)
+        {
+            offsets.Add(output.Count);
+            AddAscii(output, $"{index + 1} 0 obj\n{objects[index]}\nendobj\n");
+        }
+
+        var xrefOffset = output.Count;
+        AddAscii(output, $"xref\n0 {objects.Length + 1}\n");
+        AddAscii(output, "0000000000 65535 f \n");
+        foreach (var offset in offsets.Skip(1))
+        {
+            AddAscii(output, $"{offset:0000000000} 00000 n \n");
+        }
+
+        AddAscii(output, $"trailer\n<< /Size {objects.Length + 1} /Root 1 0 R >>\nstartxref\n{xrefOffset}\n%%EOF\n");
+        return output.ToArray();
+    }
+
+    private static void AddAscii(List<byte> output, string value)
+    {
+        output.AddRange(Encoding.ASCII.GetBytes(value));
+    }
+
+    private static string PdfText(string font, int size, int x, int y, string value, string color = "0 0 0")
+    {
+        return $"BT /{font} {size} Tf {color} rg {x.ToString(CultureInfo.InvariantCulture)} {y.ToString(CultureInfo.InvariantCulture)} Td ({PdfEscape(value)}) Tj ET";
+    }
+
+    private static string PdfEscape(string value)
+    {
+        var safe = new StringBuilder(value.Length);
+        foreach (var character in value)
+        {
+            var normalized = character is >= ' ' and <= '~' ? character : '?';
+            if (normalized is '\\' or '(' or ')')
+            {
+                safe.Append('\\');
+            }
+
+            safe.Append(normalized);
+        }
+
+        return safe.ToString();
+    }
+
+    private static IEnumerable<string> WrapText(string value, int maxCharacters)
+    {
+        var words = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var line = new StringBuilder();
+        foreach (var word in words)
+        {
+            if (line.Length > 0 && line.Length + word.Length + 1 > maxCharacters)
+            {
+                yield return line.ToString();
+                line.Clear();
+            }
+
+            if (line.Length > 0)
+            {
+                line.Append(' ');
+            }
+
+            line.Append(word.Length > maxCharacters ? word[..maxCharacters] : word);
+        }
+
+        if (line.Length > 0)
+        {
+            yield return line.ToString();
+        }
+    }
+
+    private static string SanitizeFileName(string value)
+    {
+        var safe = new string(value.Select(character =>
+            char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '-').ToArray());
+        return string.IsNullOrWhiteSpace(safe) ? "reqara-submission" : safe.Trim('-');
+    }
+
+    private static bool LooksLikeEmail(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        return trimmed.Contains('@', StringComparison.Ordinal)
+            && trimmed.Contains('.', StringComparison.Ordinal)
+            && !trimmed.Contains(' ', StringComparison.Ordinal);
     }
 
     private static async Task<RecipientAccess> RequireVerifiedRecipientAsync(
@@ -1685,4 +2190,31 @@ public sealed record SubmissionResultResponse(
     int VersionNumber,
     SubmissionStatus Status,
     DateTimeOffset SubmittedAt,
-    string ContentHash);
+    string ContentHash,
+    string PublicReference,
+    string ReceiptReference,
+    string VerificationFingerprint);
+
+public sealed record SubmissionReceiptResponse(
+    Guid Id,
+    Guid ChecklistId,
+    string PublicReference,
+    string ReceiptReference,
+    string ChecklistTitle,
+    string OrganizationName,
+    string RecipientName,
+    string RecipientEmail,
+    int VersionNumber,
+    SubmissionStatus Status,
+    DateTimeOffset SubmittedAt,
+    DateTimeOffset? DeclarationAcceptedAt,
+    int RequirementCount,
+    int ResponseCount,
+    int FileCount,
+    int PreviouslySubmittedFileCount,
+    string ContentHash,
+    string VerificationFingerprint);
+
+public sealed record RecipientContactOrganizationRequest(string? Subject, string? Message);
+
+public sealed record RecipientContactOrganizationResponse(bool Accepted, DateTimeOffset SentAt);
