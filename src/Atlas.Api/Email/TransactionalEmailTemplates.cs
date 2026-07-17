@@ -245,6 +245,49 @@ internal static class TransactionalEmailTemplates
         return new TransactionalEmail(subject, text, html);
     }
 
+    public static TransactionalEmail ChecklistCancelled(
+        string recipientFirstName,
+        string senderFullName,
+        string organizationName,
+        string checklistTitle,
+        string? reason)
+    {
+        var safeFirstName = CleanName(recipientFirstName, "there");
+        var safeSender = CleanName(senderFullName, "your sender");
+        var safeOrganization = CleanName(organizationName, "the sender");
+        var safeTitle = CleanName(checklistTitle, "Checklist request");
+        var safeReason = CleanName(reason, string.Empty);
+        var reasonText = string.IsNullOrWhiteSpace(safeReason)
+            ? string.Empty
+            : $"\nReason: {safeReason}\n";
+        var reasonDetail = string.IsNullOrWhiteSpace(safeReason)
+            ? Array.Empty<string>()
+            : new[] { $"<strong>Reason:</strong> {Html(safeReason)}" };
+
+        var text =
+            $"Hi {safeFirstName},\n\n" +
+            $"{safeSender} at {safeOrganization} has cancelled this checklist request:\n\n" +
+            $"{safeTitle}\n" +
+            reasonText +
+            "\nNo further action is needed.\n\n" +
+            $"If you have questions, reply to this email to reach {safeSender} directly.";
+
+        var details = new[] { $"<strong>Request:</strong> {Html(safeTitle)}" }
+            .Concat(reasonDetail)
+            .ToArray();
+
+        var html = BuildLayout(
+            "Checklist cancelled",
+            $"Hi {Html(safeFirstName)},",
+            $"{Html(safeSender)} at {Html(safeOrganization)} has cancelled this checklist request. No further action is needed.",
+            null,
+            null,
+            details,
+            $"If you have questions, reply to this email to reach {Html(safeSender)} directly.");
+
+        return new TransactionalEmail($"{safeOrganization} cancelled this checklist request", text, html);
+    }
+
     public static TransactionalEmail ReturnLink(
         string recipientFirstName,
         string organizationName,

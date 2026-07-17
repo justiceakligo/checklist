@@ -22,6 +22,7 @@ public sealed class ChecklistAction : Entity, ITenantOwned, ISoftDelete
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? CancelledAt { get; set; }
+    public string? CancellationReason { get; set; }
     public DateTimeOffset? DeletedAt { get; set; }
 
     public Organization? Organization { get; set; }

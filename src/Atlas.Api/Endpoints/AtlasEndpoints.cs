@@ -1105,6 +1105,8 @@ public static class AtlasEndpoints
         group.MapGet("", async (
             int? page,
             int? pageSize,
+            string? view,
+            ChecklistActionStatus? status,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
             CancellationToken cancellationToken) =>
@@ -1121,6 +1123,14 @@ public static class AtlasEndpoints
             var normalizedPage = EndpointHelpers.NormalizePage(page);
             var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
             var query = dbContext.Actions.AsNoTracking();
+            if (status.HasValue)
+            {
+                query = query.Where(action => action.Status == status.Value);
+            }
+            else
+            {
+                query = ApplyActionListView(query, view);
+            }
             var total = await query.CountAsync(cancellationToken);
             var actionRows = await query
                 .Include(action => action.Template)
@@ -1183,6 +1193,8 @@ public static class AtlasEndpoints
                 action.ExpiresAt,
                 action.SentAt,
                 action.CompletedAt,
+                action.CancelledAt,
+                action.CancellationReason,
                 action.Recipients.Select(item => new ActionRecipientResponse(item.Id, item.Name, item.Email, item.Phone, item.Status, item.OtpRequired, item.FirstViewedAt, item.StartedAt, item.SubmittedAt)).ToList(),
                 action.Requirements.OrderBy(item => item.DisplayOrder).Select(item => new ActionRequirementResponse(item.Id, item.Key, item.Type, item.Label, item.IsRequired, item.DisplayOrder)).ToList(),
                 action.CreatedAt,
@@ -1608,6 +1620,7 @@ public static class AtlasEndpoints
             Guid id,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
+            IEmailService emailService,
             IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
@@ -1621,22 +1634,129 @@ public static class AtlasEndpoints
                 return sandboxProblem;
             }
 
-            var action = await dbContext.Actions.FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
-            if (action is null)
+            var cancelRequestResult = await ReadCancelActionRequestAsync(httpContext, cancellationToken);
+            if (cancelRequestResult.Problem is not null)
+            {
+                return cancelRequestResult.Problem;
+            }
+
+            var request = cancelRequestResult.Request;
+            var action = await dbContext.Actions
+                .Include(item => item.Organization)
+                .Include(item => item.CreatedByUser)
+                .Include(item => item.Recipients)
+                .ThenInclude(item => item.ReminderSchedules)
+                .Include(item => item.Recipients)
+                .ThenInclude(item => item.AccessSessions)
+                .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
+            if (action?.Organization is null || action.CreatedByUser is null)
             {
                 return EndpointHelpers.Problem("not_found", "Action was not found.", StatusCodes.Status404NotFound);
             }
 
-            if (action.Status is ChecklistActionStatus.Completed or ChecklistActionStatus.Cancelled)
+            if (action.Status is ChecklistActionStatus.Submitted
+                or ChecklistActionStatus.Completed
+                or ChecklistActionStatus.Cancelled
+                or ChecklistActionStatus.Expired)
             {
                 return EndpointHelpers.Problem("state_conflict", "Action cannot be cancelled in its current state.", StatusCodes.Status409Conflict);
             }
 
+            var notifyRecipients = request.NotifyRecipients ?? true;
+            var recipientsToNotify = notifyRecipients && action.SentAt.HasValue
+                ? action.Recipients
+                    .Where(recipient => recipient.Status is ActionRecipientStatus.Pending or ActionRecipientStatus.Viewed or ActionRecipientStatus.Started)
+                    .ToList()
+                : new List<ActionRecipient>();
+            var now = clock.UtcNow;
+            var reason = NormalizeCancellationReason(request.Reason);
+
             action.Status = ChecklistActionStatus.Cancelled;
-            action.CancelledAt = clock.UtcNow;
-            SecurityEndpoints.AddAudit(dbContext, organizationId, action.Id, tenantContext, "action.cancelled", new { action.Id }, httpContext);
+            action.CancelledAt = now;
+            action.CancellationReason = reason;
+            action.UpdatedAt = now;
+            foreach (var recipient in action.Recipients)
+            {
+                if (recipient.Status != ActionRecipientStatus.Submitted)
+                {
+                    recipient.Status = ActionRecipientStatus.Cancelled;
+                }
+
+                recipient.TokenExpiresAt = now;
+                recipient.OtpCodeHash = null;
+                recipient.OtpExpiresAt = null;
+                recipient.OtpAttemptCount = 0;
+                foreach (var session in recipient.AccessSessions.Where(session => session.RevokedAt is null))
+                {
+                    session.RevokedAt = now;
+                    session.ExpiresAt = session.ExpiresAt > now ? now : session.ExpiresAt;
+                }
+
+                foreach (var reminder in recipient.ReminderSchedules.Where(reminder => reminder.Status == ReminderStatus.Pending))
+                {
+                    reminder.Status = ReminderStatus.Cancelled;
+                }
+            }
+
             await dbContext.SaveChangesAsync(cancellationToken);
-            return Results.Ok(new { action.Id, action.Status, action.CancelledAt });
+
+            var notificationResults = new List<CancelNotificationResult>();
+            if (recipientsToNotify.Count > 0)
+            {
+                foreach (var recipient in recipientsToNotify)
+                {
+                    var email = TransactionalEmailTemplates.ChecklistCancelled(
+                        FirstName(recipient.Name),
+                        action.CreatedByUser.FullName,
+                        action.Organization.Name,
+                        action.Title,
+                        reason);
+                    var result = await emailService.SendAsync(
+                        recipient.Email,
+                        email.Subject,
+                        email.TextBody,
+                        email.HtmlBody,
+                        "requests@reqara.com",
+                        $"{action.Organization.Name} via Reqara",
+                        cancellationToken,
+                        new Dictionary<string, string>
+                        {
+                            ["X-Atlas-Email-Type"] = "recipient-cancellation",
+                            ["X-Atlas-Action-Id"] = action.Id.ToString(),
+                            ["X-Atlas-Recipient-Id"] = recipient.Id.ToString()
+                        },
+                        action.CreatedByUser.Email);
+                    AddNotificationDelivery(dbContext, organizationId, recipient.Id, "recipient_cancellation", result, clock);
+                    notificationResults.Add(new CancelNotificationResult(recipient.Id, recipient.Email, result.Sent, result.Error));
+                }
+            }
+
+            SecurityEndpoints.AddAudit(
+                dbContext,
+                organizationId,
+                action.Id,
+                tenantContext,
+                "action.cancelled",
+                new
+                {
+                    action.Id,
+                    reason,
+                    notifyRecipients,
+                    notified = notificationResults.Count(item => item.Sent),
+                    failed = notificationResults.Count(item => !item.Sent)
+                },
+                httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            return Results.Ok(new CancelActionResponse(
+                action.Id,
+                action.Status,
+                action.CancelledAt,
+                action.CancellationReason,
+                recipientsToNotify.Count,
+                notificationResults.Count(item => item.Sent),
+                notificationResults.Count(item => !item.Sent),
+                notificationResults));
         });
 
         group.MapPost("/{id:guid}/reminders", async (
@@ -2737,6 +2857,8 @@ public static class AtlasEndpoints
             action.ExpiresAt,
             action.SentAt,
             action.CompletedAt,
+            action.CancelledAt,
+            action.CancellationReason,
             action.TemplateId,
             action.Template?.Name,
             recipient is null
@@ -2753,6 +2875,57 @@ public static class AtlasEndpoints
             action.CreatedAt,
             action.UpdatedAt,
             lastActivityAt);
+    }
+
+    private static IQueryable<ChecklistAction> ApplyActionListView(IQueryable<ChecklistAction> query, string? view)
+    {
+        return view?.Trim().ToLowerInvariant() switch
+        {
+            "active" => query.Where(action => action.Status == ChecklistActionStatus.Draft
+                || action.Status == ChecklistActionStatus.Sent
+                || action.Status == ChecklistActionStatus.InProgress
+                || action.Status == ChecklistActionStatus.Submitted),
+            "archive" or "archived" => query.Where(action => action.Status == ChecklistActionStatus.Completed
+                || action.Status == ChecklistActionStatus.Cancelled
+                || action.Status == ChecklistActionStatus.Expired),
+            _ => query
+        };
+    }
+
+    private static async Task<CancelActionRequestReadResult> ReadCancelActionRequestAsync(
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (httpContext.Request.ContentLength is null or 0)
+        {
+            return new CancelActionRequestReadResult(new CancelActionRequest(null, null), null);
+        }
+
+        try
+        {
+            var request = await JsonSerializer.DeserializeAsync<CancelActionRequest>(
+                httpContext.Request.Body,
+                EndpointHelpers.JsonOptions,
+                cancellationToken);
+            return new CancelActionRequestReadResult(request ?? new CancelActionRequest(null, null), null);
+        }
+        catch (JsonException)
+        {
+            return new CancelActionRequestReadResult(
+                new CancelActionRequest(null, null),
+                EndpointHelpers.Problem("validation_failed", "Cancellation request body must be valid JSON.", StatusCodes.Status422UnprocessableEntity));
+        }
+    }
+
+    private static string? NormalizeCancellationReason(string? reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            return null;
+        }
+
+        var trimmed = reason.Trim();
+        return trimmed.Length <= 500 ? trimmed : trimmed[..500];
     }
 
     private static IResult DuplicateActionProblem(string code, string title, ChecklistAction action)
@@ -3178,6 +3351,8 @@ public sealed record ActionListItemResponse(
     DateTimeOffset? ExpiresAt,
     DateTimeOffset? SentAt,
     DateTimeOffset? CompletedAt,
+    DateTimeOffset? CancelledAt,
+    string? CancellationReason,
     Guid? TemplateId,
     string? TemplateName,
     ActionListRecipientResponse? Recipient,
@@ -3206,6 +3381,8 @@ public sealed record ActionDetailResponse(
     DateTimeOffset? ExpiresAt,
     DateTimeOffset? SentAt,
     DateTimeOffset? CompletedAt,
+    DateTimeOffset? CancelledAt,
+    string? CancellationReason,
     IReadOnlyList<ActionRecipientResponse> Recipients,
     IReadOnlyList<ActionRequirementResponse> Requirements,
     DateTimeOffset CreatedAt,
@@ -3237,6 +3414,30 @@ public sealed record AuditEventResponse(
     string? ActorId,
     string EventData,
     DateTimeOffset CreatedAt);
+
+public sealed record CancelActionRequest(
+    string? Reason,
+    bool? NotifyRecipients);
+
+public sealed record CancelActionResponse(
+    Guid Id,
+    ChecklistActionStatus Status,
+    DateTimeOffset? CancelledAt,
+    string? CancellationReason,
+    int RecipientNotificationCount,
+    int RecipientNotificationsSent,
+    int RecipientNotificationsFailed,
+    IReadOnlyList<CancelNotificationResult> Notifications);
+
+public sealed record CancelNotificationResult(
+    Guid RecipientId,
+    string RecipientEmail,
+    bool Sent,
+    string? Error);
+
+internal sealed record CancelActionRequestReadResult(
+    CancelActionRequest Request,
+    IResult? Problem);
 
 public sealed record UploadIntentRequest(
     Guid RequirementId,

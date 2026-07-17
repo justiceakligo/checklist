@@ -70,7 +70,12 @@ public static class RecipientEndpoints
             return EndpointHelpers.Problem("expired_link", "Recipient link has expired.", StatusCodes.Status410Gone);
         }
 
-        if (recipient.Action.Status is ChecklistActionStatus.Cancelled or ChecklistActionStatus.Expired)
+        if (recipient.Action.Status == ChecklistActionStatus.Cancelled)
+        {
+            return EndpointHelpers.Problem("cancelled_checklist", "This checklist request was cancelled by the sender.", StatusCodes.Status410Gone);
+        }
+
+        if (recipient.Action.Status == ChecklistActionStatus.Expired)
         {
             return EndpointHelpers.Problem("inactive_link", "Recipient link is no longer active.", StatusCodes.Status410Gone);
         }
@@ -1181,6 +1186,16 @@ public static class RecipientEndpoints
         if (recipient.OtpRequired && !session.OtpVerified)
         {
             return new RecipientAccess(null, null, EndpointHelpers.Problem("otp_required", "Access code verification is required.", StatusCodes.Status403Forbidden));
+        }
+
+        if (recipient.Action.Status == ChecklistActionStatus.Cancelled)
+        {
+            return new RecipientAccess(null, null, EndpointHelpers.Problem("cancelled_checklist", "This checklist request was cancelled by the sender.", StatusCodes.Status410Gone));
+        }
+
+        if (recipient.Action.Status == ChecklistActionStatus.Expired)
+        {
+            return new RecipientAccess(null, null, EndpointHelpers.Problem("inactive_link", "Recipient link is no longer active.", StatusCodes.Status410Gone));
         }
 
         return new RecipientAccess(recipient, session, null);

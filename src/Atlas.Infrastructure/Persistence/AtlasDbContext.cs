@@ -257,6 +257,7 @@ public sealed class AtlasDbContext(
             entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.CancelledAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CancellationReason).HasMaxLength(500);
             entity.Property(e => e.DeletedAt).HasColumnType("timestamptz");
             entity.HasOne(e => e.Organization)
                 .WithMany(e => e.Actions)
