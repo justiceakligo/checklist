@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Atlas.Application.Abstractions;
 using Atlas.Application.Storage;
+using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -75,6 +76,7 @@ public static class SubmissionEndpoints
                 .AsNoTracking()
                 .Include(item => item.Responses)
                 .Include(item => item.Files)
+                .ThenInclude(item => item.FileAsset)
                 .FirstOrDefaultAsync(item => item.Id == id, cancellationToken);
             if (submission is null)
             {
@@ -97,7 +99,7 @@ public static class SubmissionEndpoints
                 submission.Responses.Select(item => new SubmittedResponseValue(
                     item.RequirementId,
                     item.ValueJson == null ? null : JsonSerializer.Deserialize<JsonElement>(item.ValueJson, EndpointHelpers.JsonOptions))).ToList(),
-                submission.Files.Select(item => new SubmittedFileValue(item.RequirementId, item.FileAssetId)).ToList()));
+                submission.Files.Select(ToSubmittedFileValue).ToList()));
         });
 
         group.MapGet("/{id:guid}/export", async (
@@ -274,6 +276,21 @@ public static class SubmissionEndpoints
         return app;
     }
 
+    private static SubmittedFileValue ToSubmittedFileValue(SubmissionFile file)
+    {
+        return new SubmittedFileValue(
+            file.RequirementId,
+            file.FileAssetId,
+            file.FileAsset?.OriginalFileName ?? file.DocumentName ?? string.Empty,
+            file.FileAsset?.OriginalFileName ?? file.DocumentName ?? string.Empty,
+            file.FileAsset?.MimeType ?? string.Empty,
+            file.FileAsset?.SizeBytes ?? 0,
+            file.FileAsset?.ScanStatus ?? FileScanStatus.Pending,
+            file.IsPreviouslySubmitted,
+            file.DocumentName,
+            file.DocumentExpiresAt);
+    }
+
     private static async Task<IResult> ReviewSubmissionAsync(
         Guid id,
         SubmissionStatus status,
@@ -377,7 +394,17 @@ public sealed record SubmissionExportResponse(
 
 public sealed record SubmittedResponseValue(Guid RequirementId, JsonElement? Value);
 
-public sealed record SubmittedFileValue(Guid RequirementId, Guid FileAssetId);
+public sealed record SubmittedFileValue(
+    Guid RequirementId,
+    Guid FileAssetId,
+    string FileName,
+    string OriginalFileName,
+    string MimeType,
+    long SizeBytes,
+    FileScanStatus ScanStatus,
+    bool IsPreviouslySubmitted,
+    string? DocumentName,
+    DateTimeOffset? DocumentExpiresAt);
 
 public sealed record SubmittedFileExportValue(
     Guid RequirementId,

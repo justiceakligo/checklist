@@ -1085,7 +1085,7 @@ GET /v1/submissions?page=1&pageSize=25
 
 ### GET `/v1/submissions/{id}`
 
-Includes declaration timestamp/IP, content hash, response values, and file IDs.
+Includes declaration timestamp/IP, content hash, response values, file IDs, and file metadata for dashboard previews.
 
 ```json
 {
@@ -1110,11 +1110,21 @@ Includes declaration timestamp/IP, content hash, response values, and file IDs.
   "files": [
     {
       "requirementId": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
-      "fileAssetId": "cccccccc-cccc-cccc-cccc-cccccccccccc"
+      "fileAssetId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "fileName": "government-id.pdf",
+      "originalFileName": "government-id.pdf",
+      "mimeType": "application/pdf",
+      "sizeBytes": 245760,
+      "scanStatus": "Clean",
+      "isPreviouslySubmitted": false,
+      "documentName": null,
+      "documentExpiresAt": null
     }
   ]
 }
 ```
+
+Use `fileName` for the dashboard label. Use `mimeType` for preview decisions. Use `GET /v1/files/{fileAssetId}/download-url` only after the user clicks Preview or Download; signed URLs are short-lived.
 
 ### GET `/v1/submissions/{id}/export`
 
