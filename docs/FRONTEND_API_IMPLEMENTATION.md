@@ -1303,7 +1303,7 @@ Marks upload received, verifies size, and scans with ClamAV in the current produ
 
 ### GET `/v1/recipient/uploads/{fileId}`
 
-Recipient-safe polling endpoint for scan state. If the file is still `Pending` and the uploaded object exists in storage, the backend attempts to finalize the ClamAV scan during this request and returns the updated status.
+Recipient-safe polling endpoint for scan state. If the file is still `Pending` and the uploaded object exists in storage, the backend attempts to finalize the ClamAV scan during this request and returns the updated status. A backend worker also scans pending files on the configured interval, so polling is safe even if the initial complete call returned `Pending`.
 
 ```json
 {

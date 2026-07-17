@@ -107,6 +107,7 @@ builder.Services.AddSwaggerGen(options =>
 builder.Services.AddAtlasInfrastructure(builder.Configuration);
 builder.Services.AddHostedService<ReminderDispatcherService>();
 builder.Services.AddHostedService<RetentionPurgeService>();
+builder.Services.AddHostedService<FileScanDispatcherService>();
 
 var app = builder.Build();
 
