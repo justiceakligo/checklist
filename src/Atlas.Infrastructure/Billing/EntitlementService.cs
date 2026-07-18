@@ -271,6 +271,18 @@ public sealed class EntitlementService(
             "security_review" => features.SecurityReview,
             "dpa" => features.Dpa,
             "dedicated_onboarding" => features.DedicatedOnboarding,
+            "package_report" => features.TeamWorkspace,
+            "package_zip_export" => features.TeamWorkspace,
+            "manual_handoff" => features.TeamWorkspace,
+            "email_destination" => features.AutomaticReminders,
+            "webhook_destination" => features.ApiAndWebhooks,
+            "api_access" => features.ApiAndWebhooks,
+            "api_pull_destination" => features.ApiAndWebhooks,
+            "custom_destinations" => features.CustomWorkflows,
+            "automatic_routing" => features.CustomWorkflows,
+            "sharepoint_destination" => features.CustomWorkflows,
+            "delivery_history_retention" => features.TeamWorkspace,
+            "advanced_audit" => features.TeamWorkspace,
             _ => false
         };
     }

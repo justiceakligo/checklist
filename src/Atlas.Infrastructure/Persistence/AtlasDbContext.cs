@@ -35,6 +35,12 @@ public sealed class AtlasDbContext(
     public DbSet<UsageEvent> UsageEvents => Set<UsageEvent>();
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
     public DbSet<AdminSetting> AdminSettings => Set<AdminSetting>();
+    public DbSet<SubmissionPackage> SubmissionPackages => Set<SubmissionPackage>();
+    public DbSet<Destination> Destinations => Set<Destination>();
+    public DbSet<TemplateRoutingRule> TemplateRoutingRules => Set<TemplateRoutingRule>();
+    public DbSet<DeliveryJob> DeliveryJobs => Set<DeliveryJob>();
+    public DbSet<DeliveryAttempt> DeliveryAttempts => Set<DeliveryAttempt>();
+    public DbSet<ManualHandoff> ManualHandoffs => Set<ManualHandoff>();
     public DbSet<PlatformStaff> PlatformStaff => Set<PlatformStaff>();
     public DbSet<PlatformOrganizationInterest> PlatformOrganizationInterests => Set<PlatformOrganizationInterest>();
     public DbSet<PlatformRevenueEvent> PlatformRevenueEvents => Set<PlatformRevenueEvent>();
@@ -56,6 +62,7 @@ public sealed class AtlasDbContext(
         ConfigureFilesAndNotifications(modelBuilder);
         ConfigureDeveloperAndAudit(modelBuilder);
         ConfigureAdminSettings(modelBuilder);
+        ConfigurePackagesAndRouting(modelBuilder);
         ConfigurePlatform(modelBuilder);
         ConfigureAnalytics(modelBuilder);
         ConfigureQueryFilters(modelBuilder);
@@ -1131,6 +1138,194 @@ public sealed class AtlasDbContext(
         });
     }
 
+    private static void ConfigurePackagesAndRouting(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SubmissionPackage>(entity =>
+        {
+            entity.ToTable("submission_packages");
+            entity.HasIndex(e => e.PackageReference).IsUnique().HasDatabaseName("uq_submission_packages_reference");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status, e.AcceptedAt }).HasDatabaseName("ix_submission_packages_org_status");
+            entity.HasIndex(e => new { e.ActionId, e.VersionNumber }).HasDatabaseName("ix_submission_packages_action_version");
+            entity.HasIndex(e => e.SubmissionId).IsUnique().HasDatabaseName("uq_submission_packages_submission");
+            entity.Property(e => e.PackageReference).HasMaxLength(40).IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.AcceptedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.GeneratedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ContentHash).HasMaxLength(128);
+            entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.RevisionReason).HasMaxLength(500);
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ArchivedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.RowVersion).IsConcurrencyToken();
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Action)
+                .WithMany()
+                .HasForeignKey(e => e.ActionId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Submission)
+                .WithMany()
+                .HasForeignKey(e => e.SubmissionId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.ActionRecipient)
+                .WithMany()
+                .HasForeignKey(e => e.ActionRecipientId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.AcceptedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.AcceptedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.OwnerUser)
+                .WithMany()
+                .HasForeignKey(e => e.OwnerUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.ReportFileAsset)
+                .WithMany()
+                .HasForeignKey(e => e.ReportFileAssetId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.BundleFileAsset)
+                .WithMany()
+                .HasForeignKey(e => e.BundleFileAssetId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.PreviousPackage)
+                .WithMany()
+                .HasForeignKey(e => e.PreviousPackageId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.SupersededByPackage)
+                .WithMany()
+                .HasForeignKey(e => e.SupersededByPackageId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<Destination>(entity =>
+        {
+            entity.ToTable("destinations");
+            entity.HasIndex(e => new { e.OrganizationId, e.Type, e.IsActive }).HasDatabaseName("ix_destinations_org_type_active");
+            entity.HasIndex(e => new { e.OrganizationId, e.Name }).HasDatabaseName("ix_destinations_org_name");
+            entity.Property(e => e.Name).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.Type).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ConfigurationJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.ConfigurationEncrypted);
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastValidatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastValidationStatus).HasMaxLength(30);
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.CreatedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.CreatedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<TemplateRoutingRule>(entity =>
+        {
+            entity.ToTable("template_routing_rules");
+            entity.HasIndex(e => new { e.OrganizationId, e.TemplateId, e.Sequence }).HasDatabaseName("ix_template_routing_rules_template_order");
+            entity.Property(e => e.Trigger).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ConfigurationOverridesJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Template)
+                .WithMany()
+                .HasForeignKey(e => e.TemplateId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.Destination)
+                .WithMany(e => e.RoutingRules)
+                .HasForeignKey(e => e.DestinationId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<DeliveryJob>(entity =>
+        {
+            entity.ToTable("delivery_jobs");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status, e.QueuedAt }).HasDatabaseName("ix_delivery_jobs_org_status");
+            entity.HasIndex(e => new { e.OrganizationId, e.IdempotencyKey }).IsUnique().HasDatabaseName("uq_delivery_jobs_org_idempotency");
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.TriggeredBy).HasMaxLength(60).IsRequired();
+            entity.Property(e => e.QueuedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.StartedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CompletedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.NextRetryAt).HasColumnType("timestamptz");
+            entity.Property(e => e.FailureCode).HasMaxLength(100);
+            entity.Property(e => e.FailureMessage).HasMaxLength(1000);
+            entity.Property(e => e.ExternalReference).HasMaxLength(200);
+            entity.Property(e => e.IdempotencyKey).HasMaxLength(160).IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.SubmissionPackage)
+                .WithMany(e => e.DeliveryJobs)
+                .HasForeignKey(e => e.SubmissionPackageId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.Destination)
+                .WithMany(e => e.DeliveryJobs)
+                .HasForeignKey(e => e.DestinationId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.RequestedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.RequestedByUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<DeliveryAttempt>(entity =>
+        {
+            entity.ToTable("delivery_attempts");
+            entity.HasIndex(e => new { e.DeliveryJobId, e.AttemptNumber }).IsUnique().HasDatabaseName("uq_delivery_attempts_job_attempt");
+            entity.Property(e => e.StartedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CompletedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ProviderReference).HasMaxLength(200);
+            entity.Property(e => e.ResponseSummary).HasMaxLength(2000);
+            entity.Property(e => e.FailureCode).HasMaxLength(100);
+            entity.Property(e => e.FailureMessage).HasMaxLength(1000);
+            entity.HasOne(e => e.DeliveryJob)
+                .WithMany(e => e.Attempts)
+                .HasForeignKey(e => e.DeliveryJobId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<ManualHandoff>(entity =>
+        {
+            entity.ToTable("manual_handoffs");
+            entity.HasIndex(e => new { e.OrganizationId, e.SubmissionPackageId, e.CompletedAt }).HasDatabaseName("ix_manual_handoffs_package");
+            entity.Property(e => e.DestinationLabel).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.CompletedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ExternalReference).HasMaxLength(200);
+            entity.Property(e => e.Notes).HasMaxLength(2000);
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.SubmissionPackage)
+                .WithMany(e => e.ManualHandoffs)
+                .HasForeignKey(e => e.SubmissionPackageId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.CompletedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.CompletedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.EvidenceFileAsset)
+                .WithMany()
+                .HasForeignKey(e => e.EvidenceFileAssetId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+    }
+
     private static void ConfigurePlatform(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<PlatformStaff>(entity =>
@@ -1355,6 +1550,20 @@ public sealed class AtlasDbContext(
         modelBuilder.Entity<AdminSetting>()
             .HasQueryFilter(e => e.OrganizationId == null
                 || e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<SubmissionPackage>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<Destination>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<TemplateRoutingRule>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<DeliveryJob>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<DeliveryAttempt>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue
+                && e.DeliveryJob != null
+                && e.DeliveryJob.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ManualHandoff>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
         modelBuilder.Entity<AnalyticsEvent>()
             .HasQueryFilter(e => e.OrganizationId == CurrentOrganizationId);
     }
@@ -1399,6 +1608,28 @@ public sealed class AtlasDbContext(
                         setting.CreatedAt = setting.CreatedAt == default ? now : setting.CreatedAt;
                         setting.UpdatedAt = now;
                         break;
+                    case SubmissionPackage package:
+                        package.CreatedAt = package.CreatedAt == default ? now : package.CreatedAt;
+                        package.UpdatedAt = now;
+                        package.RowVersion = package.RowVersion <= 0 ? 1 : package.RowVersion;
+                        break;
+                    case Destination destination:
+                        destination.CreatedAt = destination.CreatedAt == default ? now : destination.CreatedAt;
+                        destination.UpdatedAt = now;
+                        break;
+                    case TemplateRoutingRule routingRule:
+                        routingRule.CreatedAt = routingRule.CreatedAt == default ? now : routingRule.CreatedAt;
+                        routingRule.UpdatedAt = now;
+                        break;
+                    case DeliveryJob deliveryJob:
+                        deliveryJob.CreatedAt = deliveryJob.CreatedAt == default ? now : deliveryJob.CreatedAt;
+                        deliveryJob.UpdatedAt = now;
+                        deliveryJob.QueuedAt = deliveryJob.QueuedAt == default ? now : deliveryJob.QueuedAt;
+                        break;
+                    case ManualHandoff manualHandoff:
+                        manualHandoff.CreatedAt = manualHandoff.CreatedAt == default ? now : manualHandoff.CreatedAt;
+                        manualHandoff.CompletedAt = manualHandoff.CompletedAt == default ? now : manualHandoff.CompletedAt;
+                        break;
                     case PlatformStaff staff:
                         staff.CreatedAt = staff.CreatedAt == default ? now : staff.CreatedAt;
                         staff.UpdatedAt = now;
@@ -1436,6 +1667,19 @@ public sealed class AtlasDbContext(
                         break;
                     case AdminSetting setting:
                         setting.UpdatedAt = now;
+                        break;
+                    case SubmissionPackage package:
+                        package.UpdatedAt = now;
+                        package.RowVersion++;
+                        break;
+                    case Destination destination:
+                        destination.UpdatedAt = now;
+                        break;
+                    case TemplateRoutingRule routingRule:
+                        routingRule.UpdatedAt = now;
+                        break;
+                    case DeliveryJob deliveryJob:
+                        deliveryJob.UpdatedAt = now;
                         break;
                     case PlatformStaff staff:
                         staff.UpdatedAt = now;

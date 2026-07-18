@@ -193,3 +193,64 @@ public enum InvestorReportStatus : short
     Completed = 2,
     Failed = 3
 }
+
+public enum SubmissionPackageStatus : short
+{
+    Preparing = 1,
+    Ready = 2,
+    RoutingPending = 3,
+    PartiallyDelivered = 4,
+    Delivered = 5,
+    DeliveryFailed = 6,
+    HandoffConfirmed = 7,
+    Archived = 8,
+    Superseded = 9
+}
+
+public enum DestinationType : short
+{
+    ManualDownload = 1,
+    Email = 2,
+    Webhook = 3,
+    ApiPull = 4,
+    CsvExport = 5,
+    JsonExport = 6,
+    SharePoint = 7,
+    OneDrive = 8,
+    GoogleDrive = 9,
+    Sftp = 10
+}
+
+public enum DestinationStatus : short
+{
+    Active = 1,
+    Disabled = 2,
+    Invalid = 3
+}
+
+public enum RoutingTrigger : short
+{
+    OnSubmission = 1,
+    OnAcceptance = 2,
+    OnPackageReady = 3,
+    ManualOnly = 4
+}
+
+public enum DeliveryJobStatus : short
+{
+    Queued = 1,
+    Preparing = 2,
+    Sending = 3,
+    Succeeded = 4,
+    Failed = 5,
+    RetryScheduled = 6,
+    Cancelled = 7,
+    RequiresAttention = 8
+}
+
+public enum DeliveryAttemptStatus : short
+{
+    Succeeded = 1,
+    Failed = 2,
+    Cancelled = 3
+}

@@ -59,6 +59,7 @@ builder.Services.AddCors(options =>
     });
 });
 builder.Services.AddAuthorization();
+builder.Services.AddDataProtection();
 builder.Services.AddRateLimiter(options =>
 {
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
@@ -108,6 +109,7 @@ builder.Services.AddAtlasInfrastructure(builder.Configuration);
 builder.Services.AddHostedService<ReminderDispatcherService>();
 builder.Services.AddHostedService<RetentionPurgeService>();
 builder.Services.AddHostedService<FileScanDispatcherService>();
+builder.Services.AddHostedService<DeliveryJobDispatcherService>();
 
 var app = builder.Build();
 
@@ -178,6 +180,7 @@ app.MapAtlasEndpoints();
 app.MapAtlasSecurityEndpoints();
 app.MapAtlasRecipientEndpoints();
 app.MapAtlasSubmissionEndpoints();
+app.MapAtlasPackageEndpoints();
 app.MapAtlasPlatformEndpoints();
 app.MapAtlasAnalyticsEndpoints();
 

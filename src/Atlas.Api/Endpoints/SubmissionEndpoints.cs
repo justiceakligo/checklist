@@ -370,6 +370,13 @@ public static class SubmissionEndpoints
             submission.Action.UpdatedAt = now;
             SecurityEndpoints.AddAudit(dbContext, organizationId, submission.ActionId, tenantContext, "submission.accepted", new { submission.Id, submission.VersionNumber }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
+            await PackageEndpoints.EnsurePackageForAcceptedSubmissionAsync(
+                submission.Id,
+                dbContext,
+                tenantContext,
+                clock,
+                httpContext,
+                cancellationToken);
             return Results.Ok(ToSummary(submission));
         }
 
