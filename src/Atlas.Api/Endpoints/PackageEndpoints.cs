@@ -23,6 +23,8 @@ public static class PackageEndpoints
     {
         PropertyNameCaseInsensitive = true
     };
+    private const int DefaultPackageBundleMaxFileCount = 100;
+    private const long DefaultPackageBundleMaxBytes = 250L * 1024 * 1024;
 
     public static IEndpointRouteBuilder MapAtlasPackageEndpoints(this IEndpointRouteBuilder app)
     {
@@ -424,12 +426,40 @@ public static class PackageEndpoints
             }
 
             package.GeneratedAt ??= clock.UtcNow;
-            SecurityEndpoints.AddAudit(dbContext, organizationId, package.ActionId, tenantContext, "package.downloaded", new { package.Id, package.PackageReference, Type = "bundle" }, httpContext);
+            var bundlePlan = await BuildPackageBundlePlanAsync(package, settings, storage, cancellationToken);
+            SecurityEndpoints.AddAudit(
+                dbContext,
+                organizationId,
+                package.ActionId,
+                tenantContext,
+                "package.downloaded",
+                new
+                {
+                    package.Id,
+                    package.PackageReference,
+                    Type = "bundle",
+                    PlannedEmbeddedFileCount = bundlePlan.FilesToEmbed.Count,
+                    PlannedEmbeddedBytes = bundlePlan.PlannedEmbeddedBytes,
+                    bundlePlan.MaxEmbeddedFileCount,
+                    bundlePlan.MaxEmbeddedBytes,
+                    ExcludedFiles = bundlePlan.ManifestItems
+                        .Where(item => !item.Included)
+                        .Select(item => new
+                        {
+                            item.RequirementId,
+                            item.FileAssetId,
+                            item.FileName,
+                            item.ScanStatus,
+                            item.ExcludedReason
+                        })
+                        .ToList()
+                },
+                httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
 
             var fileName = $"{SanitizeFileName(package.PackageReference)}-Completion-Package.zip";
-            return Results.File(
-                await BuildPackageBundleAsync(package, settings, storage, cancellationToken),
+            return Results.Stream(
+                stream => WritePackageBundleAsync(stream, package, bundlePlan, storage, cancellationToken),
                 "application/zip",
                 fileName);
         });
@@ -2030,74 +2060,239 @@ public static class PackageEndpoints
             });
     }
 
-    private static async Task<byte[]> BuildPackageBundleAsync(
+    private static async Task<PackageBundlePlan> BuildPackageBundlePlanAsync(
         SubmissionPackage package,
         IAdminSettingService settings,
         IObjectStorageService storage,
         CancellationToken cancellationToken)
     {
-        using var memory = new MemoryStream();
-        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, true))
+        var maxFileCountSetting = await settings.GetAsync(package.OrganizationId, "packageExport", "maxFileCount", cancellationToken);
+        var maxEmbeddedFileCount = EndpointHelpers.ReadPositiveIntSetting(maxFileCountSetting?.ValueJson, DefaultPackageBundleMaxFileCount);
+        var maxBytesSetting = await settings.GetAsync(package.OrganizationId, "packageExport", "maxZipBytes", cancellationToken);
+        var maxEmbeddedBytes = EndpointHelpers.ReadPositiveLongSetting(maxBytesSetting?.ValueJson, DefaultPackageBundleMaxBytes);
+        var root = SanitizeFileName(package.PackageReference);
+        var filesToEmbed = new List<PackageBundleFilePlan>();
+        var manifestItems = new List<PackageBundleFileManifestItem>();
+        var usedEntryNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var embeddedFileAssets = new Dictionary<Guid, PackageBundleFilePlan>();
+        var plannedEmbeddedBytes = 0L;
+
+        foreach (var file in package.Submission?.Files ?? [])
         {
-            var root = SanitizeFileName(package.PackageReference);
-            AddZipEntry(archive, $"{root}/Submission Report.txt", BuildPackageReportText(package));
-            AddZipEntry(archive, $"{root}/answers.json", JsonSerializer.Serialize(package.Submission?.Responses.Select(item => new
+            var asset = file.FileAsset;
+            if (asset is null)
             {
-                item.RequirementId,
-                Value = item.ValueJson is null ? (JsonElement?)null : JsonSerializer.Deserialize<JsonElement>(item.ValueJson, JsonOptions)
-            }) ?? [], JsonOptions));
-            AddZipEntry(archive, $"{root}/metadata.json", package.MetadataJson);
-            AddZipEntry(archive, $"{root}/audit-summary.json", JsonSerializer.Serialize(new
-            {
-                package.Id,
-                package.PackageReference,
-                package.VersionNumber,
-                package.Status,
-                package.AcceptedAt,
-                package.AcceptedByUserId,
-                GeneratedAt = DateTimeOffset.UtcNow
-            }, JsonOptions));
-
-            var downloadMinutesSetting = await settings.GetAsync(package.OrganizationId, "files", "downloadUrlMinutes", cancellationToken);
-            var downloadMinutes = EndpointHelpers.ReadPositiveIntSetting(downloadMinutesSetting?.ValueJson, 5);
-            var files = new List<object>();
-            if (package.Submission is not null)
-            {
-                foreach (var file in package.Submission.Files)
-                {
-                    PresignedDownloadResponse? signedUrl = null;
-                    if (file.FileAsset is not null && file.FileAsset.ScanStatus == FileScanStatus.Clean)
-                    {
-                        signedUrl = await storage.CreateDownloadUrlAsync(
-                            new PresignedDownloadRequest(
-                                file.FileAsset.StorageKey,
-                                file.FileAsset.OriginalFileName,
-                                file.FileAsset.MimeType,
-                                TimeSpan.FromMinutes(downloadMinutes)),
-                            cancellationToken);
-                    }
-
-                    files.Add(new
-                    {
-                        file.RequirementId,
-                        file.FileAssetId,
-                        FileName = file.FileAsset?.OriginalFileName ?? file.DocumentName,
-                        file.FileAsset?.MimeType,
-                        file.FileAsset?.SizeBytes,
-                        file.FileAsset?.ScanStatus,
-                        file.IsPreviouslySubmitted,
-                        file.DocumentName,
-                        file.DocumentExpiresAt,
-                        DownloadUrl = signedUrl?.DownloadUrl.ToString(),
-                        DownloadUrlExpiresAt = signedUrl?.ExpiresAt
-                    });
-                }
+                manifestItems.Add(ToPackageBundleManifestItem(file, false, null, "file_asset_missing"));
+                continue;
             }
 
-            AddZipEntry(archive, $"{root}/file-manifest.json", JsonSerializer.Serialize(files, JsonOptions));
+            if (asset.ScanStatus != FileScanStatus.Clean)
+            {
+                manifestItems.Add(ToPackageBundleManifestItem(file, false, null, FileScanSkipReason(asset.ScanStatus)));
+                continue;
+            }
+
+            if (embeddedFileAssets.TryGetValue(file.FileAssetId, out var existingPlan))
+            {
+                manifestItems.Add(ToPackageBundleManifestItem(file, true, existingPlan.ZipEntryName, null, existingPlan.SizeBytes));
+                continue;
+            }
+
+            if (filesToEmbed.Count >= maxEmbeddedFileCount)
+            {
+                manifestItems.Add(ToPackageBundleManifestItem(file, false, null, "max_file_count_exceeded"));
+                continue;
+            }
+
+            var metadata = await storage.GetObjectMetadataAsync(asset.StorageKey, cancellationToken);
+            if (metadata is null)
+            {
+                manifestItems.Add(ToPackageBundleManifestItem(file, false, null, "storage_object_missing"));
+                continue;
+            }
+
+            var sizeBytes = metadata.SizeBytes > 0 ? metadata.SizeBytes : asset.SizeBytes;
+            if (plannedEmbeddedBytes + sizeBytes > maxEmbeddedBytes)
+            {
+                manifestItems.Add(ToPackageBundleManifestItem(file, false, null, "max_zip_bytes_exceeded", sizeBytes));
+                continue;
+            }
+
+            var fileName = string.IsNullOrWhiteSpace(asset.OriginalFileName)
+                ? file.DocumentName ?? $"{file.FileAssetId:N}.bin"
+                : asset.OriginalFileName;
+            var plan = new PackageBundleFilePlan(
+                file.RequirementId,
+                file.FileAssetId,
+                asset.StorageKey,
+                fileName,
+                string.IsNullOrWhiteSpace(asset.MimeType) ? "application/octet-stream" : asset.MimeType,
+                sizeBytes,
+                UniqueZipEntryName(usedEntryNames, root, file.FileAssetId, fileName));
+            filesToEmbed.Add(plan);
+            embeddedFileAssets[file.FileAssetId] = plan;
+            plannedEmbeddedBytes += sizeBytes;
+            manifestItems.Add(ToPackageBundleManifestItem(file, true, plan.ZipEntryName, null, sizeBytes));
         }
 
-        return memory.ToArray();
+        return new PackageBundlePlan(
+            root,
+            filesToEmbed,
+            manifestItems,
+            plannedEmbeddedBytes,
+            maxEmbeddedBytes,
+            maxEmbeddedFileCount);
+    }
+
+    private static async Task WritePackageBundleAsync(
+        Stream output,
+        SubmissionPackage package,
+        PackageBundlePlan plan,
+        IObjectStorageService storage,
+        CancellationToken cancellationToken)
+    {
+        using var archive = new ZipArchive(output, ZipArchiveMode.Create, true);
+        AddZipEntry(archive, $"{plan.Root}/Submission Report.txt", BuildPackageReportText(package));
+        AddZipEntry(archive, $"{plan.Root}/answers.json", JsonSerializer.Serialize(package.Submission?.Responses.Select(item => new
+        {
+            item.RequirementId,
+            Value = item.ValueJson is null ? (JsonElement?)null : JsonSerializer.Deserialize<JsonElement>(item.ValueJson, JsonOptions)
+        }) ?? [], JsonOptions));
+        AddZipEntry(archive, $"{plan.Root}/metadata.json", package.MetadataJson);
+        AddZipEntry(archive, $"{plan.Root}/audit-summary.json", JsonSerializer.Serialize(new
+        {
+            package.Id,
+            package.PackageReference,
+            package.VersionNumber,
+            package.Status,
+            package.AcceptedAt,
+            package.AcceptedByUserId,
+            GeneratedAt = DateTimeOffset.UtcNow
+        }, JsonOptions));
+
+        var unavailableFileAssetIds = new HashSet<Guid>();
+        foreach (var file in plan.FilesToEmbed)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var objectRead = await storage.OpenReadAsync(file.StorageKey, cancellationToken);
+            if (objectRead is null)
+            {
+                unavailableFileAssetIds.Add(file.FileAssetId);
+                continue;
+            }
+
+            await using (objectRead)
+            {
+                var entry = archive.CreateEntry(file.ZipEntryName, CompressionLevel.Optimal);
+                using var entryStream = entry.Open();
+                await objectRead.Content.CopyToAsync(entryStream, cancellationToken);
+            }
+        }
+
+        var manifestItems = plan.ManifestItems
+            .Select(item => item.Included && unavailableFileAssetIds.Contains(item.FileAssetId)
+                ? item with { Included = false, ZipEntryName = null, ExcludedReason = "storage_object_missing" }
+                : item)
+            .ToList();
+        AddZipEntry(archive, $"{plan.Root}/file-manifest.json", JsonSerializer.Serialize(new
+        {
+            GeneratedAt = DateTimeOffset.UtcNow,
+            ManifestVersion = 2,
+            plan.MaxEmbeddedFileCount,
+            plan.MaxEmbeddedBytes,
+            EmbeddedFileCount = manifestItems.Count(item => item.Included),
+            SkippedFileCount = manifestItems.Count(item => !item.Included),
+            Files = manifestItems
+        }, JsonOptions));
+    }
+
+    private static PackageBundleFileManifestItem ToPackageBundleManifestItem(
+        SubmissionFile file,
+        bool included,
+        string? zipEntryName,
+        string? excludedReason,
+        long? sizeBytes = null)
+    {
+        return new PackageBundleFileManifestItem(
+            file.RequirementId,
+            file.FileAssetId,
+            file.FileAsset?.OriginalFileName ?? file.DocumentName,
+            file.FileAsset?.MimeType,
+            sizeBytes ?? file.FileAsset?.SizeBytes,
+            file.FileAsset?.ScanStatus,
+            file.IsPreviouslySubmitted,
+            file.DocumentName,
+            file.DocumentExpiresAt,
+            included,
+            zipEntryName,
+            excludedReason);
+    }
+
+    private static string FileScanSkipReason(FileScanStatus status)
+    {
+        return status switch
+        {
+            FileScanStatus.Pending => "scan_pending",
+            FileScanStatus.Rejected => "scan_rejected",
+            _ => "file_not_clean"
+        };
+    }
+
+    private static string UniqueZipEntryName(
+        HashSet<string> usedEntryNames,
+        string root,
+        Guid fileAssetId,
+        string fileName)
+    {
+        var safeFileName = SanitizeZipFileName(fileName, fileAssetId);
+        var entryName = $"{root}/files/{safeFileName}";
+        if (usedEntryNames.Add(entryName))
+        {
+            return entryName;
+        }
+
+        var suffix = fileAssetId.ToString("N")[..8];
+        var stem = SanitizeFileName(Path.GetFileNameWithoutExtension(safeFileName));
+        var extension = Path.GetExtension(safeFileName);
+        for (var index = 2; index < 1000; index++)
+        {
+            var candidate = $"{root}/files/{stem}-{suffix}-{index}{extension}";
+            if (usedEntryNames.Add(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return $"{root}/files/{suffix}-{Guid.NewGuid():N}{extension}";
+    }
+
+    private static string SanitizeZipFileName(string? fileName, Guid fileAssetId)
+    {
+        var normalized = (fileName ?? string.Empty).Replace('\\', '/');
+        var slashIndex = normalized.LastIndexOf('/');
+        if (slashIndex >= 0)
+        {
+            normalized = normalized[(slashIndex + 1)..];
+        }
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return $"{fileAssetId:N}.bin";
+        }
+
+        var extension = Path.GetExtension(normalized);
+        if (extension.Length > 20 || extension.Any(character => character != '.' && !char.IsLetterOrDigit(character)))
+        {
+            extension = string.Empty;
+        }
+
+        var stem = SanitizeFileName(Path.GetFileNameWithoutExtension(normalized));
+        if (string.IsNullOrWhiteSpace(stem))
+        {
+            stem = fileAssetId.ToString("N")[..12];
+        }
+
+        return $"{stem}{extension.ToLowerInvariant()}";
     }
 
     private static void AddZipEntry(ZipArchive archive, string name, string content)
@@ -2311,7 +2506,8 @@ public static class PackageEndpoints
     {
         var safe = new string(value.Select(character =>
             char.IsLetterOrDigit(character) || character is '-' or '_' ? character : '-').ToArray());
-        return string.IsNullOrWhiteSpace(safe) ? "reqara-package" : safe.Trim('-');
+        safe = safe.Trim('-');
+        return string.IsNullOrWhiteSpace(safe) ? "reqara-package" : safe;
     }
 
     private static string FormatDate(DateTimeOffset? value)
@@ -2338,6 +2534,36 @@ public static class PackageEndpoints
 
     private sealed record DestinationConfiguration(IReadOnlyList<string> Recipients, IReadOnlyList<string> Cc);
     private sealed record WebhookDeliveryResult(bool Succeeded, int? StatusCode, string? ResponseSummary);
+    private sealed record PackageBundlePlan(
+        string Root,
+        IReadOnlyList<PackageBundleFilePlan> FilesToEmbed,
+        IReadOnlyList<PackageBundleFileManifestItem> ManifestItems,
+        long PlannedEmbeddedBytes,
+        long MaxEmbeddedBytes,
+        int MaxEmbeddedFileCount);
+
+    private sealed record PackageBundleFilePlan(
+        Guid RequirementId,
+        Guid FileAssetId,
+        string StorageKey,
+        string FileName,
+        string MimeType,
+        long SizeBytes,
+        string ZipEntryName);
+
+    private sealed record PackageBundleFileManifestItem(
+        Guid RequirementId,
+        Guid FileAssetId,
+        string? FileName,
+        string? MimeType,
+        long? SizeBytes,
+        FileScanStatus? ScanStatus,
+        bool IsPreviouslySubmitted,
+        string? DocumentName,
+        DateTimeOffset? DocumentExpiresAt,
+        bool Included,
+        string? ZipEntryName,
+        string? ExcludedReason);
 }
 
 public sealed record PackageListItemResponse(

@@ -91,6 +91,44 @@ public sealed class DigitalOceanSpacesStorageService(
         }
     }
 
+    public async Task<ObjectReadResult?> OpenReadAsync(string storageKey, CancellationToken cancellationToken)
+    {
+        var options = await optionsResolver.ResolveAsync(cancellationToken);
+        ValidateConfigured(options);
+        ArgumentException.ThrowIfNullOrWhiteSpace(storageKey);
+
+        IAmazonS3? s3Client = null;
+        try
+        {
+            s3Client = CreateS3Client(options);
+            var response = await s3Client.GetObjectAsync(new GetObjectRequest
+            {
+                BucketName = options.BucketName,
+                Key = storageKey
+            }, cancellationToken);
+
+            return new ObjectReadResult(
+                response.ResponseStream,
+                new ObjectMetadata(
+                    storageKey,
+                    response.ContentLength,
+                    response.Headers.ContentType,
+                    response.ETag),
+                response,
+                s3Client);
+        }
+        catch (AmazonS3Exception exception) when (exception.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            s3Client?.Dispose();
+            return null;
+        }
+        catch
+        {
+            s3Client?.Dispose();
+            throw;
+        }
+    }
+
     public async Task DeleteObjectAsync(string storageKey, CancellationToken cancellationToken)
     {
         var options = await optionsResolver.ResolveAsync(cancellationToken);

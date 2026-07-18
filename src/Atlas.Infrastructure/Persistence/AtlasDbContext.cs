@@ -1087,6 +1087,26 @@ public sealed class AtlasDbContext(
                 },
                 new AdminSetting
                 {
+                    Id = Guid.Parse("57a3ce93-90dd-42a5-8717-b36e5e1390d7"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "packageExport",
+                    Key = "maxFileCount",
+                    ValueJson = "100",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
+                    Id = Guid.Parse("c4b4d3cc-23e4-4421-bc99-639f7978038d"),
+                    Scope = Domain.Enums.AdminSettingScope.System,
+                    Category = "packageExport",
+                    Key = "maxZipBytes",
+                    ValueJson = "262144000",
+                    CreatedAt = seededAt,
+                    UpdatedAt = seededAt
+                },
+                new AdminSetting
+                {
                     Id = Guid.Parse("24801c38-0bfe-4404-aecb-7b2ce479706a"),
                     Scope = Domain.Enums.AdminSettingScope.System,
                     Category = "actions",

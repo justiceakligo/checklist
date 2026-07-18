@@ -262,8 +262,59 @@ Current bundle contents:
 - `metadata.json`
 - `audit-summary.json`
 - `file-manifest.json`
+- `files/{original-file-name}` for each scan-clean submitted file
 
-Important: the current ZIP contains a signed download URL manifest for clean files, not raw file bytes. This keeps the backend compatible with private object storage without routing sensitive files through app memory. UI should call the existing file download/preview flow for actual file content.
+Important: the ZIP now embeds scan-clean file bytes directly. Pending, rejected, missing, or over-limit files are not embedded and appear in `file-manifest.json` with `included: false` and an `excludedReason`.
+
+Example `file-manifest.json`:
+
+```json
+{
+  "generatedAt": "2026-07-18T00:20:30Z",
+  "manifestVersion": 2,
+  "maxEmbeddedFileCount": 100,
+  "maxEmbeddedBytes": 262144000,
+  "embeddedFileCount": 2,
+  "skippedFileCount": 1,
+  "files": [
+    {
+      "requirementId": "b9613c9f-7b80-40f5-8734-47af63e52d78",
+      "fileAssetId": "7c3de87a-8770-4e66-bb35-9b44fbea2919",
+      "fileName": "Insurance certificate.pdf",
+      "mimeType": "application/pdf",
+      "sizeBytes": 1552760,
+      "scanStatus": "Clean",
+      "isPreviouslySubmitted": false,
+      "documentName": "Insurance certificate",
+      "documentExpiresAt": "2027-04-30T00:00:00Z",
+      "included": true,
+      "zipEntryName": "REQ-20260717-BFED84/files/Insurance-certificate.pdf",
+      "excludedReason": null
+    },
+    {
+      "requirementId": "04a5db4e-9fb7-419d-b217-162186b9c49b",
+      "fileAssetId": "0888f6db-fce8-4a93-a892-ef8a968a9dde",
+      "fileName": "Pending ID.png",
+      "mimeType": "image/png",
+      "sizeBytes": 412991,
+      "scanStatus": "Pending",
+      "isPreviouslySubmitted": false,
+      "documentName": "Government ID",
+      "documentExpiresAt": null,
+      "included": false,
+      "zipEntryName": null,
+      "excludedReason": "scan_pending"
+    }
+  ]
+}
+```
+
+Possible `excludedReason` values: `scan_pending`, `scan_rejected`, `file_not_clean`, `file_asset_missing`, `storage_object_missing`, `max_file_count_exceeded`, `max_zip_bytes_exceeded`.
+
+Admin-configurable limits:
+
+- `packageExport.maxFileCount`, default `100`
+- `packageExport.maxZipBytes`, default `262144000`
 
 Summary endpoint:
 

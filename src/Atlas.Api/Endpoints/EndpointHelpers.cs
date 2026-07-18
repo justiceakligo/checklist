@@ -210,6 +210,24 @@ internal static class EndpointHelpers
         }
     }
 
+    public static long ReadPositiveLongSetting(string? valueJson, long fallback)
+    {
+        if (string.IsNullOrWhiteSpace(valueJson))
+        {
+            return fallback;
+        }
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<long>(valueJson);
+            return value > 0 ? value : fallback;
+        }
+        catch (JsonException)
+        {
+            return fallback;
+        }
+    }
+
     public static bool ReadBoolSetting(string? valueJson, bool fallback)
     {
         if (string.IsNullOrWhiteSpace(valueJson))

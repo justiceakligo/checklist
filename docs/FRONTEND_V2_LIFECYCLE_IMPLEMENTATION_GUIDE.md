@@ -227,6 +227,13 @@ GET /api/v2/submission-packages/{packageId}/bundle
 POST /api/v2/submission-packages/{packageId}/assign
 ```
 
+Bundle behavior:
+
+- `GET /api/v2/submission-packages/{packageId}/bundle` downloads a real ZIP with package JSON/text artifacts plus scan-clean submitted file bytes under `files/`.
+- The ZIP also contains `file-manifest.json`. Use it as the source of truth for embedded vs skipped files.
+- Skipped files have `included: false` and `excludedReason` such as `scan_pending`, `scan_rejected`, `storage_object_missing`, `max_file_count_exceeded`, or `max_zip_bytes_exceeded`.
+- Admin settings control export size: `packageExport.maxFileCount` and `packageExport.maxZipBytes`.
+
 Package statuses:
 
 ```text
