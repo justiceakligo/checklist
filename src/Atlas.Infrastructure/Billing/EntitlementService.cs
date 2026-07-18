@@ -274,7 +274,7 @@ public sealed class EntitlementService(
             "package_report" => features.TeamWorkspace,
             "package_zip_export" => features.TeamWorkspace,
             "manual_handoff" => features.TeamWorkspace,
-            "email_destination" => features.AutomaticReminders,
+            "email_destination" => features.TeamWorkspace,
             "webhook_destination" => features.ApiAndWebhooks,
             "api_access" => features.ApiAndWebhooks,
             "api_pull_destination" => features.ApiAndWebhooks,

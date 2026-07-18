@@ -1642,6 +1642,7 @@ public static class PlatformEndpoints
 
                 var ownerEmail = NormalizeEmail(request.OwnerEmail ?? interest.ContactEmail);
                 var ownerName = string.IsNullOrWhiteSpace(request.OwnerFullName) ? interest.ContactName : request.OwnerFullName.Trim();
+                var now = clock.UtcNow;
                 var owner = await dbContext.Users.IgnoreQueryFilters().FirstOrDefaultAsync(item => item.Email == ownerEmail, cancellationToken);
                 if (owner is null)
                 {
@@ -1654,7 +1655,7 @@ public static class PlatformEndpoints
                     {
                         Email = ownerEmail,
                         FullName = ownerName,
-                        CreatedAt = clock.UtcNow
+                        CreatedAt = now
                     };
                     owner.PasswordHash = new PasswordHasher<AppUser>().HashPassword(owner, request.OwnerPassword);
                     dbContext.Users.Add(owner);
@@ -1671,8 +1672,8 @@ public static class PlatformEndpoints
                     Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "UTC" : request.Timezone.Trim(),
                     DefaultLanguage = string.IsNullOrWhiteSpace(request.DefaultLanguage) ? "en" : request.DefaultLanguage.Trim(),
                     RetentionDays = defaultRetentionDays,
-                    CreatedAt = clock.UtcNow,
-                    UpdatedAt = clock.UtcNow
+                    CreatedAt = now,
+                    UpdatedAt = now
                 };
                 dbContext.Organizations.Add(organization);
                 dbContext.OrganizationUsers.Add(new OrganizationUser
@@ -1681,9 +1682,10 @@ public static class PlatformEndpoints
                     User = owner,
                     Role = OrganizationUserRole.Owner,
                     Status = MembershipStatus.Active,
-                    JoinedAt = clock.UtcNow,
-                    CreatedAt = clock.UtcNow
+                    JoinedAt = now,
+                    CreatedAt = now
                 });
+                dbContext.Destinations.Add(DefaultPackageDestination.CreateEmail(organization.Id, owner.Id, ownerEmail, now));
             }
 
             interest.Status = OrganizationInterestStatus.Approved;

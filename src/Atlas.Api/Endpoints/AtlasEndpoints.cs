@@ -126,7 +126,9 @@ public static class AtlasEndpoints
                 CreatedAt = now
             };
 
-            dbContext.AddRange(user, organization, membership);
+            var defaultDestination = DefaultPackageDestination.CreateEmail(organization.Id, user.Id, email, now);
+
+            dbContext.AddRange(user, organization, membership, defaultDestination);
             await dbContext.SaveChangesAsync(cancellationToken);
 
             var verificationResult = await SecurityEndpoints.SendEmailVerificationAsync(
@@ -671,6 +673,17 @@ public static class AtlasEndpoints
             };
 
             dbContext.OrganizationUsers.Add(membership);
+            if (status == MembershipStatus.Active && role is OrganizationUserRole.Owner or OrganizationUserRole.Admin)
+            {
+                await DefaultPackageDestination.AddEmailIfMissingAsync(
+                    dbContext,
+                    organizationId,
+                    user.Id,
+                    email,
+                    clock.UtcNow,
+                    cancellationToken);
+            }
+
             SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "organization.member_created", new { user.Email, membership.Role, membership.Status }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
             return Results.Created($"/v1/organization-members/{membership.Id}", ToMemberResponse(membership));
