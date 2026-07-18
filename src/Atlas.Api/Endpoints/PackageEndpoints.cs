@@ -936,6 +936,8 @@ public static class PackageEndpoints
             UpsertRoutingRuleRequest request,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -949,9 +951,19 @@ public static class PackageEndpoints
                 return EndpointHelpers.Problem("forbidden", "Admin scope is required to manage routing rules.", StatusCodes.Status403Forbidden);
             }
 
-            if (!await dbContext.Destinations.AnyAsync(item => item.Id == request.DestinationId && item.IsActive, cancellationToken))
+            var destination = await dbContext.Destinations
+                .FirstOrDefaultAsync(item => item.Id == request.DestinationId
+                    && item.IsActive
+                    && item.Status == DestinationStatus.Active,
+                    cancellationToken);
+            if (destination is null)
             {
                 return EndpointHelpers.Problem("not_found", "Destination was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (await RequireRoutingRuleEntitlementAsync(destination, request, entitlements, organizationId, clock.UtcNow, cancellationToken) is { } entitlementProblem)
+            {
+                return entitlementProblem;
             }
 
             var rule = new TemplateRoutingRule
@@ -959,6 +971,7 @@ public static class PackageEndpoints
                 OrganizationId = organizationId,
                 TemplateId = request.TemplateId,
                 DestinationId = request.DestinationId,
+                Destination = destination,
                 Trigger = request.Trigger,
                 Sequence = request.Sequence,
                 IsRequired = request.IsRequired,
@@ -976,6 +989,8 @@ public static class PackageEndpoints
             UpsertRoutingRuleRequest request,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
+            IEntitlementService entitlements,
+            IAtlasClock clock,
             HttpContext httpContext,
             CancellationToken cancellationToken) =>
         {
@@ -995,8 +1010,24 @@ public static class PackageEndpoints
                 return EndpointHelpers.Problem("not_found", "Routing rule was not found.", StatusCodes.Status404NotFound);
             }
 
+            var destination = await dbContext.Destinations
+                .FirstOrDefaultAsync(item => item.Id == request.DestinationId
+                    && item.IsActive
+                    && item.Status == DestinationStatus.Active,
+                    cancellationToken);
+            if (destination is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Destination was not found.", StatusCodes.Status404NotFound);
+            }
+
+            if (await RequireRoutingRuleEntitlementAsync(destination, request, entitlements, organizationId, clock.UtcNow, cancellationToken) is { } entitlementProblem)
+            {
+                return entitlementProblem;
+            }
+
             rule.TemplateId = request.TemplateId;
             rule.DestinationId = request.DestinationId;
+            rule.Destination = destination;
             rule.Trigger = request.Trigger;
             rule.Sequence = request.Sequence;
             rule.IsRequired = request.IsRequired;
@@ -2414,6 +2445,28 @@ public static class PackageEndpoints
         };
         var check = await entitlements.HasFeatureAsync(organizationId, now, feature, cancellationToken);
         return check.Allowed ? null : EndpointHelpers.EntitlementProblem(check);
+    }
+
+    private static async Task<IResult?> RequireRoutingRuleEntitlementAsync(
+        Destination destination,
+        UpsertRoutingRuleRequest request,
+        IEntitlementService entitlements,
+        Guid organizationId,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (await RequireDestinationEntitlementAsync(destination.Type, entitlements, organizationId, now, cancellationToken) is { } destinationProblem)
+        {
+            return destinationProblem;
+        }
+
+        if (!request.IsAutomatic && request.Trigger == RoutingTrigger.ManualOnly)
+        {
+            return null;
+        }
+
+        var automaticRouting = await entitlements.HasFeatureAsync(organizationId, now, "automatic_routing", cancellationToken);
+        return automaticRouting.Allowed ? null : EndpointHelpers.EntitlementProblem(automaticRouting);
     }
 
     private static bool TryRequireDashboard(ITenantContext tenantContext, out Guid organizationId, out IResult? problem)
