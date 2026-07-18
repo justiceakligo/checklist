@@ -31,6 +31,23 @@ public sealed class Sha256SecretHasher(IOptions<SecurityOptions> options) : ISec
         ArgumentNullException.ThrowIfNull(expectedHash);
 
         var actual = HashSecret(secret);
-        return CryptographicOperations.FixedTimeEquals(actual, expectedHash);
+        if (FixedTimeEquals(actual, expectedHash))
+        {
+            return true;
+        }
+
+        if (_pepper is null)
+        {
+            return false;
+        }
+
+        var legacyHash = SHA256.HashData(Encoding.UTF8.GetBytes(secret));
+        return FixedTimeEquals(legacyHash, expectedHash);
+    }
+
+    private static bool FixedTimeEquals(byte[] actual, byte[] expected)
+    {
+        return actual.Length == expected.Length
+            && CryptographicOperations.FixedTimeEquals(actual, expected);
     }
 }
