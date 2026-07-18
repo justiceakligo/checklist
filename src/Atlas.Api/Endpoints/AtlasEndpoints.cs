@@ -403,6 +403,172 @@ public static class AtlasEndpoints
                 attention,
                 await entitlements.GetOrganizationEntitlementsAsync(organizationId, now, cancellationToken)));
         });
+
+        group.MapGet("/kpis", async (
+            string? period,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            if (!EndpointHelpers.TryGetDashboardTenant(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var now = clock.UtcNow;
+            if (!TryResolveDashboardKpiPeriod(period, now, out var periodKey, out var periodStart))
+            {
+                return EndpointHelpers.Problem(
+                    "validation_failed",
+                    "Unsupported KPI period. Use last_7_days, last_30_days, last_90_days or all_time.",
+                    StatusCodes.Status422UnprocessableEntity);
+            }
+
+            var actionQuery = dbContext.Actions
+                .AsNoTracking()
+                .Include(item => item.Template)
+                .Include(item => item.TemplateVersion)
+                .Include(item => item.Recipients)
+                .Where(item => item.Status != ChecklistActionStatus.Draft);
+
+            if (periodStart is { } sentSince)
+            {
+                actionQuery = actionQuery.Where(item => (item.SentAt ?? item.CreatedAt) >= sentSince
+                    && (item.SentAt ?? item.CreatedAt) <= now);
+            }
+
+            var sentActions = await actionQuery.ToListAsync(cancellationToken);
+            var sentRecipientRows = sentActions
+                .Where(action => action.Status is not ChecklistActionStatus.Cancelled and not ChecklistActionStatus.Draft)
+                .SelectMany(action => action.Recipients.Select(recipient => new { action, recipient }))
+                .ToList();
+
+            var onboardingRows = sentRecipientRows
+                .Where(item => IsOnboardingAction(item.action))
+                .ToList();
+
+            var onboardingCompleted = onboardingRows.Count(item => item.recipient.Status == ActionRecipientStatus.Submitted
+                || item.action.Status is ChecklistActionStatus.Submitted or ChecklistActionStatus.Completed);
+            var onboardingCompletionRate = Rate(onboardingCompleted, onboardingRows.Count);
+
+            var submissionQuery = dbContext.Submissions
+                .AsNoTracking()
+                .Include(item => item.Action)
+                .Include(item => item.ActionRecipient)
+                .Where(item => item.SubmittedAt <= now);
+
+            if (periodStart is { } submittedSince)
+            {
+                submissionQuery = submissionQuery.Where(item => item.SubmittedAt >= submittedSince);
+            }
+
+            var submissions = await submissionQuery.ToListAsync(cancellationToken);
+            var reviewedSubmissions = submissions
+                .Where(item => item.ReviewedAt is not null && item.ReviewedAt >= item.SubmittedAt)
+                .ToList();
+            var averageReviewMinutes = AverageMinutes(reviewedSubmissions.Select(item => item.ReviewedAt!.Value - item.SubmittedAt));
+
+            var firstSubmissionsByRecipient = submissions
+                .GroupBy(item => item.ActionRecipientId)
+                .Select(group => group.OrderBy(item => item.SubmittedAt).First())
+                .ToList();
+            var recipientCompletionDurations = firstSubmissionsByRecipient
+                .Select(item =>
+                {
+                    var sentAt = item.Action?.SentAt
+                        ?? item.ActionRecipient?.CreatedAt
+                        ?? item.Action?.CreatedAt;
+                    return sentAt is null || sentAt > item.SubmittedAt
+                        ? (TimeSpan?)null
+                        : item.SubmittedAt - sentAt.Value;
+                })
+                .Where(item => item is not null)
+                .Select(item => item!.Value);
+            var averageRecipientCompletionMinutes = AverageMinutes(recipientCompletionDurations);
+
+            var packageQuery = dbContext.SubmissionPackages
+                .AsNoTracking()
+                .Where(item => item.Status == SubmissionPackageStatus.Delivered
+                    && item.UpdatedAt <= now);
+
+            if (periodStart is { } deliveredSince)
+            {
+                packageQuery = packageQuery.Where(item => item.UpdatedAt >= deliveredSince);
+            }
+
+            var packagesDelivered = await packageQuery.CountAsync(cancellationToken);
+
+            return Results.Ok(new DashboardKpiResponse(
+                organizationId,
+                periodKey,
+                periodStart,
+                now,
+                onboardingCompletionRate,
+                averageReviewMinutes,
+                averageRecipientCompletionMinutes,
+                packagesDelivered,
+                new DashboardKpiBasis(
+                    onboardingRows.Count,
+                    onboardingCompleted,
+                    reviewedSubmissions.Count,
+                    firstSubmissionsByRecipient.Count,
+                    packagesDelivered)));
+        });
+    }
+
+    private static bool TryResolveDashboardKpiPeriod(
+        string? requestedPeriod,
+        DateTimeOffset now,
+        out string period,
+        out DateTimeOffset? periodStart)
+    {
+        period = string.IsNullOrWhiteSpace(requestedPeriod)
+            ? "last_30_days"
+            : requestedPeriod.Trim().ToLowerInvariant();
+
+        periodStart = period switch
+        {
+            "last_7_days" => now.AddDays(-7),
+            "last_30_days" => now.AddDays(-30),
+            "last_90_days" => now.AddDays(-90),
+            "all_time" => null,
+            _ => null
+        };
+
+        return period is "last_7_days" or "last_30_days" or "last_90_days" or "all_time";
+    }
+
+    private static bool IsOnboardingAction(ChecklistAction action)
+    {
+        return ContainsDashboardKeyword(action.Template?.Category, "onboarding")
+            || ContainsDashboardKeyword(action.Template?.Name, "onboarding")
+            || ContainsDashboardKeyword(action.TemplateVersion?.Title, "onboarding")
+            || ContainsDashboardKeyword(action.Title, "onboarding");
+    }
+
+    private static bool ContainsDashboardKeyword(string? value, string keyword)
+    {
+        return value?.Contains(keyword, StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private static decimal? Rate(int numerator, int denominator)
+    {
+        return denominator == 0
+            ? null
+            : Math.Round((decimal)numerator / denominator, 4);
+    }
+
+    private static decimal? AverageMinutes(IEnumerable<TimeSpan> durations)
+    {
+        var values = durations
+            .Select(item => item.TotalMinutes)
+            .Where(item => item >= 0)
+            .ToList();
+
+        return values.Count == 0
+            ? null
+            : Math.Round((decimal)values.Average(), 2);
     }
 
     private static void MapOrganizationMembers(RouteGroupBuilder v1)
@@ -3266,6 +3432,24 @@ public sealed record DashboardAttentionItem(
     DateTimeOffset? LastActivityAt,
     bool Overdue,
     bool DueSoon);
+
+public sealed record DashboardKpiResponse(
+    Guid OrganizationId,
+    string Period,
+    DateTimeOffset? PeriodStart,
+    DateTimeOffset PeriodEnd,
+    decimal? OnboardingCompletionRate,
+    decimal? AverageReviewMinutes,
+    decimal? AverageRecipientCompletionMinutes,
+    int PackagesDelivered,
+    DashboardKpiBasis Basis);
+
+public sealed record DashboardKpiBasis(
+    int OnboardingSent,
+    int OnboardingCompleted,
+    int ReviewedSubmissions,
+    int CompletedRecipients,
+    int DeliveredPackages);
 
 public sealed record OrganizationMemberResponse(
     Guid Id,
