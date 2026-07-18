@@ -281,6 +281,9 @@ public sealed class EntitlementService(
             "custom_destinations" => features.CustomWorkflows,
             "automatic_routing" => features.CustomWorkflows,
             "sharepoint_destination" => features.CustomWorkflows,
+            "onedrive_destination" => features.CustomWorkflows,
+            "google_drive_destination" => features.CustomWorkflows,
+            "sftp_destination" => features.CustomWorkflows,
             "delivery_history_retention" => features.TeamWorkspace,
             "advanced_audit" => features.TeamWorkspace,
             _ => false

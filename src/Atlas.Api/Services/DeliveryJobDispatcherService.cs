@@ -3,6 +3,7 @@ using Atlas.Api.Endpoints;
 using Atlas.Application.Abstractions;
 using Atlas.Application.Email;
 using Atlas.Application.Settings;
+using Atlas.Application.Storage;
 using Atlas.Domain.Entities;
 using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
@@ -51,6 +52,8 @@ public sealed class DeliveryJobDispatcherService(
         var dbContext = services.GetRequiredService<AtlasDbContext>();
         var emailService = services.GetRequiredService<IEmailService>();
         var httpClientFactory = services.GetRequiredService<IHttpClientFactory>();
+        var settings = services.GetRequiredService<IAdminSettingService>();
+        var storage = services.GetRequiredService<IObjectStorageService>();
         var dataProtectionProvider = services.GetRequiredService<IDataProtectionProvider>();
         var clock = services.GetRequiredService<IAtlasClock>();
         var now = clock.UtcNow;
@@ -104,6 +107,8 @@ public sealed class DeliveryJobDispatcherService(
                 job.Destination,
                 emailService,
                 httpClientFactory,
+                settings,
+                storage,
                 dataProtectionProvider,
                 clock,
                 cancellationToken);

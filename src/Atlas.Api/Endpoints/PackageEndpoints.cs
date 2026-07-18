@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -14,6 +15,8 @@ using Atlas.Domain.Enums;
 using Atlas.Infrastructure.Persistence;
 using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
+using Renci.SshNet;
+using Renci.SshNet.Common;
 
 namespace Atlas.Api.Endpoints;
 
@@ -25,6 +28,7 @@ public static class PackageEndpoints
     };
     private const int DefaultPackageBundleMaxFileCount = 100;
     private const long DefaultPackageBundleMaxBytes = 250L * 1024 * 1024;
+    private const string PackageBundleContentType = "application/zip";
 
     public static IEndpointRouteBuilder MapAtlasPackageEndpoints(this IEndpointRouteBuilder app)
     {
@@ -749,6 +753,11 @@ public static class PackageEndpoints
                 return validation;
             }
 
+            if (ValidateDestinationSecretConfiguration(request.Type, request.SecretConfiguration, true) is { } secretValidation)
+            {
+                return secretValidation;
+            }
+
             var secretToReturn = request.Type == DestinationType.Webhook && request.SecretConfiguration is null
                 ? EndpointHelpers.NewOpaqueToken()
                 : null;
@@ -835,6 +844,11 @@ public static class PackageEndpoints
             if (validation is not null)
             {
                 return validation;
+            }
+
+            if (ValidateDestinationSecretConfiguration(request.Type, request.SecretConfiguration, string.IsNullOrWhiteSpace(destination.ConfigurationEncrypted)) is { } secretValidation)
+            {
+                return secretValidation;
             }
 
             destination.Name = string.IsNullOrWhiteSpace(request.Name) ? destination.Name : request.Name.Trim();
@@ -1057,6 +1071,8 @@ public static class PackageEndpoints
         IEntitlementService entitlements,
         IEmailService emailService,
         IHttpClientFactory httpClientFactory,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
         IDataProtectionProvider dataProtectionProvider,
         IAtlasClock clock,
         HttpContext httpContext,
@@ -1119,7 +1135,7 @@ public static class PackageEndpoints
             };
             dbContext.DeliveryJobs.Add(job);
             await dbContext.SaveChangesAsync(cancellationToken);
-            await ProcessDeliveryJobAsync(job, package, destination, emailService, httpClientFactory, dataProtectionProvider, clock, cancellationToken);
+            await ProcessDeliveryJobAsync(job, package, destination, emailService, httpClientFactory, settings, storage, dataProtectionProvider, clock, cancellationToken);
             SecurityEndpoints.AddAudit(
                 dbContext,
                 organizationId,
@@ -1252,6 +1268,8 @@ public static class PackageEndpoints
         ITenantContext tenantContext,
         IEmailService emailService,
         IHttpClientFactory httpClientFactory,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
         IDataProtectionProvider dataProtectionProvider,
         IAtlasClock clock,
         HttpContext httpContext,
@@ -1285,7 +1303,7 @@ public static class PackageEndpoints
             return EndpointHelpers.Problem("state_conflict", "Only failed or pending delivery jobs can be retried.", StatusCodes.Status409Conflict);
         }
 
-        await ProcessDeliveryJobAsync(job, job.SubmissionPackage, job.Destination, emailService, httpClientFactory, dataProtectionProvider, clock, cancellationToken);
+        await ProcessDeliveryJobAsync(job, job.SubmissionPackage, job.Destination, emailService, httpClientFactory, settings, storage, dataProtectionProvider, clock, cancellationToken);
         SecurityEndpoints.AddAudit(dbContext, organizationId, job.SubmissionPackage.ActionId, tenantContext, "delivery.retried", new { job.Id, job.DestinationId, job.Status }, httpContext);
         await UpdatePackageDeliveryStatusAsync(dbContext, job.SubmissionPackage, clock, cancellationToken);
         await dbContext.SaveChangesAsync(cancellationToken);
@@ -1329,6 +1347,7 @@ public static class PackageEndpoints
         AtlasDbContext dbContext,
         ITenantContext tenantContext,
         IAtlasClock clock,
+        IDataProtectionProvider dataProtectionProvider,
         HttpContext httpContext,
         CancellationToken cancellationToken)
     {
@@ -1343,7 +1362,8 @@ public static class PackageEndpoints
             return EndpointHelpers.Problem("not_found", "Destination was not found.", StatusCodes.Status404NotFound);
         }
 
-        var validation = ValidateDestinationConfiguration(destination.Type, ParseJson(destination.ConfigurationJson));
+        var validation = ValidateDestinationConfiguration(destination.Type, ParseJson(destination.ConfigurationJson))
+            ?? ValidateStoredDestinationSecretConfiguration(destination, dataProtectionProvider);
         destination.LastValidatedAt = clock.UtcNow;
         destination.LastValidationStatus = validation is null ? "valid" : "invalid";
         SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "destination.validated", new { destination.Id, destination.LastValidationStatus }, httpContext);
@@ -1359,6 +1379,8 @@ public static class PackageEndpoints
         ITenantContext tenantContext,
         IEmailService emailService,
         IHttpClientFactory httpClientFactory,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
         IDataProtectionProvider dataProtectionProvider,
         IAtlasClock clock,
         HttpContext httpContext,
@@ -1375,7 +1397,7 @@ public static class PackageEndpoints
             return EndpointHelpers.Problem("not_found", "Destination was not found.", StatusCodes.Status404NotFound);
         }
 
-        var attempt = await SendDestinationTestAsync(destination, emailService, httpClientFactory, dataProtectionProvider, clock, cancellationToken);
+        var attempt = await SendDestinationTestAsync(destination, emailService, httpClientFactory, settings, storage, dataProtectionProvider, clock, cancellationToken);
         destination.LastValidatedAt = clock.UtcNow;
         destination.LastValidationStatus = attempt.Status == DeliveryAttemptStatus.Succeeded ? "valid" : "failed";
         SecurityEndpoints.AddAudit(dbContext, organizationId, null, tenantContext, "destination.tested", new { destination.Id, destination.Type, attempt.Status, attempt.HttpStatusCode, attempt.FailureCode }, httpContext);
@@ -1410,6 +1432,8 @@ public static class PackageEndpoints
         Destination destination,
         IEmailService emailService,
         IHttpClientFactory httpClientFactory,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
         IDataProtectionProvider dataProtectionProvider,
         IAtlasClock clock,
         CancellationToken cancellationToken)
@@ -1439,9 +1463,23 @@ public static class PackageEndpoints
                     var webhookResult = await DeliverWebhookDestinationAsync(package, destination, httpClientFactory, dataProtectionProvider, cancellationToken);
                     attempt.Status = webhookResult.Succeeded ? DeliveryAttemptStatus.Succeeded : DeliveryAttemptStatus.Failed;
                     attempt.HttpStatusCode = webhookResult.StatusCode;
+                    attempt.ProviderReference = webhookResult.ProviderReference;
                     attempt.ResponseSummary = webhookResult.ResponseSummary;
                     attempt.FailureCode = webhookResult.Succeeded ? null : "webhook_failed";
                     attempt.FailureMessage = webhookResult.Succeeded ? null : webhookResult.ResponseSummary;
+                    break;
+                case DestinationType.Sftp:
+                    var sftpResult = await DeliverSftpDestinationAsync(package, destination, settings, storage, dataProtectionProvider, cancellationToken);
+                    ApplyConnectorResult(attempt, sftpResult);
+                    break;
+                case DestinationType.SharePoint:
+                case DestinationType.OneDrive:
+                    var graphResult = await DeliverGraphDriveDestinationAsync(package, destination, settings, storage, httpClientFactory, dataProtectionProvider, cancellationToken);
+                    ApplyConnectorResult(attempt, graphResult);
+                    break;
+                case DestinationType.GoogleDrive:
+                    var googleResult = await DeliverGoogleDriveDestinationAsync(package, destination, settings, storage, httpClientFactory, dataProtectionProvider, cancellationToken);
+                    ApplyConnectorResult(attempt, googleResult);
                     break;
                 default:
                     attempt.Status = DeliveryAttemptStatus.Succeeded;
@@ -1449,7 +1487,7 @@ public static class PackageEndpoints
                     break;
             }
         }
-        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or InvalidOperationException or JsonException)
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException or InvalidOperationException or JsonException or SshException)
         {
             attempt.Status = DeliveryAttemptStatus.Failed;
             attempt.FailureCode = exception.GetType().Name;
@@ -1530,7 +1568,7 @@ public static class PackageEndpoints
         }
     }
 
-    private static async Task<WebhookDeliveryResult> DeliverWebhookDestinationAsync(
+    private static async Task<ConnectorDeliveryResult> DeliverWebhookDestinationAsync(
         SubmissionPackage package,
         Destination destination,
         IHttpClientFactory httpClientFactory,
@@ -1575,13 +1613,200 @@ public static class PackageEndpoints
 
         var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
         var excerpt = Truncate(await response.Content.ReadAsStringAsync(cancellationToken), 2000);
-        return new WebhookDeliveryResult((int)response.StatusCode is >= 200 and <= 299, (int)response.StatusCode, excerpt);
+        return new ConnectorDeliveryResult(
+            (int)response.StatusCode is >= 200 and <= 299,
+            (int)response.StatusCode,
+            "webhook",
+            excerpt,
+            (int)response.StatusCode is >= 200 and <= 299 ? null : "webhook_failed",
+            (int)response.StatusCode is >= 200 and <= 299 ? null : excerpt);
+    }
+
+    private static async Task<ConnectorDeliveryResult> DeliverSftpDestinationAsync(
+        SubmissionPackage package,
+        Destination destination,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        IDataProtectionProvider dataProtectionProvider,
+        CancellationToken cancellationToken)
+    {
+        var publicConfig = ParseJson(destination.ConfigurationJson);
+        var secretConfig = ReadSecretConfiguration(destination, dataProtectionProvider)
+            ?? throw new InvalidOperationException("SFTP destination requires encrypted connection credentials.");
+        var host = ReadString(secretConfig, "host")
+            ?? throw new InvalidOperationException("SFTP destination requires a host.");
+        var username = ReadString(secretConfig, "username", "user")
+            ?? throw new InvalidOperationException("SFTP destination requires a username.");
+        var port = ReadInt(secretConfig, "port") ?? 22;
+        var expectedHostKey = ReadString(secretConfig, "hostKeySha256", "hostKeyFingerprintSha256", "hostKeyFingerprint")
+            ?? throw new InvalidOperationException("SFTP destination requires a pinned SHA256 host key fingerprint.");
+        var password = ReadString(secretConfig, "password");
+        var privateKey = ReadString(secretConfig, "privateKey");
+        var privateKeyPassphrase = ReadString(secretConfig, "privateKeyPassphrase", "passphrase");
+        if (string.IsNullOrWhiteSpace(password) && string.IsNullOrWhiteSpace(privateKey))
+        {
+            throw new InvalidOperationException("SFTP destination requires either password or private key authentication.");
+        }
+
+        var remoteDirectory = ReadString(publicConfig, "remotePath", "folderPath", "directory")
+            ?? throw new InvalidOperationException("SFTP destination requires a remotePath.");
+        await using var artifact = await CreatePackageBundleTempFileAsync(package, settings, storage, publicConfig, cancellationToken);
+        var remoteFilePath = JoinRemotePath(remoteDirectory, artifact.FileName);
+
+        await Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var methods = new List<AuthenticationMethod>();
+            if (!string.IsNullOrWhiteSpace(privateKey))
+            {
+                var keyBytes = Encoding.UTF8.GetBytes(privateKey.Replace("\\n", "\n", StringComparison.Ordinal));
+                var keyStream = new MemoryStream(keyBytes);
+                var keyFile = string.IsNullOrWhiteSpace(privateKeyPassphrase)
+                    ? new PrivateKeyFile(keyStream)
+                    : new PrivateKeyFile(keyStream, privateKeyPassphrase);
+                methods.Add(new PrivateKeyAuthenticationMethod(username, keyFile));
+            }
+
+            if (!string.IsNullOrWhiteSpace(password))
+            {
+                methods.Add(new PasswordAuthenticationMethod(username, password));
+            }
+
+            using var client = new SftpClient(new Renci.SshNet.ConnectionInfo(host, port, username, methods.ToArray()));
+            client.HostKeyReceived += (_, args) =>
+            {
+                args.CanTrust = HostKeyMatches(args.HostKey, expectedHostKey);
+            };
+            client.Connect();
+            try
+            {
+                EnsureSftpDirectory(client, remoteDirectory);
+                using var fileStream = File.OpenRead(artifact.Path);
+                client.UploadFile(fileStream, remoteFilePath, true);
+            }
+            finally
+            {
+                if (client.IsConnected)
+                {
+                    client.Disconnect();
+                }
+            }
+        }, cancellationToken);
+
+        return new ConnectorDeliveryResult(
+            true,
+            null,
+            $"sftp://{host}:{port}{remoteFilePath}",
+            $"Uploaded package bundle to {remoteFilePath}.",
+            null,
+            null);
+    }
+
+    private static async Task<ConnectorDeliveryResult> DeliverGraphDriveDestinationAsync(
+        SubmissionPackage package,
+        Destination destination,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        IHttpClientFactory httpClientFactory,
+        IDataProtectionProvider dataProtectionProvider,
+        CancellationToken cancellationToken)
+    {
+        var publicConfig = ParseJson(destination.ConfigurationJson);
+        var secretConfig = ReadSecretConfiguration(destination, dataProtectionProvider)
+            ?? throw new InvalidOperationException($"{destination.Type} destination requires encrypted Microsoft Graph credentials.");
+        await using var artifact = await CreatePackageBundleTempFileAsync(package, settings, storage, publicConfig, cancellationToken);
+        var accessToken = await GetMicrosoftGraphAccessTokenAsync(secretConfig, httpClientFactory, cancellationToken);
+        var uploadUrl = BuildMicrosoftGraphUploadUrl(destination.Type, publicConfig, artifact.FileName);
+
+        using var request = new HttpRequestMessage(HttpMethod.Put, uploadUrl);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        await using var stream = File.OpenRead(artifact.Path);
+        request.Content = new StreamContent(stream);
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue(PackageBundleContentType);
+        request.Content.Headers.ContentLength = artifact.SizeBytes;
+
+        using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        var reference = ExtractJsonString(body, "webUrl") ?? ExtractJsonString(body, "id") ?? destination.Type.ToString();
+        var excerpt = Truncate(body, 2000);
+        return new ConnectorDeliveryResult(
+            response.IsSuccessStatusCode,
+            (int)response.StatusCode,
+            reference,
+            response.IsSuccessStatusCode ? $"Uploaded package bundle to {destination.Type}." : excerpt,
+            response.IsSuccessStatusCode ? null : "graph_upload_failed",
+            response.IsSuccessStatusCode ? null : excerpt);
+    }
+
+    private static async Task<ConnectorDeliveryResult> DeliverGoogleDriveDestinationAsync(
+        SubmissionPackage package,
+        Destination destination,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        IHttpClientFactory httpClientFactory,
+        IDataProtectionProvider dataProtectionProvider,
+        CancellationToken cancellationToken)
+    {
+        var publicConfig = ParseJson(destination.ConfigurationJson);
+        var secretConfig = ReadSecretConfiguration(destination, dataProtectionProvider)
+            ?? throw new InvalidOperationException("Google Drive destination requires encrypted Google OAuth credentials.");
+        await using var artifact = await CreatePackageBundleTempFileAsync(package, settings, storage, publicConfig, cancellationToken);
+        var accessToken = await GetGoogleAccessTokenAsync(secretConfig, httpClientFactory, cancellationToken);
+        var uploadUrl = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink";
+        if (ReadBool(publicConfig, "supportsAllDrives", "supportsSharedDrives") == true)
+        {
+            uploadUrl += "&supportsAllDrives=true";
+        }
+
+        var metadata = new Dictionary<string, object?>
+        {
+            ["name"] = artifact.FileName
+        };
+        if (ReadString(publicConfig, "folderId", "parentId") is { } folderId)
+        {
+            metadata["parents"] = new[] { folderId };
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, uploadUrl);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        using var content = new MultipartContent("related");
+        content.Add(new StringContent(JsonSerializer.Serialize(metadata, JsonOptions), Encoding.UTF8, "application/json"));
+        await using var stream = File.OpenRead(artifact.Path);
+        var fileContent = new StreamContent(stream);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue(PackageBundleContentType);
+        fileContent.Headers.ContentLength = artifact.SizeBytes;
+        content.Add(fileContent);
+        request.Content = content;
+
+        using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        var reference = ExtractJsonString(body, "webViewLink") ?? ExtractJsonString(body, "id") ?? "google-drive";
+        var excerpt = Truncate(body, 2000);
+        return new ConnectorDeliveryResult(
+            response.IsSuccessStatusCode,
+            (int)response.StatusCode,
+            reference,
+            response.IsSuccessStatusCode ? "Uploaded package bundle to Google Drive." : excerpt,
+            response.IsSuccessStatusCode ? null : "google_drive_upload_failed",
+            response.IsSuccessStatusCode ? null : excerpt);
+    }
+
+    private static void ApplyConnectorResult(DeliveryAttempt attempt, ConnectorDeliveryResult result)
+    {
+        attempt.Status = result.Succeeded ? DeliveryAttemptStatus.Succeeded : DeliveryAttemptStatus.Failed;
+        attempt.HttpStatusCode = result.StatusCode;
+        attempt.ProviderReference = result.ProviderReference;
+        attempt.ResponseSummary = result.ResponseSummary;
+        attempt.FailureCode = result.Succeeded ? null : result.FailureCode;
+        attempt.FailureMessage = result.Succeeded ? null : result.FailureMessage;
     }
 
     private static async Task<DeliveryAttempt> SendDestinationTestAsync(
         Destination destination,
         IEmailService emailService,
         IHttpClientFactory httpClientFactory,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
         IDataProtectionProvider dataProtectionProvider,
         IAtlasClock clock,
         CancellationToken cancellationToken)
@@ -1593,7 +1818,14 @@ public static class PackageEndpoints
             PackageReference = "REQ-TEST",
             VersionNumber = 1,
             AcceptedAt = clock.UtcNow,
-            Status = SubmissionPackageStatus.Ready
+            AcceptedByUserId = Guid.Empty,
+            Status = SubmissionPackageStatus.Ready,
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                request = new { title = "Reqara destination test" },
+                recipient = new { name = "Destination Test", email = "test@example.com" },
+                submission = new { submittedAt = clock.UtcNow, acceptedAt = clock.UtcNow }
+            }, JsonOptions)
         };
 
         var job = new DeliveryJob
@@ -1603,8 +1835,332 @@ public static class PackageEndpoints
             SubmissionPackageId = package.Id,
             DestinationId = destination.Id
         };
-        await ProcessDeliveryJobAsync(job, package, destination, emailService, httpClientFactory, dataProtectionProvider, clock, cancellationToken);
+        await ProcessDeliveryJobAsync(job, package, destination, emailService, httpClientFactory, settings, storage, dataProtectionProvider, clock, cancellationToken);
         return job.Attempts.Single();
+    }
+
+    private static async Task<PackageArtifactFile> CreatePackageBundleTempFileAsync(
+        SubmissionPackage package,
+        IAdminSettingService settings,
+        IObjectStorageService storage,
+        JsonElement configuration,
+        CancellationToken cancellationToken)
+    {
+        var plan = await BuildPackageBundlePlanAsync(package, settings, storage, cancellationToken);
+        var fileName = BuildDestinationPackageFileName(package, configuration);
+        var tempPath = Path.Combine(Path.GetTempPath(), $"reqara-delivery-{package.Id:N}-{Guid.NewGuid():N}.zip");
+        await using (var stream = new FileStream(
+            tempPath,
+            FileMode.CreateNew,
+            FileAccess.ReadWrite,
+            FileShare.None,
+            81920,
+            FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            await WritePackageBundleArchiveAsync(stream, package, plan, storage, cancellationToken);
+        }
+
+        return new PackageArtifactFile(tempPath, fileName, PackageBundleContentType, new FileInfo(tempPath).Length);
+    }
+
+    private static string BuildDestinationPackageFileName(SubmissionPackage package, JsonElement configuration)
+    {
+        var template = ReadString(configuration, "fileNameTemplate")
+            ?? "{packageReference}-Completion-Package.zip";
+        var value = template
+            .Replace("{packageReference}", package.PackageReference, StringComparison.OrdinalIgnoreCase)
+            .Replace("{packageId}", package.Id.ToString("N"), StringComparison.OrdinalIgnoreCase)
+            .Replace("{requestTitle}", package.Action?.Title ?? "Checklist", StringComparison.OrdinalIgnoreCase)
+            .Replace("{recipientName}", package.ActionRecipient?.Name ?? "Recipient", StringComparison.OrdinalIgnoreCase)
+            .Replace("{date}", DateTimeOffset.UtcNow.ToString("yyyyMMdd", CultureInfo.InvariantCulture), StringComparison.OrdinalIgnoreCase);
+        if (!value.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            value += ".zip";
+        }
+
+        return SanitizeZipFileName(value, package.Id);
+    }
+
+    private static async Task<string> GetMicrosoftGraphAccessTokenAsync(
+        JsonElement secretConfiguration,
+        IHttpClientFactory httpClientFactory,
+        CancellationToken cancellationToken)
+    {
+        if (ReadString(secretConfiguration, "accessToken") is { } accessToken)
+        {
+            return accessToken;
+        }
+
+        var tenantId = ReadString(secretConfiguration, "tenantId", "tenant")
+            ?? throw new InvalidOperationException("Microsoft Graph destination requires tenantId or accessToken.");
+        var clientId = ReadString(secretConfiguration, "clientId")
+            ?? throw new InvalidOperationException("Microsoft Graph destination requires clientId.");
+        var clientSecret = ReadString(secretConfiguration, "clientSecret")
+            ?? throw new InvalidOperationException("Microsoft Graph destination requires clientSecret.");
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            $"https://login.microsoftonline.com/{Uri.EscapeDataString(tenantId)}/oauth2/v2.0/token")
+        {
+            Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["scope"] = "https://graph.microsoft.com/.default",
+                ["client_secret"] = clientSecret,
+                ["grant_type"] = "client_credentials"
+            })
+        };
+        using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Microsoft Graph token request failed: {Truncate(body, 500)}");
+        }
+
+        return ExtractJsonString(body, "access_token")
+            ?? throw new InvalidOperationException("Microsoft Graph token response did not include access_token.");
+    }
+
+    private static Uri BuildMicrosoftGraphUploadUrl(DestinationType type, JsonElement configuration, string fileName)
+    {
+        var folderPath = ReadString(configuration, "folderPath", "path") ?? string.Empty;
+        var fullPath = GraphPath(folderPath, fileName);
+        string path;
+        if (ReadString(configuration, "driveId") is { } driveId)
+        {
+            path = $"/v1.0/drives/{Uri.EscapeDataString(driveId)}/root:/{fullPath}:/content";
+        }
+        else if (ReadString(configuration, "siteId") is { } siteId)
+        {
+            path = $"/v1.0/sites/{Uri.EscapeDataString(siteId)}/drive/root:/{fullPath}:/content";
+        }
+        else if (ReadString(configuration, "groupId") is { } groupId)
+        {
+            path = $"/v1.0/groups/{Uri.EscapeDataString(groupId)}/drive/root:/{fullPath}:/content";
+        }
+        else if (type == DestinationType.OneDrive && ReadString(configuration, "userId") is { } userId)
+        {
+            path = $"/v1.0/users/{Uri.EscapeDataString(userId)}/drive/root:/{fullPath}:/content";
+        }
+        else
+        {
+            throw new InvalidOperationException($"{type} destination requires driveId, siteId, groupId, or OneDrive userId.");
+        }
+
+        return new Uri("https://graph.microsoft.com" + path);
+    }
+
+    private static async Task<string> GetGoogleAccessTokenAsync(
+        JsonElement secretConfiguration,
+        IHttpClientFactory httpClientFactory,
+        CancellationToken cancellationToken)
+    {
+        if (ReadString(secretConfiguration, "accessToken") is { } accessToken)
+        {
+            return accessToken;
+        }
+
+        var clientId = ReadString(secretConfiguration, "clientId")
+            ?? throw new InvalidOperationException("Google Drive destination requires clientId or accessToken.");
+        var clientSecret = ReadString(secretConfiguration, "clientSecret")
+            ?? throw new InvalidOperationException("Google Drive destination requires clientSecret.");
+        var refreshToken = ReadString(secretConfiguration, "refreshToken")
+            ?? throw new InvalidOperationException("Google Drive destination requires refreshToken.");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://oauth2.googleapis.com/token")
+        {
+            Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["client_id"] = clientId,
+                ["client_secret"] = clientSecret,
+                ["refresh_token"] = refreshToken,
+                ["grant_type"] = "refresh_token"
+            })
+        };
+        using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Google OAuth token request failed: {Truncate(body, 500)}");
+        }
+
+        return ExtractJsonString(body, "access_token")
+            ?? throw new InvalidOperationException("Google OAuth token response did not include access_token.");
+    }
+
+    private static JsonElement? ReadSecretConfiguration(Destination destination, IDataProtectionProvider dataProtectionProvider)
+    {
+        if (string.IsNullOrWhiteSpace(destination.ConfigurationEncrypted))
+        {
+            return null;
+        }
+
+        try
+        {
+            var raw = dataProtectionProvider.CreateProtector("Reqara.Destinations").Unprotect(destination.ConfigurationEncrypted);
+            using var document = JsonDocument.Parse(raw);
+            return document.RootElement.Clone();
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or JsonException or CryptographicException)
+        {
+            return null;
+        }
+    }
+
+    private static string? ReadString(JsonElement element, params string[] names)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var name in names)
+        {
+            if (element.TryGetProperty(name, out var value)
+                && value.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(value.GetString()))
+            {
+                return value.GetString()!.Trim();
+            }
+        }
+
+        return null;
+    }
+
+    private static int? ReadInt(JsonElement element, params string[] names)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var value))
+            {
+                continue;
+            }
+
+            if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number))
+            {
+                return number;
+            }
+
+            if (value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out number))
+            {
+                return number;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool? ReadBool(JsonElement element, params string[] names)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var value))
+            {
+                continue;
+            }
+
+            if (value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            {
+                return value.GetBoolean();
+            }
+
+            if (value.ValueKind == JsonValueKind.String && bool.TryParse(value.GetString(), out var parsed))
+            {
+                return parsed;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ExtractJsonString(string json, string propertyName)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string GraphPath(string folderPath, string fileName)
+    {
+        return string.Join(
+            "/",
+            new[] { folderPath, fileName }
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .SelectMany(value => value.Replace("\\", "/", StringComparison.Ordinal).Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                .Where(segment => segment != "." && segment != "..")
+                .Select(Uri.EscapeDataString));
+    }
+
+    private static string JoinRemotePath(string remoteDirectory, string fileName)
+    {
+        var directory = NormalizeRemoteDirectory(remoteDirectory);
+        return directory == "/"
+            ? "/" + fileName
+            : directory.TrimEnd('/') + "/" + fileName;
+    }
+
+    private static string NormalizeRemoteDirectory(string value)
+    {
+        var normalized = value.Replace("\\", "/", StringComparison.Ordinal).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return "/";
+        }
+
+        var parts = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(part => part != "." && part != "..")
+            .ToArray();
+        return "/" + string.Join("/", parts);
+    }
+
+    private static void EnsureSftpDirectory(SftpClient client, string remoteDirectory)
+    {
+        var normalized = NormalizeRemoteDirectory(remoteDirectory);
+        if (normalized == "/")
+        {
+            return;
+        }
+
+        var current = string.Empty;
+        foreach (var part in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current += "/" + part;
+            if (!client.Exists(current))
+            {
+                client.CreateDirectory(current);
+            }
+        }
+    }
+
+    private static bool HostKeyMatches(byte[] hostKey, string expected)
+    {
+        var normalized = expected.Trim();
+        var sha256 = "SHA256:" + Convert.ToBase64String(SHA256.HashData(hostKey)).TrimEnd('=');
+        if (string.Equals(normalized, sha256, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var hex = Convert.ToHexString(SHA256.HashData(hostKey)).ToLowerInvariant();
+        return string.Equals(normalized.Replace(":", string.Empty, StringComparison.Ordinal).ToLowerInvariant(), hex, StringComparison.Ordinal);
     }
 
     private static async Task UpdatePackageDeliveryStatusAsync(
@@ -1698,6 +2254,141 @@ public static class PackageEndpoints
             return EndpointHelpers.Problem("validation_failed", "Webhook destination requires an HTTPS url.", StatusCodes.Status422UnprocessableEntity);
         }
 
+        if (type == DestinationType.Sftp && string.IsNullOrWhiteSpace(ReadString(root, "remotePath", "folderPath", "directory")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SFTP destination requires remotePath.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (type == DestinationType.SharePoint
+            && string.IsNullOrWhiteSpace(ReadString(root, "driveId"))
+            && string.IsNullOrWhiteSpace(ReadString(root, "siteId"))
+            && string.IsNullOrWhiteSpace(ReadString(root, "groupId")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SharePoint destination requires driveId, siteId, or groupId.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (type == DestinationType.OneDrive
+            && string.IsNullOrWhiteSpace(ReadString(root, "driveId"))
+            && string.IsNullOrWhiteSpace(ReadString(root, "userId")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "OneDrive destination requires driveId or userId.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (type == DestinationType.GoogleDrive && string.IsNullOrWhiteSpace(ReadString(root, "folderId", "parentId")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Google Drive destination requires folderId.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return null;
+    }
+
+    private static IResult? ValidateDestinationSecretConfiguration(
+        DestinationType type,
+        JsonElement? secretConfiguration,
+        bool required)
+    {
+        if (!DestinationTypeRequiresSecret(type))
+        {
+            return null;
+        }
+
+        if (secretConfiguration is null || secretConfiguration.Value.ValueKind is not JsonValueKind.Object)
+        {
+            return required
+                ? EndpointHelpers.Problem("validation_failed", $"{type} destination requires secretConfiguration.", StatusCodes.Status422UnprocessableEntity)
+                : null;
+        }
+
+        var root = secretConfiguration.Value;
+        return type switch
+        {
+            DestinationType.Sftp => ValidateSftpSecretConfiguration(root),
+            DestinationType.SharePoint or DestinationType.OneDrive => ValidateMicrosoftGraphSecretConfiguration(root, type),
+            DestinationType.GoogleDrive => ValidateGoogleDriveSecretConfiguration(root),
+            _ => null
+        };
+    }
+
+    private static IResult? ValidateStoredDestinationSecretConfiguration(
+        Destination destination,
+        IDataProtectionProvider dataProtectionProvider)
+    {
+        if (!DestinationTypeRequiresSecret(destination.Type))
+        {
+            return null;
+        }
+
+        var secret = ReadSecretConfiguration(destination, dataProtectionProvider);
+        return ValidateDestinationSecretConfiguration(destination.Type, secret, true);
+    }
+
+    private static bool DestinationTypeRequiresSecret(DestinationType type)
+    {
+        return type is DestinationType.Sftp or DestinationType.SharePoint or DestinationType.OneDrive or DestinationType.GoogleDrive;
+    }
+
+    private static IResult? ValidateSftpSecretConfiguration(JsonElement root)
+    {
+        if (string.IsNullOrWhiteSpace(ReadString(root, "host")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SFTP secretConfiguration requires host.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (string.IsNullOrWhiteSpace(ReadString(root, "username", "user")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SFTP secretConfiguration requires username.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (string.IsNullOrWhiteSpace(ReadString(root, "hostKeySha256", "hostKeyFingerprintSha256", "hostKeyFingerprint")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SFTP secretConfiguration requires hostKeySha256.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (string.IsNullOrWhiteSpace(ReadString(root, "password")) && string.IsNullOrWhiteSpace(ReadString(root, "privateKey")))
+        {
+            return EndpointHelpers.Problem("validation_failed", "SFTP secretConfiguration requires password or privateKey.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return null;
+    }
+
+    private static IResult? ValidateMicrosoftGraphSecretConfiguration(JsonElement root, DestinationType type)
+    {
+        if (!string.IsNullOrWhiteSpace(ReadString(root, "accessToken")))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(ReadString(root, "tenantId", "tenant"))
+            || string.IsNullOrWhiteSpace(ReadString(root, "clientId"))
+            || string.IsNullOrWhiteSpace(ReadString(root, "clientSecret")))
+        {
+            return EndpointHelpers.Problem(
+                "validation_failed",
+                $"{type} secretConfiguration requires accessToken or tenantId, clientId, and clientSecret.",
+                StatusCodes.Status422UnprocessableEntity);
+        }
+
+        return null;
+    }
+
+    private static IResult? ValidateGoogleDriveSecretConfiguration(JsonElement root)
+    {
+        if (!string.IsNullOrWhiteSpace(ReadString(root, "accessToken")))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(ReadString(root, "clientId"))
+            || string.IsNullOrWhiteSpace(ReadString(root, "clientSecret"))
+            || string.IsNullOrWhiteSpace(ReadString(root, "refreshToken")))
+        {
+            return EndpointHelpers.Problem(
+                "validation_failed",
+                "Google Drive secretConfiguration requires accessToken or clientId, clientSecret, and refreshToken.",
+                StatusCodes.Status422UnprocessableEntity);
+        }
+
         return null;
     }
 
@@ -1716,6 +2407,9 @@ public static class PackageEndpoints
             DestinationType.CsvExport => "package_zip_export",
             DestinationType.JsonExport => "package_zip_export",
             DestinationType.SharePoint => "sharepoint_destination",
+            DestinationType.OneDrive => "onedrive_destination",
+            DestinationType.GoogleDrive => "google_drive_destination",
+            DestinationType.Sftp => "sftp_destination",
             _ => "custom_destinations"
         };
         var check = await entitlements.HasFeatureAsync(organizationId, now, feature, cancellationToken);
@@ -2605,7 +3299,37 @@ public static class PackageEndpoints
     }
 
     private sealed record DestinationConfiguration(IReadOnlyList<string> Recipients, IReadOnlyList<string> Cc);
-    private sealed record WebhookDeliveryResult(bool Succeeded, int? StatusCode, string? ResponseSummary);
+    private sealed record ConnectorDeliveryResult(
+        bool Succeeded,
+        int? StatusCode,
+        string? ProviderReference,
+        string? ResponseSummary,
+        string? FailureCode,
+        string? FailureMessage);
+
+    private sealed record PackageArtifactFile(
+        string Path,
+        string FileName,
+        string ContentType,
+        long SizeBytes) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            try
+            {
+                if (File.Exists(Path))
+                {
+                    File.Delete(Path);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+            }
+
+            return ValueTask.CompletedTask;
+        }
+    }
+
     private sealed record PackageBundlePlan(
         string Root,
         IReadOnlyList<PackageBundleFilePlan> FilesToEmbed,
