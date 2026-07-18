@@ -47,6 +47,7 @@ public static class PlatformEndpoints
         MapOrganizations(group);
         MapInterests(group);
         MapRevenue(group);
+        MapPackageReporting(group);
         MapMetrics(group);
         MapAudit(group);
 
@@ -1949,6 +1950,357 @@ public static class PlatformEndpoints
             await dbContext.SaveChangesAsync(cancellationToken);
             return Results.NoContent();
         });
+    }
+
+    private static void MapPackageReporting(RouteGroupBuilder group)
+    {
+        group.MapGet("/packages", async (
+            int? page,
+            int? pageSize,
+            SubmissionPackageStatus? status,
+            Guid? organizationId,
+            Guid? ownerUserId,
+            Guid? assignedTeamId,
+            DateTimeOffset? from,
+            DateTimeOffset? to,
+            string? q,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var query = dbContext.SubmissionPackages.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Include(item => item.Organization)
+                .Include(item => item.Action)
+                .Include(item => item.ActionRecipient)
+                .Include(item => item.OwnerUser)
+                .Include(item => item.DeliveryJobs)
+                .Include(item => item.ManualHandoffs)
+                .AsQueryable();
+            if (status.HasValue)
+            {
+                query = query.Where(item => item.Status == status.Value);
+            }
+
+            if (organizationId.HasValue)
+            {
+                query = query.Where(item => item.OrganizationId == organizationId.Value);
+            }
+
+            if (ownerUserId.HasValue)
+            {
+                query = query.Where(item => item.OwnerUserId == ownerUserId.Value);
+            }
+
+            if (assignedTeamId.HasValue)
+            {
+                query = query.Where(item => item.AssignedTeamId == assignedTeamId.Value);
+            }
+
+            if (from.HasValue)
+            {
+                query = query.Where(item => item.AcceptedAt >= from.Value);
+            }
+
+            if (to.HasValue)
+            {
+                query = query.Where(item => item.AcceptedAt <= to.Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(q))
+            {
+                var term = q.Trim();
+                query = query.Where(item => item.PackageReference.Contains(term)
+                    || item.Action!.Title.Contains(term)
+                    || item.Organization!.Name.Contains(term)
+                    || (item.ActionRecipient != null && (item.ActionRecipient.Name.Contains(term) || item.ActionRecipient.Email.Contains(term))));
+            }
+
+            var total = await query.CountAsync(cancellationToken);
+            var items = await query
+                .OrderByDescending(item => item.AcceptedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
+                .Select(item => new
+                {
+                    item.Id,
+                    item.OrganizationId,
+                    OrganizationName = item.Organization == null ? null : item.Organization.Name,
+                    item.PackageReference,
+                    item.VersionNumber,
+                    item.Status,
+                    item.ActionId,
+                    RequestTitle = item.Action == null ? string.Empty : item.Action.Title,
+                    PublicReference = item.Action == null ? string.Empty : item.Action.PublicReference,
+                    item.SubmissionId,
+                    item.ActionRecipientId,
+                    RecipientName = item.ActionRecipient == null ? null : item.ActionRecipient.Name,
+                    RecipientEmail = item.ActionRecipient == null ? null : item.ActionRecipient.Email,
+                    item.AcceptedAt,
+                    item.GeneratedAt,
+                    item.OwnerUserId,
+                    OwnerName = item.OwnerUser == null ? null : item.OwnerUser.FullName,
+                    item.AssignedTeamId,
+                    DeliveryCount = item.DeliveryJobs.Count,
+                    FailedDeliveryCount = item.DeliveryJobs.Count(job => job.Status == DeliveryJobStatus.Failed || job.Status == DeliveryJobStatus.RequiresAttention),
+                    LatestDeliveryStatus = item.DeliveryJobs.OrderByDescending(job => job.QueuedAt).Select(job => (DeliveryJobStatus?)job.Status).FirstOrDefault(),
+                    HandoffCount = item.ManualHandoffs.Count,
+                    item.CreatedAt,
+                    item.UpdatedAt
+                })
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new { items, page = normalizedPage, pageSize = normalizedPageSize, total });
+        });
+
+        group.MapGet("/packages/delivery-health", async (
+            DateTimeOffset? from,
+            DateTimeOffset? to,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var effectiveTo = to ?? clock.UtcNow;
+            var effectiveFrom = from ?? effectiveTo.AddDays(-30);
+            var jobs = await dbContext.DeliveryJobs.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Include(item => item.Destination)
+                .Where(item => item.QueuedAt >= effectiveFrom && item.QueuedAt <= effectiveTo)
+                .ToListAsync(cancellationToken);
+            var attempts = await dbContext.DeliveryAttempts.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Where(item => item.StartedAt >= effectiveFrom && item.StartedAt <= effectiveTo)
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new
+            {
+                from = effectiveFrom,
+                to = effectiveTo,
+                totalJobs = jobs.Count,
+                succeededJobs = jobs.Count(item => item.Status == DeliveryJobStatus.Succeeded),
+                retryScheduledJobs = jobs.Count(item => item.Status == DeliveryJobStatus.RetryScheduled),
+                requiresAttentionJobs = jobs.Count(item => item.Status == DeliveryJobStatus.RequiresAttention),
+                cancelledJobs = jobs.Count(item => item.Status == DeliveryJobStatus.Cancelled),
+                successRate = Rate(jobs.Count(item => item.Status == DeliveryJobStatus.Succeeded), jobs.Count),
+                byStatus = jobs.GroupBy(item => item.Status).Select(grouping => new { status = grouping.Key, count = grouping.Count() }),
+                byDestinationType = jobs.GroupBy(item => item.Destination?.Type).Select(grouping => new { destinationType = grouping.Key, count = grouping.Count() }),
+                failureCodes = jobs.Where(item => item.FailureCode != null)
+                    .GroupBy(item => item.FailureCode)
+                    .Select(grouping => new { code = grouping.Key, count = grouping.Count() }),
+                attempts = new
+                {
+                    total = attempts.Count,
+                    succeeded = attempts.Count(item => item.Status == DeliveryAttemptStatus.Succeeded),
+                    failed = attempts.Count(item => item.Status == DeliveryAttemptStatus.Failed),
+                    successRate = Rate(attempts.Count(item => item.Status == DeliveryAttemptStatus.Succeeded), attempts.Count)
+                },
+                recentProblems = jobs
+                    .Where(item => item.Status is DeliveryJobStatus.Failed or DeliveryJobStatus.RequiresAttention or DeliveryJobStatus.RetryScheduled)
+                    .OrderByDescending(item => item.QueuedAt)
+                    .Take(10)
+                    .Select(item => new
+                    {
+                        item.Id,
+                        item.OrganizationId,
+                        item.SubmissionPackageId,
+                        item.DestinationId,
+                        DestinationName = item.Destination?.Name,
+                        DestinationType = item.Destination?.Type,
+                        item.Status,
+                        item.FailureCode,
+                        item.FailureMessage,
+                        item.AttemptCount,
+                        item.NextRetryAt,
+                        item.QueuedAt
+                    })
+            });
+        });
+
+        group.MapGet("/packages/destination-adoption", async (
+            DateTimeOffset? from,
+            DateTimeOffset? to,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var effectiveTo = to ?? clock.UtcNow;
+            var effectiveFrom = from ?? effectiveTo.AddDays(-30);
+            var destinations = await dbContext.Destinations.IgnoreQueryFilters().AsNoTracking().ToListAsync(cancellationToken);
+            var jobs = await dbContext.DeliveryJobs.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Include(item => item.Destination)
+                .Where(item => item.QueuedAt >= effectiveFrom && item.QueuedAt <= effectiveTo)
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new
+            {
+                from = effectiveFrom,
+                to = effectiveTo,
+                totalDestinations = destinations.Count,
+                activeDestinations = destinations.Count(item => item.IsActive && item.Status == DestinationStatus.Active),
+                defaultDestinations = destinations.Count(item => item.IsDefault),
+                organizationsWithDestinations = destinations.Select(item => item.OrganizationId).Distinct().Count(),
+                byType = destinations.GroupBy(item => item.Type).Select(grouping => new
+                {
+                    type = grouping.Key,
+                    total = grouping.Count(),
+                    active = grouping.Count(item => item.IsActive && item.Status == DestinationStatus.Active),
+                    defaults = grouping.Count(item => item.IsDefault),
+                    organizations = grouping.Select(item => item.OrganizationId).Distinct().Count()
+                }),
+                deliveryVolumeByType = jobs.GroupBy(item => item.Destination?.Type).Select(grouping => new
+                {
+                    type = grouping.Key,
+                    jobs = grouping.Count(),
+                    succeeded = grouping.Count(item => item.Status == DeliveryJobStatus.Succeeded),
+                    failed = grouping.Count(item => item.Status is DeliveryJobStatus.Failed or DeliveryJobStatus.RequiresAttention)
+                })
+            });
+        });
+
+        group.MapGet("/packages/compliance", async (
+            DateTimeOffset? from,
+            DateTimeOffset? to,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var effectiveTo = to ?? clock.UtcNow;
+            var effectiveFrom = from ?? effectiveTo.AddDays(-30);
+            var packages = await dbContext.SubmissionPackages.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Include(item => item.Submission)
+                .ThenInclude(submission => submission!.Files)
+                .ThenInclude(file => file.FileAsset)
+                .Include(item => item.DeliveryJobs)
+                .Include(item => item.ManualHandoffs)
+                .Where(item => item.AcceptedAt >= effectiveFrom && item.AcceptedAt <= effectiveTo)
+                .ToListAsync(cancellationToken);
+            var audits = await dbContext.AuditEvents.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Where(item => item.CreatedAt >= effectiveFrom
+                    && item.CreatedAt <= effectiveTo
+                    && (item.EventType.StartsWith("package.") || item.EventType.StartsWith("delivery.") || item.EventType.StartsWith("destination.") || item.EventType.StartsWith("routing_rule.")))
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new
+            {
+                from = effectiveFrom,
+                to = effectiveTo,
+                totalPackages = packages.Count,
+                readyForHandoff = packages.Count(item => item.Status == SubmissionPackageStatus.Ready),
+                delivered = packages.Count(item => item.Status == SubmissionPackageStatus.Delivered),
+                deliveryFailures = packages.Count(item => item.Status == SubmissionPackageStatus.DeliveryFailed),
+                archived = packages.Count(item => item.Status == SubmissionPackageStatus.Archived),
+                superseded = packages.Count(item => item.Status == SubmissionPackageStatus.Superseded),
+                packagesWithContentHash = packages.Count(item => !string.IsNullOrWhiteSpace(item.ContentHash)),
+                packagesWithEmbeddedFileCandidates = packages.Count(item => item.Submission?.Files.Count > 0),
+                cleanFiles = packages.SelectMany(item => item.Submission?.Files ?? []).Count(item => item.FileAsset?.ScanStatus == FileScanStatus.Clean),
+                pendingFiles = packages.SelectMany(item => item.Submission?.Files ?? []).Count(item => item.FileAsset?.ScanStatus == FileScanStatus.Pending),
+                rejectedFiles = packages.SelectMany(item => item.Submission?.Files ?? []).Count(item => item.FileAsset?.ScanStatus == FileScanStatus.Rejected),
+                packageDownloads = audits.Count(item => item.EventType == "package.downloaded"),
+                manualHandoffs = packages.Sum(item => item.ManualHandoffs.Count),
+                deliveryJobs = packages.Sum(item => item.DeliveryJobs.Count),
+                auditEvents = audits.Count,
+                byStatus = packages.GroupBy(item => item.Status).Select(grouping => new { status = grouping.Key, count = grouping.Count() }),
+                auditByType = audits.GroupBy(item => item.EventType).Select(grouping => new { eventType = grouping.Key, count = grouping.Count() })
+            });
+        });
+
+        group.MapGet("/packages/audit", async (
+            int? page,
+            int? pageSize,
+            Guid? organizationId,
+            string? eventType,
+            DateTimeOffset? from,
+            DateTimeOffset? to,
+            AtlasDbContext dbContext,
+            HttpContext httpContext,
+            IAtlasClock clock,
+            CancellationToken cancellationToken) =>
+        {
+            var access = await RequirePlatformStaffAsync(dbContext, httpContext, cancellationToken, SupportRoles);
+            if (access.Problem is not null)
+            {
+                return access.Problem;
+            }
+
+            var effectiveTo = to ?? clock.UtcNow;
+            var effectiveFrom = from ?? effectiveTo.AddDays(-30);
+            var normalizedPage = EndpointHelpers.NormalizePage(page);
+            var normalizedPageSize = EndpointHelpers.NormalizePageSize(pageSize);
+            var query = dbContext.AuditEvents.IgnoreQueryFilters()
+                .AsNoTracking()
+                .Include(item => item.Organization)
+                .Where(item => item.CreatedAt >= effectiveFrom
+                    && item.CreatedAt <= effectiveTo
+                    && (item.EventType.StartsWith("package.") || item.EventType.StartsWith("delivery.") || item.EventType.StartsWith("destination.") || item.EventType.StartsWith("routing_rule.")));
+            if (organizationId.HasValue)
+            {
+                query = query.Where(item => item.OrganizationId == organizationId.Value);
+            }
+
+            if (!string.IsNullOrWhiteSpace(eventType))
+            {
+                query = query.Where(item => item.EventType == eventType.Trim());
+            }
+
+            var total = await query.CountAsync(cancellationToken);
+            var items = await query
+                .OrderByDescending(item => item.CreatedAt)
+                .Skip(EndpointHelpers.PageSkip(normalizedPage, normalizedPageSize))
+                .Take(normalizedPageSize)
+                .Select(item => new
+                {
+                    item.Id,
+                    item.OrganizationId,
+                    OrganizationName = item.Organization == null ? null : item.Organization.Name,
+                    item.ActionId,
+                    item.ActorType,
+                    item.ActorId,
+                    item.EventType,
+                    EventData = JsonSerializer.Deserialize<JsonElement>(item.EventData, EndpointHelpers.JsonOptions),
+                    item.CorrelationId,
+                    item.CreatedAt
+                })
+                .ToListAsync(cancellationToken);
+
+            return Results.Ok(new { items, page = normalizedPage, pageSize = normalizedPageSize, total, from = effectiveFrom, to = effectiveTo });
+        });
+    }
+
+    private static decimal Rate(int numerator, int denominator)
+    {
+        return denominator == 0 ? 0 : Math.Round((decimal)numerator / denominator * 100, 2);
     }
 
     private static void MapMetrics(RouteGroupBuilder group)

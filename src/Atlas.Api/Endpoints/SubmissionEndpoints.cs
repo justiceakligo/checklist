@@ -370,14 +370,14 @@ public static class SubmissionEndpoints
             submission.Action.UpdatedAt = now;
             SecurityEndpoints.AddAudit(dbContext, organizationId, submission.ActionId, tenantContext, "submission.accepted", new { submission.Id, submission.VersionNumber }, httpContext);
             await dbContext.SaveChangesAsync(cancellationToken);
-            await PackageEndpoints.EnsurePackageForAcceptedSubmissionAsync(
+            var package = await PackageEndpoints.EnsurePackageForAcceptedSubmissionAsync(
                 submission.Id,
                 dbContext,
                 tenantContext,
                 clock,
                 httpContext,
                 cancellationToken);
-            return Results.Ok(ToSummary(submission));
+            return Results.Ok(ToReviewResponse(submission, package));
         }
 
         submission.Action.Status = ChecklistActionStatus.InProgress;
@@ -460,7 +460,7 @@ public static class SubmissionEndpoints
         await dbContext.SaveChangesAsync(cancellationToken);
 
         return send.Sent
-            ? Results.Ok(ToSummary(submission))
+            ? Results.Ok(ToReviewResponse(submission, null))
             : EndpointHelpers.Problem("email_send_failed", "Change request email could not be sent. The request is saved and can be resent.", StatusCodes.Status503ServiceUnavailable);
     }
 
@@ -510,6 +510,25 @@ public static class SubmissionEndpoints
             submission.ReviewedAt);
     }
 
+    private static SubmissionReviewResponse ToReviewResponse(Submission submission, SubmissionPackage? package)
+    {
+        return new SubmissionReviewResponse(
+            submission.Id,
+            submission.ActionId,
+            submission.ActionRecipientId,
+            submission.VersionNumber,
+            submission.Status,
+            submission.SubmittedAt,
+            submission.ReviewedAt,
+            package is null
+                ? null
+                : new SubmissionPackageReferenceResponse(
+                    package.Id,
+                    package.PackageReference,
+                    package.Status,
+                    package.VersionNumber));
+    }
+
     private static string FirstName(string fullName)
     {
         var trimmed = fullName.Trim();
@@ -538,6 +557,22 @@ public sealed record SubmissionSummaryResponse(
     SubmissionStatus Status,
     DateTimeOffset SubmittedAt,
     DateTimeOffset? ReviewedAt);
+
+public sealed record SubmissionReviewResponse(
+    Guid Id,
+    Guid ActionId,
+    Guid ActionRecipientId,
+    int VersionNumber,
+    SubmissionStatus Status,
+    DateTimeOffset SubmittedAt,
+    DateTimeOffset? ReviewedAt,
+    SubmissionPackageReferenceResponse? Package);
+
+public sealed record SubmissionPackageReferenceResponse(
+    Guid Id,
+    string PackageReference,
+    SubmissionPackageStatus Status,
+    int VersionNumber);
 
 public sealed record SubmissionDetailResponse(
     Guid Id,

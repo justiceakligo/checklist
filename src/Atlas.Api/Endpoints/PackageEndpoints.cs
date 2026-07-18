@@ -176,6 +176,10 @@ public static class PackageEndpoints
             int? page,
             int? pageSize,
             SubmissionPackageStatus? status,
+            Guid? ownerUserId,
+            Guid? assignedTeamId,
+            DateTimeOffset? from,
+            DateTimeOffset? to,
             string? q,
             AtlasDbContext dbContext,
             ITenantContext tenantContext,
@@ -192,10 +196,33 @@ public static class PackageEndpoints
                 .AsNoTracking()
                 .Include(item => item.Action)
                 .Include(item => item.ActionRecipient)
+                .Include(item => item.OwnerUser)
+                .Include(item => item.DeliveryJobs)
+                .Include(item => item.ManualHandoffs)
                 .AsQueryable();
             if (status.HasValue)
             {
                 query = query.Where(item => item.Status == status.Value);
+            }
+
+            if (ownerUserId.HasValue)
+            {
+                query = query.Where(item => item.OwnerUserId == ownerUserId.Value);
+            }
+
+            if (assignedTeamId.HasValue)
+            {
+                query = query.Where(item => item.AssignedTeamId == assignedTeamId.Value);
+            }
+
+            if (from.HasValue)
+            {
+                query = query.Where(item => item.AcceptedAt >= from.Value);
+            }
+
+            if (to.HasValue)
+            {
+                query = query.Where(item => item.AcceptedAt <= to.Value);
             }
 
             if (!string.IsNullOrWhiteSpace(q))
@@ -1371,6 +1398,7 @@ public static class PackageEndpoints
             .ThenInclude(file => file.FileAsset)
             .Include(item => item.Submission)
             .ThenInclude(submission => submission!.ReviewedByUser)
+            .Include(item => item.OwnerUser)
             .Include(item => item.DeliveryJobs)
             .ThenInclude(job => job.Destination)
             .Include(item => item.ManualHandoffs);
@@ -1846,7 +1874,12 @@ public static class PackageEndpoints
             package.AcceptedAt,
             package.GeneratedAt,
             package.OwnerUserId,
-            package.AssignedTeamId);
+            package.OwnerUser?.FullName,
+            package.AssignedTeamId,
+            package.DeliveryJobs.Count,
+            package.DeliveryJobs.Count(item => item.Status is DeliveryJobStatus.Failed or DeliveryJobStatus.RequiresAttention),
+            package.DeliveryJobs.OrderByDescending(item => item.QueuedAt).Select(item => (DeliveryJobStatus?)item.Status).FirstOrDefault(),
+            package.ManualHandoffs.Count);
     }
 
     private static PackageDetailResponse ToPackageDetail(SubmissionPackage package)
@@ -1872,6 +1905,7 @@ public static class PackageEndpoints
             package.PreviousPackageId,
             package.SupersededByPackageId,
             package.OwnerUserId,
+            package.OwnerUser?.FullName,
             package.AssignedTeamId,
             submission?.Responses.Count ?? 0,
             submission?.Files.Count ?? 0,
@@ -2580,7 +2614,12 @@ public sealed record PackageListItemResponse(
     DateTimeOffset AcceptedAt,
     DateTimeOffset? GeneratedAt,
     Guid? OwnerUserId,
-    Guid? AssignedTeamId);
+    string? OwnerName,
+    Guid? AssignedTeamId,
+    int DeliveryCount,
+    int FailedDeliveryCount,
+    DeliveryJobStatus? LatestDeliveryStatus,
+    int HandoffCount);
 
 public sealed record PackageDetailResponse(
     Guid Id,
@@ -2602,6 +2641,7 @@ public sealed record PackageDetailResponse(
     Guid? PreviousPackageId,
     Guid? SupersededByPackageId,
     Guid? OwnerUserId,
+    string? OwnerName,
     Guid? AssignedTeamId,
     int ResponseCount,
     int FileCount,
