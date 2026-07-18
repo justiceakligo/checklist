@@ -486,7 +486,7 @@ public static class PackageEndpoints
 
             var fileName = $"{SanitizeFileName(package.PackageReference)}-Completion-Package.zip";
             return Results.Stream(
-                stream => WritePackageBundleAsync(stream, package, bundlePlan, storage, cancellationToken),
+                stream => StreamPackageBundleAsync(stream, package, bundlePlan, storage, cancellationToken),
                 "application/zip",
                 fileName);
         });
@@ -2178,7 +2178,46 @@ public static class PackageEndpoints
             maxEmbeddedFileCount);
     }
 
-    private static async Task WritePackageBundleAsync(
+    private static async Task StreamPackageBundleAsync(
+        Stream output,
+        SubmissionPackage package,
+        PackageBundlePlan plan,
+        IObjectStorageService storage,
+        CancellationToken cancellationToken)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"reqara-package-{Guid.NewGuid():N}.zip");
+        try
+        {
+            await using (var temp = new FileStream(
+                tempPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                81920,
+                FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await WritePackageBundleArchiveAsync(temp, package, plan, storage, cancellationToken);
+                temp.Position = 0;
+                await temp.CopyToAsync(output, 81920, cancellationToken);
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    File.Delete(tempPath);
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                // The temp file is best-effort cleanup; failure to delete should not break a completed download.
+            }
+        }
+    }
+
+    private static async Task WritePackageBundleArchiveAsync(
         Stream output,
         SubmissionPackage package,
         PackageBundlePlan plan,
@@ -2352,7 +2391,6 @@ public static class PackageEndpoints
         builder.AppendLine($"Accepted: {package.AcceptedAt:yyyy-MM-dd HH:mm:ss 'UTC'}");
         builder.AppendLine($"Reviewer: {package.Submission?.ReviewedByUser?.FullName ?? package.AcceptedByUserId.ToString()}");
         builder.AppendLine($"Version: {package.VersionNumber}");
-        builder.AppendLine($"Content hash: {package.ContentHash}");
         builder.AppendLine();
         builder.AppendLine("Structured answers");
         builder.AppendLine("------------------");
@@ -2410,8 +2448,8 @@ public static class PackageEndpoints
 
         commands.AppendLine("0.94 0.98 0.98 rg 42 140 528 52 re f");
         commands.AppendLine("0.78 0.91 0.91 RG 42 140 528 52 re S");
-        commands.AppendLine(PdfText("F2", 12, 64, 170, "Integrity"));
-        commands.AppendLine(PdfText("F1", 10, 64, 152, $"Content hash: {Truncate(package.ContentHash, 72) ?? "Not set"}"));
+        commands.AppendLine(PdfText("F2", 12, 64, 170, "Audit-ready package"));
+        commands.AppendLine(PdfText("F1", 10, 64, 152, "Detailed integrity data is available in the package export for audit teams."));
         commands.AppendLine(PdfText("F1", 9, 42, 74, "Powered by Reqara"));
         commands.AppendLine(PdfText("F1", 9, 372, 74, $"Generated {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm 'UTC'}"));
         return BuildSimplePdf(commands.ToString());
