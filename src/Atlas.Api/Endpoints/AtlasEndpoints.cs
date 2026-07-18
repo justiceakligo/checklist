@@ -323,6 +323,27 @@ public static class AtlasEndpoints
             var rejectedFiles = await dbContext.FileAssets
                 .AsNoTracking()
                 .CountAsync(item => item.ScanStatus == FileScanStatus.Rejected, cancellationToken);
+            var packageCounts = await dbContext.SubmissionPackages
+                .AsNoTracking()
+                .GroupBy(_ => 1)
+                .Select(group => new
+                {
+                    Total = group.Count(),
+                    ReadyForHandoff = group.Count(item => item.Status == SubmissionPackageStatus.Ready),
+                    RoutingPending = group.Count(item => item.Status == SubmissionPackageStatus.RoutingPending),
+                    Delivered = group.Count(item => item.Status == SubmissionPackageStatus.Delivered),
+                    PartiallyDelivered = group.Count(item => item.Status == SubmissionPackageStatus.PartiallyDelivered),
+                    DeliveryFailures = group.Count(item => item.Status == SubmissionPackageStatus.DeliveryFailed),
+                    HandoffConfirmed = group.Count(item => item.Status == SubmissionPackageStatus.HandoffConfirmed),
+                    Archived = group.Count(item => item.Status == SubmissionPackageStatus.Archived),
+                    Superseded = group.Count(item => item.Status == SubmissionPackageStatus.Superseded)
+                })
+                .FirstOrDefaultAsync(cancellationToken);
+            var deliveryProblems = await dbContext.DeliveryJobs
+                .AsNoTracking()
+                .CountAsync(item => item.Status == DeliveryJobStatus.RequiresAttention
+                    || item.Status == DeliveryJobStatus.Failed,
+                    cancellationToken);
             var waitingRecipients = actions
                 .SelectMany(action => action.Recipients.Select(recipient => new { action, recipient }))
                 .Where(item => item.recipient.Status != ActionRecipientStatus.Submitted
@@ -368,6 +389,17 @@ public static class AtlasEndpoints
                     submissions.Count(item => item.Status == SubmissionStatus.Accepted),
                     submissions.Count(item => item.Status == SubmissionStatus.ChangesRequested)),
                 new DashboardFileCounts(pendingFiles, rejectedFiles),
+                new DashboardPackageCounts(
+                    packageCounts?.Total ?? 0,
+                    packageCounts?.ReadyForHandoff ?? 0,
+                    packageCounts?.RoutingPending ?? 0,
+                    packageCounts?.Delivered ?? 0,
+                    packageCounts?.PartiallyDelivered ?? 0,
+                    packageCounts?.DeliveryFailures ?? 0,
+                    deliveryProblems,
+                    packageCounts?.HandoffConfirmed ?? 0,
+                    packageCounts?.Archived ?? 0,
+                    packageCounts?.Superseded ?? 0),
                 attention,
                 await entitlements.GetOrganizationEntitlementsAsync(organizationId, now, cancellationToken)));
         });
@@ -3183,6 +3215,7 @@ public sealed record DashboardSummaryResponse(
     DashboardChecklistCounts Checklists,
     DashboardSubmissionCounts Submissions,
     DashboardFileCounts Files,
+    DashboardPackageCounts Packages,
     IReadOnlyList<DashboardAttentionItem> AttentionItems,
     OrganizationEntitlementSnapshot Entitlements);
 
@@ -3209,6 +3242,18 @@ public sealed record DashboardSubmissionCounts(
 public sealed record DashboardFileCounts(
     int PendingScan,
     int Rejected);
+
+public sealed record DashboardPackageCounts(
+    int Total,
+    int ReadyForHandoff,
+    int RoutingPending,
+    int Delivered,
+    int PartiallyDelivered,
+    int DeliveryFailures,
+    int DeliveryProblems,
+    int HandoffConfirmed,
+    int Archived,
+    int Superseded);
 
 public sealed record DashboardAttentionItem(
     Guid ActionId,

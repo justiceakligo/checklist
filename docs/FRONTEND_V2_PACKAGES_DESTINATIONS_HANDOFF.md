@@ -47,6 +47,19 @@ For already-accepted submissions that predate this release:
 POST /api/v2/submissions/{submissionId}/package
 ```
 
+Find an existing package by submission:
+
+```http
+GET /api/v2/submissions/{submissionId}/package
+```
+
+Find packages by action/request:
+
+```http
+GET /api/v2/actions/{actionId}/packages
+GET /api/v2/actions/{actionId}/packages?latest=true
+```
+
 Success `201`:
 
 ```json
@@ -278,6 +291,60 @@ Response:
   }
 }
 ```
+
+Contents and integrity proof:
+
+```http
+GET /api/v2/submission-packages/{packageId}/contents
+```
+
+Response:
+
+```json
+{
+  "packageId": "74fd5f68-0d87-40c9-9d63-28e95f760800",
+  "packageReference": "REQ-20260717-BFED84",
+  "submissionId": "c8904d39-1284-4dfa-8ef5-599068d28a18",
+  "actionId": "5038097e-d308-4085-c5b5-9bb9c2c10aac",
+  "responses": [
+    {
+      "requirementId": "81f3eb05-9d7e-48cb-a2e1-6cf6ab1ec326",
+      "value": "Ontario Driver's Licence"
+    }
+  ],
+  "files": [
+    {
+      "fileAssetId": "7c3de87a-8770-4e66-bb35-9b44fbea2919",
+      "requirementId": "b9613c9f-7b80-40f5-8734-47af63e52d78",
+      "fileName": "Certificate of Insurance.pdf",
+      "mimeType": "application/pdf",
+      "sizeBytes": 1552760,
+      "scanStatus": "Clean",
+      "isPreviouslySubmitted": false,
+      "documentName": "Certificate of Insurance",
+      "documentExpiresAt": "2027-04-30T00:00:00Z"
+    }
+  ],
+  "integrity": {
+    "contentHash": "bfed8452b189b02342ab7c842d596605ad79...",
+    "metadataJson": "{...}",
+    "versionNumber": 1,
+    "acceptedAt": "2026-07-17T00:55:24Z",
+    "acceptedByUserId": "1e960383-bea0-4576-a21f-3b483c741d29",
+    "declarationAcceptedAt": "2026-07-17T00:50:24Z",
+    "declarationIpAddress": "203.0.113.10"
+  }
+}
+```
+
+Download full JSON export:
+
+```http
+GET /api/v2/submission-packages/{packageId}/export.json
+Accept: application/json
+```
+
+This returns a downloadable JSON file containing package detail, contents, integrity proof, summary, deliveries, handoffs, and export timestamp.
 
 ## Archive And Assignment
 
@@ -637,6 +704,25 @@ Org dashboard:
 - Manual handoffs this period
 - Average time from accepted to delivered
 - Top destinations by volume
+
+The existing org dashboard summary now includes:
+
+```json
+{
+  "packages": {
+    "total": 12,
+    "readyForHandoff": 3,
+    "routingPending": 1,
+    "delivered": 6,
+    "partiallyDelivered": 1,
+    "deliveryFailures": 1,
+    "deliveryProblems": 1,
+    "handoffConfirmed": 4,
+    "archived": 2,
+    "superseded": 0
+  }
+}
+```
 
 Admin dashboard:
 

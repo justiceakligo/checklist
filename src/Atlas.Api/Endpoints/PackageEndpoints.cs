@@ -234,6 +234,97 @@ public static class PackageEndpoints
                 : Results.Ok(ToPackageDetail(package));
         });
 
+        group.MapGet("/actions/{actionId:guid}/packages", async (
+            Guid actionId,
+            bool? latest,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!TryRequireDashboard(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+
+            var query = LoadPackageDetailQuery(dbContext)
+                .AsNoTracking()
+                .Where(item => item.ActionId == actionId)
+                .OrderByDescending(item => item.VersionNumber)
+                .ThenByDescending(item => item.AcceptedAt);
+            var packages = latest.GetValueOrDefault(false)
+                ? await query.Take(1).ToListAsync(cancellationToken)
+                : await query.ToListAsync(cancellationToken);
+            var items = packages.Select(ToPackageDetail).ToList();
+            return Results.Ok(new { items, total = items.Count });
+        }).WithTags("Packages");
+
+        group.MapGet("/submissions/{submissionId:guid}/package", async (
+            Guid submissionId,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!TryRequireDashboard(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+
+            var package = await LoadPackageDetailQuery(dbContext)
+                .AsNoTracking()
+                .FirstOrDefaultAsync(item => item.SubmissionId == submissionId, cancellationToken);
+            return package is null
+                ? EndpointHelpers.Problem("not_found", "Submission package was not found.", StatusCodes.Status404NotFound)
+                : Results.Ok(ToPackageDetail(package));
+        }).WithTags("Packages");
+
+        packages.MapGet("/{packageId:guid}/contents", async (
+            Guid packageId,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!TryRequireDashboard(tenantContext, out _, out var problem))
+            {
+                return problem!;
+            }
+
+            var package = await LoadPackageDetailQuery(dbContext)
+                .AsNoTracking()
+                .FirstOrDefaultAsync(item => item.Id == packageId, cancellationToken);
+            return package is null
+                ? EndpointHelpers.Problem("not_found", "Submission package was not found.", StatusCodes.Status404NotFound)
+                : Results.Ok(ToPackageContents(package));
+        });
+
+        packages.MapGet("/{packageId:guid}/export.json", async (
+            Guid packageId,
+            AtlasDbContext dbContext,
+            ITenantContext tenantContext,
+            IAtlasClock clock,
+            HttpContext httpContext,
+            CancellationToken cancellationToken) =>
+        {
+            if (!TryRequireDashboard(tenantContext, out var organizationId, out var problem))
+            {
+                return problem!;
+            }
+
+            var package = await LoadPackageDetailQuery(dbContext)
+                .FirstOrDefaultAsync(item => item.Id == packageId, cancellationToken);
+            if (package is null)
+            {
+                return EndpointHelpers.Problem("not_found", "Submission package was not found.", StatusCodes.Status404NotFound);
+            }
+
+            package.GeneratedAt ??= clock.UtcNow;
+            SecurityEndpoints.AddAudit(dbContext, organizationId, package.ActionId, tenantContext, "package.downloaded", new { package.Id, package.PackageReference, Type = "json" }, httpContext);
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            var fileName = $"{SanitizeFileName(package.PackageReference)}-Package-Export.json";
+            var json = JsonSerializer.Serialize(ToPackageExport(package), JsonOptions);
+            return Results.File(Encoding.UTF8.GetBytes(json), "application/json", fileName);
+        });
+
         packages.MapGet("/{packageId:guid}/report", async (
             Guid packageId,
             AtlasDbContext dbContext,
@@ -1770,6 +1861,48 @@ public static class PackageEndpoints
             package.UpdatedAt);
     }
 
+    private static PackageContentsResponse ToPackageContents(SubmissionPackage package)
+    {
+        var submission = package.Submission;
+        return new PackageContentsResponse(
+            package.Id,
+            package.PackageReference,
+            package.SubmissionId,
+            package.ActionId,
+            submission?.Responses.Select(item => new PackageResponseValue(
+                item.RequirementId,
+                DeserializeJsonElementOrNull(item.ValueJson))).ToList() ?? [],
+            submission?.Files.Select(file => new PackageFileResponse(
+                file.FileAssetId,
+                file.RequirementId,
+                file.FileAsset?.OriginalFileName ?? file.DocumentName ?? "Submitted file",
+                file.FileAsset?.MimeType ?? string.Empty,
+                file.FileAsset?.SizeBytes ?? 0,
+                file.FileAsset?.ScanStatus ?? FileScanStatus.Pending,
+                file.IsPreviouslySubmitted,
+                file.DocumentName,
+                file.DocumentExpiresAt)).ToList() ?? [],
+            new PackageIntegrityResponse(
+                package.ContentHash,
+                package.MetadataJson,
+                package.VersionNumber,
+                package.AcceptedAt,
+                package.AcceptedByUserId,
+                submission?.DeclarationAcceptedAt,
+                submission?.DeclarationIpAddress?.ToString()));
+    }
+
+    private static PackageExportResponse ToPackageExport(SubmissionPackage package)
+    {
+        return new PackageExportResponse(
+            ToPackageDetail(package),
+            ToPackageContents(package),
+            BuildPackageSummary(package),
+            package.DeliveryJobs.OrderByDescending(item => item.QueuedAt).Select(ToDeliveryJobResponse).ToList(),
+            package.ManualHandoffs.OrderByDescending(item => item.CompletedAt).Select(ToManualHandoffResponse).ToList(),
+            DateTimeOffset.UtcNow);
+    }
+
     private static PackageGeneratedResponse ToPackageGeneratedResponse(SubmissionPackage package, string artifact)
     {
         return new PackageGeneratedResponse(
@@ -2160,6 +2293,13 @@ public static class PackageEndpoints
         return JsonSerializer.Deserialize<JsonElement>(json, JsonOptions);
     }
 
+    private static JsonElement? DeserializeJsonElementOrNull(string? json)
+    {
+        return string.IsNullOrWhiteSpace(json)
+            ? null
+            : JsonSerializer.Deserialize<JsonElement>(json, JsonOptions);
+    }
+
     private static string JsonOrDefault(JsonElement? value)
     {
         return value is { ValueKind: not JsonValueKind.Undefined and not JsonValueKind.Null }
@@ -2256,6 +2396,26 @@ public sealed record PackageFileResponse(
     string? DocumentName,
     DateTimeOffset? DocumentExpiresAt);
 
+public sealed record PackageContentsResponse(
+    Guid PackageId,
+    string PackageReference,
+    Guid SubmissionId,
+    Guid ActionId,
+    IReadOnlyList<PackageResponseValue> Responses,
+    IReadOnlyList<PackageFileResponse> Files,
+    PackageIntegrityResponse Integrity);
+
+public sealed record PackageResponseValue(Guid RequirementId, JsonElement? Value);
+
+public sealed record PackageIntegrityResponse(
+    string? ContentHash,
+    string MetadataJson,
+    int VersionNumber,
+    DateTimeOffset AcceptedAt,
+    Guid AcceptedByUserId,
+    DateTimeOffset? DeclarationAcceptedAt,
+    string? DeclarationIpAddress);
+
 public sealed record PackageGeneratedResponse(
     Guid Id,
     string PackageReference,
@@ -2265,6 +2425,14 @@ public sealed record PackageGeneratedResponse(
     string Url);
 
 public sealed record PackageSummaryResponse(string PlainText, object Json);
+
+public sealed record PackageExportResponse(
+    PackageDetailResponse Package,
+    PackageContentsResponse Contents,
+    PackageSummaryResponse Summary,
+    IReadOnlyList<DeliveryJobResponse> Deliveries,
+    IReadOnlyList<ManualHandoffResponse> ManualHandoffs,
+    DateTimeOffset ExportedAt);
 
 public sealed record AssignPackageRequest(Guid? OwnerUserId, Guid? AssignedTeamId);
 
