@@ -489,14 +489,24 @@ public static class AtlasEndpoints
                 .Select(item => item!.Value);
             var averageRecipientCompletionMinutes = AverageMinutes(recipientCompletionDurations);
 
+            var deliveredPackageStatuses = new[]
+            {
+                SubmissionPackageStatus.Delivered,
+                SubmissionPackageStatus.HandoffConfirmed,
+                SubmissionPackageStatus.Archived
+            };
             var packageQuery = dbContext.SubmissionPackages
                 .AsNoTracking()
-                .Where(item => item.Status == SubmissionPackageStatus.Delivered
-                    && item.UpdatedAt <= now);
+                .Where(item => deliveredPackageStatuses.Contains(item.Status)
+                    && (item.Status == SubmissionPackageStatus.Archived
+                        ? item.ArchivedAt ?? item.UpdatedAt
+                        : item.UpdatedAt) <= now);
 
             if (periodStart is { } deliveredSince)
             {
-                packageQuery = packageQuery.Where(item => item.UpdatedAt >= deliveredSince);
+                packageQuery = packageQuery.Where(item => (item.Status == SubmissionPackageStatus.Archived
+                    ? item.ArchivedAt ?? item.UpdatedAt
+                    : item.UpdatedAt) >= deliveredSince);
             }
 
             var packagesDelivered = await packageQuery.CountAsync(cancellationToken);
