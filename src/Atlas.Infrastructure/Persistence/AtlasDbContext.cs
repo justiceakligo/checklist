@@ -14,6 +14,7 @@ public sealed class AtlasDbContext(
     public DbSet<AppUser> Users => Set<AppUser>();
     public DbSet<UserAuthToken> UserAuthTokens => Set<UserAuthToken>();
     public DbSet<OrganizationUser> OrganizationUsers => Set<OrganizationUser>();
+    public DbSet<OrganizationTeam> OrganizationTeams => Set<OrganizationTeam>();
     public DbSet<Template> Templates => Set<Template>();
     public DbSet<TemplateVersion> TemplateVersions => Set<TemplateVersion>();
     public DbSet<TemplateRequirement> TemplateRequirements => Set<TemplateRequirement>();
@@ -68,6 +69,7 @@ public sealed class AtlasDbContext(
 
         ConfigureOrganizations(modelBuilder);
         ConfigureUsers(modelBuilder);
+        ConfigureTeams(modelBuilder);
         ConfigureTemplates(modelBuilder);
         ConfigureActions(modelBuilder);
         ConfigureSubmissions(modelBuilder);
@@ -177,6 +179,32 @@ public sealed class AtlasDbContext(
                 .WithMany(e => e.Memberships)
                 .HasForeignKey(e => e.UserId)
                 .OnDelete(DeleteBehavior.Restrict);
+        });
+    }
+
+    private static void ConfigureTeams(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<OrganizationTeam>(entity =>
+        {
+            entity.ToTable("organization_teams");
+            entity.HasIndex(e => new { e.OrganizationId, e.Name })
+                .IsUnique()
+                .HasDatabaseName("uq_organization_teams_org_name");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status, e.Name })
+                .HasDatabaseName("ix_organization_teams_org_status_name");
+            entity.Property(e => e.Name).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.Description).HasMaxLength(500);
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.CreatedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.CreatedByUserId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
     }
 
@@ -1779,6 +1807,8 @@ public sealed class AtlasDbContext(
                 && e.DeletedAt == null);
         modelBuilder.Entity<OrganizationUser>()
             .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<OrganizationTeam>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
         modelBuilder.Entity<Template>()
             .HasQueryFilter(e => e.DeletedAt == null
                 && (e.OrganizationId == null
@@ -1944,6 +1974,10 @@ public sealed class AtlasDbContext(
                         action.CreatedAt = action.CreatedAt == default ? now : action.CreatedAt;
                         action.UpdatedAt = now;
                         break;
+                    case OrganizationTeam team:
+                        team.CreatedAt = team.CreatedAt == default ? now : team.CreatedAt;
+                        team.UpdatedAt = now;
+                        break;
                     case AdminSetting setting:
                         setting.CreatedAt = setting.CreatedAt == default ? now : setting.CreatedAt;
                         setting.UpdatedAt = now;
@@ -2047,6 +2081,9 @@ public sealed class AtlasDbContext(
                         break;
                     case ChecklistAction action:
                         action.UpdatedAt = now;
+                        break;
+                    case OrganizationTeam team:
+                        team.UpdatedAt = now;
                         break;
                     case AdminSetting setting:
                         setting.UpdatedAt = now;

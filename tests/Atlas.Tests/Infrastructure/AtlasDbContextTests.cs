@@ -311,6 +311,47 @@ public sealed class AtlasDbContextTests
     }
 
     [Fact]
+    public async Task Teams_are_filtered_to_current_tenant()
+    {
+        var organizationA = Guid.NewGuid();
+        var organizationB = Guid.NewGuid();
+        var tenant = new TestTenantContext { OrganizationId = organizationA };
+        var databaseRoot = new InMemoryDatabaseRoot();
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            dbContext.Organizations.AddRange(
+                new Organization { Id = organizationA, Name = "A", Slug = "a" },
+                new Organization { Id = organizationB, Name = "B", Slug = "b" });
+            dbContext.OrganizationTeams.AddRange(
+                new OrganizationTeam
+                {
+                    OrganizationId = organizationA,
+                    Name = "Sales"
+                },
+                new OrganizationTeam
+                {
+                    OrganizationId = organizationB,
+                    Name = "Hidden Sales"
+                });
+            await dbContext.SaveChangesAsync();
+        }
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            var teams = await dbContext.OrganizationTeams.ToListAsync();
+            Assert.Single(teams);
+            Assert.Equal("Sales", teams[0].Name);
+        }
+
+        tenant.OrganizationId = null;
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            Assert.Empty(await dbContext.OrganizationTeams.ToListAsync());
+        }
+    }
+
+    [Fact]
     public async Task Platform_administration_records_are_not_tenant_filtered()
     {
         var staffId = Guid.NewGuid();

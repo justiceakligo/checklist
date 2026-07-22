@@ -194,6 +194,12 @@ public static class ConversationsEndpoints
             return EndpointHelpers.Problem("invalid_assignee", "Assignee must be an active member of this organization.", StatusCodes.Status422UnprocessableEntity);
         }
 
+        if (request.TeamId.HasValue
+            && !await IsActiveOrganizationTeamAsync(dbContext, request.TeamId.Value, cancellationToken))
+        {
+            return EndpointHelpers.Problem("invalid_team", "Assigned team must be an active team in this organization.", StatusCodes.Status422UnprocessableEntity);
+        }
+
         var conversation = await dbContext.Conversations
             .Include(item => item.Lead)
             .FirstOrDefaultAsync(item => item.Id == conversationId, cancellationToken);
@@ -1259,6 +1265,16 @@ public static class ConversationsEndpoints
     {
         return await dbContext.OrganizationUsers.AnyAsync(
             item => item.UserId == userId && item.Status == MembershipStatus.Active,
+            cancellationToken);
+    }
+
+    private static async Task<bool> IsActiveOrganizationTeamAsync(
+        AtlasDbContext dbContext,
+        Guid teamId,
+        CancellationToken cancellationToken)
+    {
+        return await dbContext.OrganizationTeams.AnyAsync(
+            item => item.Id == teamId && item.Status == OrganizationTeamStatus.Active,
             cancellationToken);
     }
 

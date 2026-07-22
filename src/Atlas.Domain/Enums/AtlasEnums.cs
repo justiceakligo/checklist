@@ -22,6 +22,12 @@ public enum MembershipStatus : short
     Disabled = 3
 }
 
+public enum OrganizationTeamStatus : short
+{
+    Active = 1,
+    Archived = 2
+}
+
 public enum TemplateStatus : short
 {
     Draft = 1,

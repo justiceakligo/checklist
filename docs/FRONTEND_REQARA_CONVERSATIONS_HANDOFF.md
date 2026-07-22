@@ -172,6 +172,7 @@ Suggested module routes:
 /conversations/:conversationId
 /conversations/reports
 /settings/whatsapp-connections
+/settings/teams
 ```
 
 Suggested left/inbox queues:
@@ -194,6 +195,172 @@ closed
 ```
 
 Omit `queue` for all open conversations.
+
+## UI Flow 0: Team Listing And Management
+
+Route: `/settings/teams`
+
+The conversation assignment UI can use teams as assignment buckets. Teams are tenant-scoped and lightweight in this backend slice: they have a name, optional description, status, creator, and timestamps. There is no team membership table yet.
+
+### List Teams
+
+```http
+GET /api/v1/teams?activeOnly=true&page=1&pageSize=100
+```
+
+Query parameters:
+
+```text
+activeOnly=true|false
+search=leasing
+page=1
+pageSize=100
+```
+
+Sample response:
+
+```json
+{
+  "items": [
+    {
+      "id": "4a92d2e8-4f17-49ab-85c1-177f138d7c98",
+      "name": "Leasing Sales",
+      "description": "Inbound leasing and tenant document leads.",
+      "status": "Active",
+      "createdByUserId": "7dcf95fe-ed5e-4455-98fa-d6a3fcfc1991",
+      "createdByUserName": "Jamie Mensah",
+      "createdAt": "2026-07-22T01:12:44.080+00:00",
+      "updatedAt": "2026-07-22T01:12:44.080+00:00"
+    },
+    {
+      "id": "5c87b7c4-89d2-4c81-bf20-0d56f82a1a4b",
+      "name": "Commercial Sales",
+      "description": "Business account conversations and larger client opportunities.",
+      "status": "Active",
+      "createdByUserId": "7dcf95fe-ed5e-4455-98fa-d6a3fcfc1991",
+      "createdByUserName": "Jamie Mensah",
+      "createdAt": "2026-07-22T01:13:29.425+00:00",
+      "updatedAt": "2026-07-22T01:13:29.425+00:00"
+    }
+  ],
+  "page": 1,
+  "pageSize": 100,
+  "total": 2
+}
+```
+
+Use this endpoint to populate:
+
+- Assignment modal team dropdown.
+- Conversation filters by `assignedTeamId`.
+- Teams settings page.
+
+### Create Team
+
+Requires admin scope.
+
+```http
+POST /api/v1/teams
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "name": "Leasing Sales",
+  "description": "Inbound leasing and tenant document leads.",
+  "status": "Active"
+}
+```
+
+Response `201`:
+
+```json
+{
+  "id": "4a92d2e8-4f17-49ab-85c1-177f138d7c98",
+  "name": "Leasing Sales",
+  "description": "Inbound leasing and tenant document leads.",
+  "status": "Active",
+  "createdByUserId": "7dcf95fe-ed5e-4455-98fa-d6a3fcfc1991",
+  "createdByUserName": null,
+  "createdAt": "2026-07-22T01:12:44.080+00:00",
+  "updatedAt": "2026-07-22T01:12:44.080+00:00"
+}
+```
+
+### Update Or Archive Team
+
+Requires admin scope.
+
+```http
+PATCH /api/v1/teams/4a92d2e8-4f17-49ab-85c1-177f138d7c98
+Content-Type: application/json
+```
+
+Rename request:
+
+```json
+{
+  "name": "Residential Leasing Sales",
+  "description": "Inbound residential leasing and tenant document leads.",
+  "status": "Active"
+}
+```
+
+Archive request:
+
+```json
+{
+  "name": "Residential Leasing Sales",
+  "description": "Inbound residential leasing and tenant document leads.",
+  "status": "Archived"
+}
+```
+
+Response `200`:
+
+```json
+{
+  "id": "4a92d2e8-4f17-49ab-85c1-177f138d7c98",
+  "name": "Residential Leasing Sales",
+  "description": "Inbound residential leasing and tenant document leads.",
+  "status": "Archived",
+  "createdByUserId": "7dcf95fe-ed5e-4455-98fa-d6a3fcfc1991",
+  "createdByUserName": null,
+  "createdAt": "2026-07-22T01:12:44.080+00:00",
+  "updatedAt": "2026-07-22T01:18:02.221+00:00"
+}
+```
+
+Validation errors:
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/validation_failed",
+  "title": "Team name is required.",
+  "status": 422,
+  "code": "validation_failed"
+}
+```
+
+Duplicate team name:
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/duplicate_team",
+  "title": "A team with this name already exists.",
+  "status": 409,
+  "code": "duplicate_team"
+}
+```
+
+### UX Notes
+
+- Default picker data to `GET /api/v1/teams?activeOnly=true&pageSize=100`.
+- Use `activeOnly=false` only on the teams settings page.
+- Archived teams cannot be assigned to conversations.
+- Existing conversations may still show an archived team ID; keep a fallback display of the raw ID or "Archived team" if the active picker does not include it.
 
 ## UI Flow 1: Empty / Not Enabled
 
@@ -731,6 +898,15 @@ Validation errors:
   "title": "Assignee must be an active member of this organization.",
   "status": 422,
   "code": "invalid_assignee"
+}
+```
+
+```json
+{
+  "type": "https://docs.atlas.example/errors/invalid_team",
+  "title": "Assigned team must be an active team in this organization.",
+  "status": 422,
+  "code": "invalid_team"
 }
 ```
 
@@ -1441,6 +1617,9 @@ POST   /api/v1/conversations/{conversationId}/notes
 POST   /api/v1/conversations/{conversationId}/follow-ups
 PATCH  /api/v1/conversations/{conversationId}/lead-status
 GET    /api/v1/conversation-reports/summary
+GET    /api/v1/teams
+POST   /api/v1/teams
+PATCH  /api/v1/teams/{teamId}
 GET    /api/v1/whatsapp-connections
 POST   /api/v1/whatsapp-connections
 POST   /api/v1/whatsapp-connections/{connectionId}/validate
@@ -1455,5 +1634,6 @@ POST   /api/webhooks/meta/whatsapp
 - No provider send worker yet for outgoing WhatsApp messages.
 - No media upload/send endpoint for conversation attachments yet.
 - No SignalR events yet.
-- No user/team listing endpoint was added by this slice; use existing org member/team APIs if available in the frontend app.
+- No user listing endpoint was added by this slice; use existing org member APIs if available in the frontend app.
+- Team membership is not modeled yet; teams are assignment buckets.
 - No platform-admin conversation diagnostics endpoint was added by this slice.
