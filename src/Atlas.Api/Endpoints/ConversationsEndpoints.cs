@@ -25,10 +25,12 @@ public static class ConversationsEndpoints
     {
         var conversations = app.MapGroup("/api/v1/conversations").WithTags("Conversations");
         conversations.MapGet("", ListConversations);
+        conversations.MapPost("/manual", CreateManualConversation);
         conversations.MapGet("/{conversationId:guid}", GetConversation);
         conversations.MapPost("/{conversationId:guid}/assign", AssignConversation);
         conversations.MapPost("/{conversationId:guid}/unassign", UnassignConversation);
         conversations.MapPost("/{conversationId:guid}/messages", CreateConversationMessage);
+        conversations.MapPost("/{conversationId:guid}/manual-messages", LogManualConversationMessage);
         conversations.MapPost("/{conversationId:guid}/notes", CreateInternalNote);
         conversations.MapPost("/{conversationId:guid}/follow-ups", CreateFollowUp);
         conversations.MapPatch("/{conversationId:guid}/lead-status", UpdateLeadStatus);
@@ -37,6 +39,7 @@ public static class ConversationsEndpoints
         reports.MapGet("/summary", GetConversationSummaryReport);
 
         var connections = app.MapGroup("/api/v1/whatsapp-connections").WithTags("WhatsApp Connections");
+        connections.MapGet("/onboarding-options", GetWhatsAppOnboardingOptions);
         connections.MapGet("", ListWhatsAppConnections);
         connections.MapPost("", CreateWhatsAppConnection);
         connections.MapPost("/{connectionId:guid}/validate", ValidateWhatsAppConnection);
@@ -161,6 +164,145 @@ public static class ConversationsEndpoints
         return conversation is null
             ? EndpointHelpers.Problem("not_found", "Conversation was not found.", StatusCodes.Status404NotFound)
             : Results.Ok(ToConversationDetail(conversation));
+    }
+
+    private static async Task<IResult> CreateManualConversation(
+        CreateManualConversationRequest request,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IEntitlementService entitlements,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireConversationsAccessAsync(tenantContext, entitlements, clock, cancellationToken, "conversations.create_manual");
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+        if (RequireUser(tenantContext) is { } userProblem)
+        {
+            return userProblem;
+        }
+
+        if (request.ConnectionId == Guid.Empty)
+        {
+            return EndpointHelpers.Problem("validation_failed", "A WhatsApp connection is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var normalizedPhone = NormalizePhone(request.CustomerPhone ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(normalizedPhone))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Customer phone is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var requestedStatus = request.LeadStatus ?? LeadStatus.New;
+        if (TerminalLeadStatuses.Contains(requestedStatus))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Manual conversations must start with an open lead status.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.AssignedUserId.HasValue
+            && !await IsActiveOrganizationMemberAsync(dbContext, request.AssignedUserId.Value, cancellationToken))
+        {
+            return EndpointHelpers.Problem("invalid_assignee", "Assignee must be an active member of this organization.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (request.AssignedTeamId.HasValue
+            && !await IsActiveOrganizationTeamAsync(dbContext, request.AssignedTeamId.Value, cancellationToken))
+        {
+            return EndpointHelpers.Problem("invalid_team", "Assigned team must be an active team in this organization.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var connection = await dbContext.WhatsAppConnections
+            .FirstOrDefaultAsync(item => item.Id == request.ConnectionId, cancellationToken);
+        if (connection is null)
+        {
+            return EndpointHelpers.Problem("not_found", "WhatsApp connection was not found.", StatusCodes.Status404NotFound);
+        }
+
+        if (connection.Status is WhatsAppConnectionStatus.Disabled or WhatsAppConnectionStatus.Revoked or WhatsAppConnectionStatus.Invalid)
+        {
+            return EndpointHelpers.Problem("invalid_connection", "This WhatsApp connection cannot accept manual conversations.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var contact = await UpsertContactAsync(
+            dbContext,
+            connection,
+            normalizedPhone,
+            Truncate(request.CustomerName?.Trim(), 180),
+            "manual_whatsapp",
+            clock,
+            cancellationToken);
+        var lead = await UpsertLeadAsync(
+            dbContext,
+            access.OrganizationId,
+            contact,
+            "manual_whatsapp",
+            Truncate(request.CampaignRef?.Trim(), 160),
+            clock,
+            cancellationToken);
+        var conversation = await UpsertConversationAsync(dbContext, connection, contact, lead, clock, cancellationToken);
+
+        var hasAssignment = request.AssignedUserId.HasValue || request.AssignedTeamId.HasValue;
+        lead.Status = hasAssignment && requestedStatus == LeadStatus.New ? LeadStatus.Assigned : requestedStatus;
+        conversation.AssignedUserId = request.AssignedUserId;
+        conversation.AssignedTeamId = request.AssignedTeamId;
+        conversation.Status = ConversationStatus.Open;
+        conversation.ClosedAt = null;
+        conversation.UpdatedAt = clock.UtcNow;
+
+        if (!string.IsNullOrWhiteSpace(request.InitialNote))
+        {
+            var note = new InternalNote
+            {
+                OrganizationId = access.OrganizationId,
+                ConversationId = conversation.Id,
+                AuthorUserId = tenantContext.UserId!.Value,
+                Body = Truncate(request.InitialNote.Trim(), 2000) ?? string.Empty,
+                CreatedAt = clock.UtcNow
+            };
+            dbContext.InternalNotes.Add(note);
+        }
+
+        AddConversationActivity(
+            dbContext,
+            access.OrganizationId,
+            conversation.Id,
+            "conversation.manual_created",
+            tenantContext,
+            new
+            {
+                connection.Mode,
+                ContactId = contact.Id,
+                LeadId = lead.Id,
+                request.AssignedUserId,
+                request.AssignedTeamId
+            });
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            access.OrganizationId,
+            null,
+            tenantContext,
+            "conversation.manual_created",
+            new { ConversationId = conversation.Id, ContactId = contact.Id, LeadId = lead.Id, connection.Mode },
+            httpContext);
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Results.Created(
+            $"/api/v1/conversations/{conversation.Id}",
+            new ManualConversationCreatedResponse(
+                conversation.Id,
+                connection.Id,
+                contact.Id,
+                lead.Id,
+                contact.NormalizedPhone,
+                contact.DisplayName,
+                lead.Status,
+                conversation.AssignedUserId,
+                conversation.AssignedTeamId,
+                BuildWaMeUrl(contact.NormalizedPhone),
+                connection.Mode == WhatsAppConnectionMode.ManualOnly));
     }
 
     private static async Task<IResult> AssignConversation(
@@ -350,6 +492,14 @@ public static class ConversationsEndpoints
             return EndpointHelpers.Problem("not_found", "Conversation was not found.", StatusCodes.Status404NotFound);
         }
 
+        if (conversation.Connection.Mode == WhatsAppConnectionMode.ManualOnly)
+        {
+            return EndpointHelpers.Problem(
+                "manual_reply_required",
+                "This connection is manual-only. Open WhatsApp externally and log the sent reply with the manual message endpoint.",
+                StatusCodes.Status422UnprocessableEntity);
+        }
+
         if (!CanSendFreeformMessage(conversation, clock.UtcNow) && string.IsNullOrWhiteSpace(request.TemplateName))
         {
             return EndpointHelpers.Problem(
@@ -417,6 +567,109 @@ public static class ConversationsEndpoints
 
         await dbContext.SaveChangesAsync(cancellationToken);
         return Results.Accepted($"/api/v1/conversations/{conversation.Id}", ToMessageResponse(message));
+    }
+
+    private static async Task<IResult> LogManualConversationMessage(
+        Guid conversationId,
+        LogManualConversationMessageRequest request,
+        AtlasDbContext dbContext,
+        ITenantContext tenantContext,
+        IEntitlementService entitlements,
+        IAtlasClock clock,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireConversationsAccessAsync(tenantContext, entitlements, clock, cancellationToken, "conversations.reply");
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+        if (RequireUser(tenantContext) is { } userProblem)
+        {
+            return userProblem;
+        }
+
+        var body = request.Body?.Trim();
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Message body is required.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var conversation = await dbContext.Conversations
+            .Include(item => item.Connection)
+            .Include(item => item.Lead)
+            .FirstOrDefaultAsync(item => item.Id == conversationId, cancellationToken);
+        if (conversation?.Connection is null || conversation.Lead is null)
+        {
+            return EndpointHelpers.Problem("not_found", "Conversation was not found.", StatusCodes.Status404NotFound);
+        }
+
+        var sentAt = request.SentAt ?? clock.UtcNow;
+        if (sentAt > clock.UtcNow.AddMinutes(5))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Manual sent time cannot be in the future.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        var message = new ConversationMessage
+        {
+            OrganizationId = access.OrganizationId,
+            ConversationId = conversation.Id,
+            Direction = ConversationMessageDirection.Outgoing,
+            Type = ConversationMessageType.Text,
+            Body = body,
+            Status = ConversationMessageStatus.Sent,
+            CreatedByUserId = tenantContext.UserId,
+            SentAt = sentAt,
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                request.ClientMessageId,
+                ManualExternalSend = true,
+                Provider = "manual_whatsapp"
+            }, JsonOptions),
+            CreatedAt = sentAt,
+            UpdatedAt = clock.UtcNow
+        };
+
+        dbContext.ConversationMessages.Add(message);
+        conversation.LastMessageAt = sentAt;
+        conversation.LastOutboundMessageAt = sentAt;
+        conversation.UnreadCount = 0;
+        conversation.Connection.LastOutboundAt = sentAt;
+        if (conversation.Lead.Status is LeadStatus.New or LeadStatus.Assigned)
+        {
+            conversation.Lead.Status = LeadStatus.Contacted;
+        }
+
+        AddConversationActivity(
+            dbContext,
+            access.OrganizationId,
+            conversation.Id,
+            "message.manual_outgoing_logged",
+            tenantContext,
+            new { MessageId = message.Id, conversation.Connection.Mode });
+        dbContext.UsageEvents.Add(new UsageEvent
+        {
+            OrganizationId = access.OrganizationId,
+            EventType = "conversation_manual_message_logged",
+            Quantity = 1,
+            Unit = "message",
+            IdempotencyKey = request.ClientMessageId is null
+                ? $"conversation_manual_message:{message.Id:N}"
+                : $"conversation_manual_message:{conversation.Id:N}:{request.ClientMessageId}",
+            OccurredAt = sentAt,
+            CreatedAt = clock.UtcNow
+        });
+        SecurityEndpoints.AddAudit(
+            dbContext,
+            access.OrganizationId,
+            null,
+            tenantContext,
+            "conversation.manual_message_logged",
+            new { ConversationId = conversation.Id, MessageId = message.Id },
+            httpContext);
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Results.Created($"/api/v1/conversations/{conversation.Id}", ToMessageResponse(message));
     }
 
     private static async Task<IResult> CreateInternalNote(
@@ -650,13 +903,69 @@ public static class ConversationsEndpoints
             leads.Count(item => item.Status == LeadStatus.Won),
             leads.Count(item => item.Status == LeadStatus.Lost),
             conversations.Count,
-            conversations.Count(item => item.AssignedUserId == null),
+            conversations.Count(item => item.AssignedUserId == null && item.AssignedTeamId == null),
             dueFollowUps,
             messages.Count(item => item.Direction == ConversationMessageDirection.Incoming),
             messages.Count(item => item.Direction == ConversationMessageDirection.Outgoing),
             Enum.GetValues<LeadStatus>().ToDictionary(
                 item => item.ToString(),
                 item => leads.Count(lead => lead.Status == item))));
+    }
+
+    private static async Task<IResult> GetWhatsAppOnboardingOptions(
+        HttpRequest request,
+        ITenantContext tenantContext,
+        IEntitlementService entitlements,
+        IAtlasClock clock,
+        CancellationToken cancellationToken)
+    {
+        var access = await RequireConversationsAccessAsync(tenantContext, entitlements, clock, cancellationToken, "whatsapp_connections.manage");
+        if (access.Problem is not null)
+        {
+            return access.Problem;
+        }
+
+        var baseUrl = $"{request.Scheme}://{request.Host}";
+        return Results.Ok(new WhatsAppOnboardingOptionsResponse(
+            $"{baseUrl}/api/webhooks/meta/whatsapp",
+            [
+                new WhatsAppOnboardingModeResponse(
+                    WhatsAppConnectionMode.CloudApi,
+                    "Connect a Meta Cloud API number",
+                    "Use this for a number that already has WhatsApp Business Platform assets.",
+                    RequiresEmbeddedSignup: false,
+                    SupportsExistingBusinessApp: false,
+                    SupportsPersonalWhatsapp: false,
+                    CanReceiveWebhooks: true,
+                    CanSendViaApi: true,
+                    RequiresExternalReply: false,
+                    RequiredCreateFields: ["mode", "phoneNumberId", "wabaId", "displayNumber"],
+                    UnsupportedReason: null),
+                new WhatsAppOnboardingModeResponse(
+                    WhatsAppConnectionMode.BusinessAppCoexistence,
+                    "Connect an existing WhatsApp Business App number",
+                    "Use Meta Embedded Signup/coexistence so the customer can keep the Business App while Reqara receives API/webhook traffic.",
+                    RequiresEmbeddedSignup: true,
+                    SupportsExistingBusinessApp: true,
+                    SupportsPersonalWhatsapp: false,
+                    CanReceiveWebhooks: true,
+                    CanSendViaApi: true,
+                    RequiresExternalReply: false,
+                    RequiredCreateFields: ["mode", "phoneNumberId", "wabaId", "displayNumber"],
+                    UnsupportedReason: "Personal WhatsApp Messenger numbers are not eligible for this API-backed mode."),
+                new WhatsAppOnboardingModeResponse(
+                    WhatsAppConnectionMode.ManualOnly,
+                    "Track any WhatsApp number manually",
+                    "Use this when the person only wants to keep using WhatsApp or the WhatsApp Business App without connecting Meta API assets.",
+                    RequiresEmbeddedSignup: false,
+                    SupportsExistingBusinessApp: true,
+                    SupportsPersonalWhatsapp: true,
+                    CanReceiveWebhooks: false,
+                    CanSendViaApi: false,
+                    RequiresExternalReply: true,
+                    RequiredCreateFields: ["mode", "displayNumber"],
+                    UnsupportedReason: "No live message sync, delivery status, or provider sending is available in manual-only mode.")
+            ]));
     }
 
     private static async Task<IResult> ListWhatsAppConnections(
@@ -695,34 +1004,60 @@ public static class ConversationsEndpoints
             return access.Problem;
         }
 
-        if (string.IsNullOrWhiteSpace(request.PhoneNumberId)
-            || string.IsNullOrWhiteSpace(request.WabaId)
-            || string.IsNullOrWhiteSpace(request.DisplayNumber))
+        var mode = request.Mode ?? WhatsAppConnectionMode.CloudApi;
+        var displayNumber = NormalizePhone(request.DisplayNumber ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(displayNumber))
         {
-            return EndpointHelpers.Problem("validation_failed", "Phone number ID, WABA ID and display number are required.", StatusCodes.Status422UnprocessableEntity);
+            return EndpointHelpers.Problem("validation_failed", "Display number is required.", StatusCodes.Status422UnprocessableEntity);
         }
 
-        var phoneNumberId = request.PhoneNumberId.Trim();
-        var exists = await dbContext.WhatsAppConnections.AnyAsync(
-            item => item.PhoneNumberId == phoneNumberId,
-            cancellationToken);
-        if (exists)
+        var phoneNumberId = string.IsNullOrWhiteSpace(request.PhoneNumberId) ? null : request.PhoneNumberId.Trim();
+        var wabaId = string.IsNullOrWhiteSpace(request.WabaId) ? null : request.WabaId.Trim();
+        if ((mode == WhatsAppConnectionMode.CloudApi || mode == WhatsAppConnectionMode.BusinessAppCoexistence)
+            && (string.IsNullOrWhiteSpace(phoneNumberId) || string.IsNullOrWhiteSpace(wabaId)))
+        {
+            return EndpointHelpers.Problem("validation_failed", "Phone number ID, WABA ID and display number are required for API-backed WhatsApp connections.", StatusCodes.Status422UnprocessableEntity);
+        }
+
+        if (!string.IsNullOrWhiteSpace(phoneNumberId)
+            && await dbContext.WhatsAppConnections.AnyAsync(item => item.PhoneNumberId == phoneNumberId, cancellationToken))
         {
             return EndpointHelpers.Problem("duplicate_connection", "This WhatsApp phone number is already connected.", StatusCodes.Status409Conflict);
+        }
+
+        if (mode == WhatsAppConnectionMode.ManualOnly
+            && await dbContext.WhatsAppConnections.AnyAsync(
+                item => item.Mode == WhatsAppConnectionMode.ManualOnly && item.DisplayNumber == displayNumber,
+                cancellationToken))
+        {
+            return EndpointHelpers.Problem("duplicate_connection", "This manual WhatsApp number is already connected.", StatusCodes.Status409Conflict);
         }
 
         var connection = new WhatsAppConnection
         {
             OrganizationId = access.OrganizationId,
+            Mode = mode,
             PhoneNumberId = phoneNumberId,
-            WabaId = request.WabaId.Trim(),
-            DisplayNumber = request.DisplayNumber.Trim(),
+            WabaId = wabaId,
+            DisplayNumber = displayNumber,
             SecretReference = Truncate(request.SecretReference?.Trim(), 300),
             WebhookVerifyTokenHash = string.IsNullOrWhiteSpace(request.WebhookVerifyToken)
                 ? null
                 : secretHasher.HashSecret(request.WebhookVerifyToken.Trim()),
-            Status = WhatsAppConnectionStatus.PendingVerification,
-            MetadataJson = JsonSerializer.Serialize(new { CreatedFrom = "api" }, JsonOptions),
+            BusinessPortfolioId = Truncate(request.BusinessPortfolioId?.Trim(), 120),
+            EmbeddedSignupSessionId = Truncate(request.EmbeddedSignupSessionId?.Trim(), 160),
+            ExternalAccountId = Truncate(request.ExternalAccountId?.Trim(), 160),
+            HistorySyncRequested = request.HistorySyncRequested.GetValueOrDefault(),
+            Status = mode == WhatsAppConnectionMode.ManualOnly
+                ? WhatsAppConnectionStatus.Active
+                : WhatsAppConnectionStatus.PendingVerification,
+            ConnectedAt = mode == WhatsAppConnectionMode.ManualOnly ? clock.UtcNow : null,
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                CreatedFrom = request.OnboardingSource ?? "api",
+                mode,
+                Notes = Truncate(request.Notes?.Trim(), 1000)
+            }, JsonOptions),
             CreatedAt = clock.UtcNow,
             UpdatedAt = clock.UtcNow
         };
@@ -733,7 +1068,7 @@ public static class ConversationsEndpoints
             null,
             tenantContext,
             "whatsapp_connection.created",
-            new { connection.Id, connection.PhoneNumberId, connection.WabaId, connection.DisplayNumber },
+            new { connection.Id, connection.Mode, connection.PhoneNumberId, connection.WabaId, connection.DisplayNumber },
             httpContext);
 
         await dbContext.SaveChangesAsync(cancellationToken);
@@ -761,8 +1096,14 @@ public static class ConversationsEndpoints
             return EndpointHelpers.Problem("not_found", "WhatsApp connection was not found.", StatusCodes.Status404NotFound);
         }
 
+        if (connection.Mode == WhatsAppConnectionMode.ManualOnly)
+        {
+            return EndpointHelpers.Problem("manual_validation_not_supported", "Manual-only WhatsApp connections do not use Meta webhook validation.", StatusCodes.Status422UnprocessableEntity);
+        }
+
         connection.Status = WhatsAppConnectionStatus.Active;
         connection.VerifiedAt ??= clock.UtcNow;
+        connection.ConnectedAt ??= clock.UtcNow;
         connection.LastValidatedAt = clock.UtcNow;
         SecurityEndpoints.AddAudit(
             dbContext,
@@ -808,6 +1149,7 @@ public static class ConversationsEndpoints
 
         connection.Status = WhatsAppConnectionStatus.Active;
         connection.VerifiedAt ??= clock.UtcNow;
+        connection.ConnectedAt ??= clock.UtcNow;
         connection.LastValidatedAt = clock.UtcNow;
         await dbContext.SaveChangesAsync(cancellationToken);
         return Results.Text(challenge, "text/plain", Encoding.UTF8);
@@ -857,6 +1199,7 @@ public static class ConversationsEndpoints
             var connection = await dbContext.WhatsAppConnections.IgnoreQueryFilters()
                 .FirstOrDefaultAsync(
                     item => item.PhoneNumberId == phoneNumberId
+                        && item.Mode != WhatsAppConnectionMode.ManualOnly
                         && item.Status != WhatsAppConnectionStatus.Disabled
                         && item.Status != WhatsAppConnectionStatus.Revoked,
                     cancellationToken);
@@ -950,8 +1293,8 @@ public static class ConversationsEndpoints
 
             var messageTime = ReadUnixTimestamp(item, "timestamp") ?? clock.UtcNow;
             var contactName = ExtractContactName(value, from);
-            var contact = await UpsertContactAsync(dbContext, connection, from, contactName, clock, cancellationToken);
-            var lead = await UpsertLeadAsync(dbContext, connection.OrganizationId, contact, clock, cancellationToken);
+            var contact = await UpsertContactAsync(dbContext, connection, from, contactName, "whatsapp", clock, cancellationToken);
+            var lead = await UpsertLeadAsync(dbContext, connection.OrganizationId, contact, "whatsapp", null, clock, cancellationToken);
             var conversation = await UpsertConversationAsync(dbContext, connection, contact, lead, clock, cancellationToken);
 
             var type = MapMessageType(ReadString(item, "type"));
@@ -1054,6 +1397,7 @@ public static class ConversationsEndpoints
         WhatsAppConnection connection,
         string normalizedPhone,
         string? displayName,
+        string source,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -1077,7 +1421,7 @@ public static class ConversationsEndpoints
             ConnectionId = connection.Id,
             NormalizedPhone = normalizedPhone,
             DisplayName = displayName,
-            ProfileJson = JsonSerializer.Serialize(new { Source = "whatsapp" }, JsonOptions),
+            ProfileJson = JsonSerializer.Serialize(new { Source = source }, JsonOptions),
             CreatedAt = clock.UtcNow,
             UpdatedAt = clock.UtcNow
         };
@@ -1089,6 +1433,8 @@ public static class ConversationsEndpoints
         AtlasDbContext dbContext,
         Guid organizationId,
         Contact contact,
+        string source,
+        string? campaignRef,
         IAtlasClock clock,
         CancellationToken cancellationToken)
     {
@@ -1100,6 +1446,10 @@ public static class ConversationsEndpoints
                 && item.Status != LeadStatus.Won, cancellationToken);
         if (lead is not null)
         {
+            if (!string.IsNullOrWhiteSpace(campaignRef))
+            {
+                lead.CampaignRef = campaignRef;
+            }
             lead.UpdatedAt = clock.UtcNow;
             return lead;
         }
@@ -1109,7 +1459,8 @@ public static class ConversationsEndpoints
             OrganizationId = organizationId,
             ContactId = contact.Id,
             Status = LeadStatus.New,
-            Source = "whatsapp",
+            Source = source,
+            CampaignRef = campaignRef,
             CreatedAt = clock.UtcNow,
             UpdatedAt = clock.UtcNow
         };
@@ -1196,8 +1547,8 @@ public static class ConversationsEndpoints
         return queue?.Trim().ToLowerInvariant() switch
         {
             "mine" when tenantContext.UserId.HasValue => query.Where(item => item.AssignedUserId == tenantContext.UserId.Value),
-            "unassigned" => query.Where(item => item.AssignedUserId == null),
-            "new" => query.Where(item => item.AssignedUserId == null && item.Lead != null && item.Lead.Status == LeadStatus.New),
+            "unassigned" => query.Where(item => item.AssignedUserId == null && item.AssignedTeamId == null),
+            "new" => query.Where(item => item.AssignedUserId == null && item.AssignedTeamId == null && item.Lead != null && item.Lead.Status == LeadStatus.New),
             "follow-up" => query.Where(item => item.FollowUps.Any(followUp => followUp.Status == ConversationFollowUpStatus.Pending)),
             "closed" => query.Where(item => item.Status == ConversationStatus.Closed),
             _ => query.Where(item => item.Status == ConversationStatus.Open)
@@ -1514,6 +1865,17 @@ public static class ConversationsEndpoints
             : hasPlus ? $"+{digits}" : digits;
     }
 
+    private static string? BuildWaMeUrl(string? phone)
+    {
+        if (string.IsNullOrWhiteSpace(phone))
+        {
+            return null;
+        }
+
+        var digits = new string(phone.Where(char.IsDigit).ToArray());
+        return string.IsNullOrWhiteSpace(digits) ? null : $"https://wa.me/{digits}";
+    }
+
     private static void AddConversationActivity(
         AtlasDbContext dbContext,
         Guid organizationId,
@@ -1589,12 +1951,22 @@ public static class ConversationsEndpoints
             ? null
             : new WhatsAppConnectionResponse(
                 connection.Id,
+                connection.Mode,
                 connection.PhoneNumberId,
                 connection.WabaId,
                 connection.DisplayNumber,
                 connection.Status,
+                connection.BusinessPortfolioId,
+                connection.EmbeddedSignupSessionId,
+                connection.ExternalAccountId,
+                connection.HistorySyncRequested,
+                connection.Mode != WhatsAppConnectionMode.ManualOnly,
+                connection.Mode != WhatsAppConnectionMode.ManualOnly,
+                connection.Mode == WhatsAppConnectionMode.ManualOnly,
+                BuildWaMeUrl(connection.DisplayNumber),
                 connection.SecretReference is not null,
                 connection.VerifiedAt,
+                connection.ConnectedAt,
                 connection.LastValidatedAt,
                 connection.LastInboundAt,
                 connection.LastOutboundAt,
@@ -1730,12 +2102,22 @@ public sealed record ConversationDetailResponse(
 
 public sealed record WhatsAppConnectionResponse(
     Guid Id,
-    string PhoneNumberId,
-    string WabaId,
+    WhatsAppConnectionMode Mode,
+    string? PhoneNumberId,
+    string? WabaId,
     string DisplayNumber,
     WhatsAppConnectionStatus Status,
+    string? BusinessPortfolioId,
+    string? EmbeddedSignupSessionId,
+    string? ExternalAccountId,
+    bool HistorySyncRequested,
+    bool CanReceiveWebhooks,
+    bool CanSendViaApi,
+    bool RequiresExternalReply,
+    string? ManualReplyUrl,
     bool HasSecretReference,
     DateTimeOffset? VerifiedAt,
+    DateTimeOffset? ConnectedAt,
     DateTimeOffset? LastValidatedAt,
     DateTimeOffset? LastInboundAt,
     DateTimeOffset? LastOutboundAt,
@@ -1825,12 +2207,64 @@ public sealed record ConversationAssignedResponse(Guid ConversationId, Guid? Ass
 
 public sealed record LeadStatusUpdatedResponse(Guid ConversationId, LeadStatus PreviousStatus, LeadStatus Status, ConversationStatus ConversationStatus);
 
+public sealed record CreateManualConversationRequest(
+    Guid ConnectionId,
+    string? CustomerPhone,
+    string? CustomerName,
+    LeadStatus? LeadStatus,
+    string? CampaignRef,
+    Guid? AssignedUserId,
+    Guid? AssignedTeamId,
+    string? InitialNote);
+
+public sealed record ManualConversationCreatedResponse(
+    Guid ConversationId,
+    Guid ConnectionId,
+    Guid ContactId,
+    Guid LeadId,
+    string NormalizedPhone,
+    string? ContactName,
+    LeadStatus LeadStatus,
+    Guid? AssignedUserId,
+    Guid? AssignedTeamId,
+    string? WaMeUrl,
+    bool RequiresExternalReply);
+
+public sealed record LogManualConversationMessageRequest(
+    string? Body,
+    DateTimeOffset? SentAt,
+    string? ClientMessageId);
+
+public sealed record WhatsAppOnboardingOptionsResponse(
+    string WebhookCallbackUrl,
+    IReadOnlyList<WhatsAppOnboardingModeResponse> Modes);
+
+public sealed record WhatsAppOnboardingModeResponse(
+    WhatsAppConnectionMode Mode,
+    string Label,
+    string Description,
+    bool RequiresEmbeddedSignup,
+    bool SupportsExistingBusinessApp,
+    bool SupportsPersonalWhatsapp,
+    bool CanReceiveWebhooks,
+    bool CanSendViaApi,
+    bool RequiresExternalReply,
+    IReadOnlyList<string> RequiredCreateFields,
+    string? UnsupportedReason);
+
 public sealed record CreateWhatsAppConnectionRequest(
+    WhatsAppConnectionMode? Mode,
     string? PhoneNumberId,
     string? WabaId,
     string? DisplayNumber,
     string? SecretReference,
-    string? WebhookVerifyToken);
+    string? WebhookVerifyToken,
+    string? BusinessPortfolioId,
+    string? EmbeddedSignupSessionId,
+    string? ExternalAccountId,
+    bool? HistorySyncRequested,
+    string? OnboardingSource,
+    string? Notes);
 
 public sealed record ConversationSummaryReportResponse(
     DateTimeOffset From,

@@ -1523,16 +1523,24 @@ public sealed class AtlasDbContext(
             entity.ToTable("whatsapp_connections");
             entity.HasIndex(e => new { e.OrganizationId, e.PhoneNumberId })
                 .IsUnique()
-                .HasDatabaseName("uq_whatsapp_connections_org_phone_number");
+                .HasDatabaseName("uq_whatsapp_connections_org_phone_number")
+                .HasFilter("phone_number_id IS NOT NULL");
             entity.HasIndex(e => new { e.OrganizationId, e.Status })
                 .HasDatabaseName("ix_whatsapp_connections_org_status");
-            entity.Property(e => e.PhoneNumberId).HasMaxLength(80).IsRequired();
-            entity.Property(e => e.WabaId).HasMaxLength(80).IsRequired();
+            entity.HasIndex(e => new { e.OrganizationId, e.Mode, e.Status })
+                .HasDatabaseName("ix_whatsapp_connections_org_mode_status");
+            entity.Property(e => e.Mode).HasConversion<short>().IsRequired();
+            entity.Property(e => e.PhoneNumberId).HasMaxLength(80);
+            entity.Property(e => e.WabaId).HasMaxLength(80);
             entity.Property(e => e.DisplayNumber).HasMaxLength(40).IsRequired();
             entity.Property(e => e.Status).HasConversion<short>().IsRequired();
             entity.Property(e => e.SecretReference).HasMaxLength(300);
+            entity.Property(e => e.BusinessPortfolioId).HasMaxLength(120);
+            entity.Property(e => e.EmbeddedSignupSessionId).HasMaxLength(160);
+            entity.Property(e => e.ExternalAccountId).HasMaxLength(160);
             entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
             entity.Property(e => e.VerifiedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ConnectedAt).HasColumnType("timestamptz");
             entity.Property(e => e.LastValidatedAt).HasColumnType("timestamptz");
             entity.Property(e => e.LastInboundAt).HasColumnType("timestamptz");
             entity.Property(e => e.LastOutboundAt).HasColumnType("timestamptz");

@@ -352,6 +352,37 @@ public sealed class AtlasDbContextTests
     }
 
     [Fact]
+    public async Task Manual_whatsapp_connections_do_not_require_meta_identifiers()
+    {
+        var organizationId = Guid.NewGuid();
+        var tenant = new TestTenantContext { OrganizationId = organizationId };
+        var databaseRoot = new InMemoryDatabaseRoot();
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            dbContext.Organizations.Add(new Organization { Id = organizationId, Name = "A", Slug = "a" });
+            dbContext.WhatsAppConnections.Add(new WhatsAppConnection
+            {
+                OrganizationId = organizationId,
+                Mode = WhatsAppConnectionMode.ManualOnly,
+                DisplayNumber = "+15550001111",
+                Status = WhatsAppConnectionStatus.Active
+            });
+            await dbContext.SaveChangesAsync();
+        }
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            var connection = await dbContext.WhatsAppConnections.SingleAsync();
+
+            Assert.Equal(WhatsAppConnectionMode.ManualOnly, connection.Mode);
+            Assert.Equal(WhatsAppConnectionStatus.Active, connection.Status);
+            Assert.Null(connection.PhoneNumberId);
+            Assert.Null(connection.WabaId);
+        }
+    }
+
+    [Fact]
     public async Task Platform_administration_records_are_not_tenant_filtered()
     {
         var staffId = Guid.NewGuid();

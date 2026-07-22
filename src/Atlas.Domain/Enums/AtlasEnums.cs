@@ -270,6 +270,13 @@ public enum WhatsAppConnectionStatus : short
     Revoked = 5
 }
 
+public enum WhatsAppConnectionMode : short
+{
+    CloudApi = 1,
+    BusinessAppCoexistence = 2,
+    ManualOnly = 3
+}
+
 public enum LeadStatus : short
 {
     New = 1,

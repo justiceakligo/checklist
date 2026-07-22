@@ -6,14 +6,20 @@ namespace Atlas.Domain.Entities;
 public sealed class WhatsAppConnection : Entity, ITenantOwned
 {
     public Guid OrganizationId { get; set; }
-    public string PhoneNumberId { get; set; } = string.Empty;
-    public string WabaId { get; set; } = string.Empty;
+    public WhatsAppConnectionMode Mode { get; set; } = WhatsAppConnectionMode.CloudApi;
+    public string? PhoneNumberId { get; set; }
+    public string? WabaId { get; set; }
     public string DisplayNumber { get; set; } = string.Empty;
     public WhatsAppConnectionStatus Status { get; set; } = WhatsAppConnectionStatus.PendingVerification;
     public string? SecretReference { get; set; }
     public byte[]? WebhookVerifyTokenHash { get; set; }
+    public string? BusinessPortfolioId { get; set; }
+    public string? EmbeddedSignupSessionId { get; set; }
+    public string? ExternalAccountId { get; set; }
+    public bool HistorySyncRequested { get; set; }
     public string MetadataJson { get; set; } = "{}";
     public DateTimeOffset? VerifiedAt { get; set; }
+    public DateTimeOffset? ConnectedAt { get; set; }
     public DateTimeOffset? LastValidatedAt { get; set; }
     public DateTimeOffset? LastInboundAt { get; set; }
     public DateTimeOffset? LastOutboundAt { get; set; }

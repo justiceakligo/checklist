@@ -1,13 +1,21 @@
 # Reqara Conversations Frontend Implementation Handoff
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 This document describes the frontend contract for the new Reqara Conversations module. The backend module is implemented as a tenant-scoped product area on the existing Reqara platform. It adds WhatsApp lead intake, conversation inboxes, lead assignment, internal notes, follow-ups, lead status changes, basic reporting, WhatsApp connection management, and Meta webhook ingestion.
+
+Companion handoff for the new WhatsApp Business App coexistence and manual-only onboarding flows:
+
+```text
+docs/FRONTEND_WHATSAPP_BUSINESS_APP_ONBOARDING_HANDOFF.md
+```
 
 Important current backend scope:
 
 - Inbound Meta WhatsApp webhook processing is implemented.
 - Outbound replies are accepted and stored as `Pending`, but the actual Meta send worker/client is not implemented yet.
+- WhatsApp connection modes now include `CloudApi`, `BusinessAppCoexistence`, and `ManualOnly`.
+- Manual-only conversations can be created and manually logged, but do not sync live messages or send through Meta.
 - SignalR/realtime fanout is not implemented yet. Poll or refetch after mutations.
 - Follow-up create/list is implemented through conversation detail, but complete/cancel follow-up endpoints are not implemented yet.
 - Cross-module "create Reqara Request from lead" is not implemented yet.
@@ -1609,10 +1617,12 @@ Malformed JSON returns:
 
 ```http
 GET    /api/v1/conversations
+POST   /api/v1/conversations/manual
 GET    /api/v1/conversations/{conversationId}
 POST   /api/v1/conversations/{conversationId}/assign
 POST   /api/v1/conversations/{conversationId}/unassign
 POST   /api/v1/conversations/{conversationId}/messages
+POST   /api/v1/conversations/{conversationId}/manual-messages
 POST   /api/v1/conversations/{conversationId}/notes
 POST   /api/v1/conversations/{conversationId}/follow-ups
 PATCH  /api/v1/conversations/{conversationId}/lead-status
@@ -1620,6 +1630,7 @@ GET    /api/v1/conversation-reports/summary
 GET    /api/v1/teams
 POST   /api/v1/teams
 PATCH  /api/v1/teams/{teamId}
+GET    /api/v1/whatsapp-connections/onboarding-options
 GET    /api/v1/whatsapp-connections
 POST   /api/v1/whatsapp-connections
 POST   /api/v1/whatsapp-connections/{connectionId}/validate
