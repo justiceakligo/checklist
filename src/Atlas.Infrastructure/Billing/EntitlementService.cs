@@ -286,6 +286,13 @@ public sealed class EntitlementService(
             "sftp_destination" => features.CustomWorkflows,
             "delivery_history_retention" => features.TeamWorkspace,
             "advanced_audit" => features.TeamWorkspace,
+            "conversations.enabled" => features.TeamWorkspace,
+            "whatsapp_connections.manage" => features.ApiAndWebhooks || features.TeamWorkspace,
+            "conversation_users.max" => features.TeamWorkspace,
+            "monthly_active_conversations" => features.TeamWorkspace,
+            "message_retention_days" => features.CustomRetention || features.TeamWorkspace,
+            "reports.advanced" => features.TeamWorkspace,
+            "cross_module.request_creation" => features.CustomWorkflows,
             _ => false
         };
     }

@@ -254,3 +254,80 @@ public enum DeliveryAttemptStatus : short
     Failed = 2,
     Cancelled = 3
 }
+
+public enum WhatsAppConnectionStatus : short
+{
+    PendingVerification = 1,
+    Active = 2,
+    Disabled = 3,
+    Invalid = 4,
+    Revoked = 5
+}
+
+public enum LeadStatus : short
+{
+    New = 1,
+    Assigned = 2,
+    Contacted = 3,
+    Interested = 4,
+    FollowUp = 5,
+    Won = 6,
+    Lost = 7,
+    Closed = 8
+}
+
+public enum ConversationStatus : short
+{
+    Open = 1,
+    Closed = 2
+}
+
+public enum ConversationMessageDirection : short
+{
+    Incoming = 1,
+    Outgoing = 2
+}
+
+public enum ConversationMessageType : short
+{
+    Text = 1,
+    Image = 2,
+    Video = 3,
+    Audio = 4,
+    Document = 5,
+    Location = 6,
+    Unsupported = 99
+}
+
+public enum ConversationMessageStatus : short
+{
+    Received = 1,
+    Pending = 2,
+    Sent = 3,
+    Delivered = 4,
+    Read = 5,
+    Failed = 6
+}
+
+public enum ConversationFollowUpStatus : short
+{
+    Pending = 1,
+    Completed = 2,
+    Cancelled = 3
+}
+
+public enum ConversationWebhookEventStatus : short
+{
+    Pending = 1,
+    Processed = 2,
+    Duplicate = 3,
+    Failed = 4
+}
+
+public enum ConversationTemplateStatus : short
+{
+    Pending = 1,
+    Approved = 2,
+    Rejected = 3,
+    Disabled = 4
+}

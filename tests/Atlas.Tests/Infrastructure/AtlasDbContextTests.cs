@@ -197,6 +197,120 @@ public sealed class AtlasDbContextTests
     }
 
     [Fact]
+    public async Task Conversation_records_are_filtered_to_current_tenant()
+    {
+        var organizationA = Guid.NewGuid();
+        var organizationB = Guid.NewGuid();
+        var tenant = new TestTenantContext { OrganizationId = organizationA };
+        var databaseRoot = new InMemoryDatabaseRoot();
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            var connectionA = new WhatsAppConnection
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationA,
+                PhoneNumberId = "phone-a",
+                WabaId = "waba-a",
+                DisplayNumber = "+15550000001"
+            };
+            var contactA = new Contact
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationA,
+                ConnectionId = connectionA.Id,
+                NormalizedPhone = "+15551111111"
+            };
+            var leadA = new Lead
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationA,
+                ContactId = contactA.Id
+            };
+            var conversationA = new Conversation
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationA,
+                ConnectionId = connectionA.Id,
+                ContactId = contactA.Id,
+                LeadId = leadA.Id
+            };
+
+            var connectionB = new WhatsAppConnection
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationB,
+                PhoneNumberId = "phone-b",
+                WabaId = "waba-b",
+                DisplayNumber = "+15550000002"
+            };
+            var contactB = new Contact
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationB,
+                ConnectionId = connectionB.Id,
+                NormalizedPhone = "+15552222222"
+            };
+            var leadB = new Lead
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationB,
+                ContactId = contactB.Id
+            };
+            var conversationB = new Conversation
+            {
+                Id = Guid.NewGuid(),
+                OrganizationId = organizationB,
+                ConnectionId = connectionB.Id,
+                ContactId = contactB.Id,
+                LeadId = leadB.Id
+            };
+
+            dbContext.Organizations.AddRange(
+                new Organization { Id = organizationA, Name = "A", Slug = "a" },
+                new Organization { Id = organizationB, Name = "B", Slug = "b" });
+            dbContext.AddRange(connectionA, contactA, leadA, conversationA, connectionB, contactB, leadB, conversationB);
+            dbContext.ConversationMessages.AddRange(
+                new ConversationMessage
+                {
+                    OrganizationId = organizationA,
+                    ConversationId = conversationA.Id,
+                    Direction = ConversationMessageDirection.Incoming,
+                    Status = ConversationMessageStatus.Received,
+                    Body = "Visible"
+                },
+                new ConversationMessage
+                {
+                    OrganizationId = organizationB,
+                    ConversationId = conversationB.Id,
+                    Direction = ConversationMessageDirection.Incoming,
+                    Status = ConversationMessageStatus.Received,
+                    Body = "Hidden"
+                });
+
+            await dbContext.SaveChangesAsync();
+        }
+
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            var conversations = await dbContext.Conversations.ToListAsync();
+            var messages = await dbContext.ConversationMessages.ToListAsync();
+
+            Assert.Single(conversations);
+            Assert.Equal(organizationA, conversations[0].OrganizationId);
+            Assert.Single(messages);
+            Assert.Equal("Visible", messages[0].Body);
+        }
+
+        tenant.OrganizationId = null;
+        await using (var dbContext = CreateContext(tenant, databaseRoot))
+        {
+            Assert.Empty(await dbContext.Conversations.ToListAsync());
+            Assert.Empty(await dbContext.ConversationMessages.ToListAsync());
+        }
+    }
+
+    [Fact]
     public async Task Platform_administration_records_are_not_tenant_filtered()
     {
         var staffId = Guid.NewGuid();

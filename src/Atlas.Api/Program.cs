@@ -183,5 +183,6 @@ app.MapAtlasSubmissionEndpoints();
 app.MapAtlasPackageEndpoints();
 app.MapAtlasPlatformEndpoints();
 app.MapAtlasAnalyticsEndpoints();
+app.MapAtlasConversationEndpoints();
 
 app.Run();

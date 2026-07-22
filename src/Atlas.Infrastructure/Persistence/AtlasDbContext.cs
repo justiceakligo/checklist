@@ -47,6 +47,18 @@ public sealed class AtlasDbContext(
     public DbSet<PlatformAuditEvent> PlatformAuditEvents => Set<PlatformAuditEvent>();
     public DbSet<AnalyticsEvent> AnalyticsEvents => Set<AnalyticsEvent>();
     public DbSet<InvestorReport> InvestorReports => Set<InvestorReport>();
+    public DbSet<WhatsAppConnection> WhatsAppConnections => Set<WhatsAppConnection>();
+    public DbSet<Contact> Contacts => Set<Contact>();
+    public DbSet<Lead> Leads => Set<Lead>();
+    public DbSet<Conversation> Conversations => Set<Conversation>();
+    public DbSet<ConversationMessage> ConversationMessages => Set<ConversationMessage>();
+    public DbSet<ConversationAssignment> ConversationAssignments => Set<ConversationAssignment>();
+    public DbSet<InternalNote> InternalNotes => Set<InternalNote>();
+    public DbSet<FollowUp> FollowUps => Set<FollowUp>();
+    public DbSet<ConversationWebhookEvent> ConversationWebhookEvents => Set<ConversationWebhookEvent>();
+    public DbSet<ConversationActivity> ConversationActivities => Set<ConversationActivity>();
+    public DbSet<MessageTemplate> MessageTemplates => Set<MessageTemplate>();
+    public DbSet<ConversationLink> ConversationLinks => Set<ConversationLink>();
 
     private Guid? CurrentOrganizationId => tenantContext.OrganizationId;
 
@@ -65,6 +77,7 @@ public sealed class AtlasDbContext(
         ConfigurePackagesAndRouting(modelBuilder);
         ConfigurePlatform(modelBuilder);
         ConfigureAnalytics(modelBuilder);
+        ConfigureConversations(modelBuilder);
         ConfigureQueryFilters(modelBuilder);
         ConfigureIds(modelBuilder);
     }
@@ -1475,6 +1488,289 @@ public sealed class AtlasDbContext(
         });
     }
 
+    private static void ConfigureConversations(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<WhatsAppConnection>(entity =>
+        {
+            entity.ToTable("whatsapp_connections");
+            entity.HasIndex(e => new { e.OrganizationId, e.PhoneNumberId })
+                .IsUnique()
+                .HasDatabaseName("uq_whatsapp_connections_org_phone_number");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status })
+                .HasDatabaseName("ix_whatsapp_connections_org_status");
+            entity.Property(e => e.PhoneNumberId).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.WabaId).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.DisplayNumber).HasMaxLength(40).IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.SecretReference).HasMaxLength(300);
+            entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.VerifiedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastValidatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastInboundAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastOutboundAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<Contact>(entity =>
+        {
+            entity.ToTable("contacts");
+            entity.HasIndex(e => new { e.OrganizationId, e.NormalizedPhone })
+                .IsUnique()
+                .HasDatabaseName("uq_contacts_org_phone");
+            entity.Property(e => e.NormalizedPhone).HasMaxLength(40).IsRequired();
+            entity.Property(e => e.DisplayName).HasMaxLength(180);
+            entity.Property(e => e.ProfileJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Connection)
+                .WithMany(e => e.Contacts)
+                .HasForeignKey(e => e.ConnectionId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<Lead>(entity =>
+        {
+            entity.ToTable("leads");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status, e.UpdatedAt })
+                .HasDatabaseName("ix_leads_org_status_updated");
+            entity.HasIndex(e => new { e.OrganizationId, e.ContactId })
+                .HasDatabaseName("ix_leads_org_contact");
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Source).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.CampaignRef).HasMaxLength(160);
+            entity.Property(e => e.LostReason).HasMaxLength(500);
+            entity.Property(e => e.WonAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Contact)
+                .WithMany(e => e.Leads)
+                .HasForeignKey(e => e.ContactId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<Conversation>(entity =>
+        {
+            entity.ToTable("conversations");
+            entity.HasIndex(e => new { e.OrganizationId, e.AssignedUserId, e.LastMessageAt })
+                .HasDatabaseName("ix_conversations_org_assignee_last_message");
+            entity.HasIndex(e => new { e.OrganizationId, e.Status, e.LastMessageAt })
+                .HasDatabaseName("ix_conversations_org_status_last_message");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConnectionId, e.ContactId })
+                .HasDatabaseName("ix_conversations_org_connection_contact");
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.LastMessageAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastInboundMessageAt).HasColumnType("timestamptz");
+            entity.Property(e => e.LastOutboundMessageAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ClosedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Organization)
+                .WithMany()
+                .HasForeignKey(e => e.OrganizationId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Connection)
+                .WithMany(e => e.Conversations)
+                .HasForeignKey(e => e.ConnectionId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Contact)
+                .WithMany(e => e.Conversations)
+                .HasForeignKey(e => e.ContactId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.Lead)
+                .WithMany(e => e.Conversations)
+                .HasForeignKey(e => e.LeadId)
+                .OnDelete(DeleteBehavior.Restrict);
+            entity.HasOne(e => e.AssignedUser)
+                .WithMany()
+                .HasForeignKey(e => e.AssignedUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<ConversationMessage>(entity =>
+        {
+            entity.ToTable("conversation_messages");
+            entity.HasIndex(e => new { e.OrganizationId, e.ProviderMessageId })
+                .IsUnique()
+                .HasDatabaseName("uq_conversation_messages_org_provider_id")
+                .HasFilter("provider_message_id IS NOT NULL");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.CreatedAt })
+                .HasDatabaseName("ix_conversation_messages_conversation_created");
+            entity.Property(e => e.ProviderMessageId).HasMaxLength(160);
+            entity.Property(e => e.Direction).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Type).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Body).HasMaxLength(8000);
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.SentAt).HasColumnType("timestamptz");
+            entity.Property(e => e.DeliveredAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ReadAt).HasColumnType("timestamptz");
+            entity.Property(e => e.FailedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.FailureCode).HasMaxLength(100);
+            entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.Messages)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.CreatedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.CreatedByUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<ConversationAssignment>(entity =>
+        {
+            entity.ToTable("conversation_assignments");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.AssignedAt })
+                .HasDatabaseName("ix_conversation_assignments_conversation_assigned");
+            entity.Property(e => e.Reason).HasMaxLength(500);
+            entity.Property(e => e.AssignedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.Assignments)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.FromUser)
+                .WithMany()
+                .HasForeignKey(e => e.FromUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.ToUser)
+                .WithMany()
+                .HasForeignKey(e => e.ToUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+            entity.HasOne(e => e.AssignedByUser)
+                .WithMany()
+                .HasForeignKey(e => e.AssignedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<InternalNote>(entity =>
+        {
+            entity.ToTable("conversation_internal_notes");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.CreatedAt })
+                .HasDatabaseName("ix_conversation_notes_conversation_created");
+            entity.Property(e => e.Body).HasMaxLength(8000).IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.InternalNotes)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.AuthorUser)
+                .WithMany()
+                .HasForeignKey(e => e.AuthorUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<FollowUp>(entity =>
+        {
+            entity.ToTable("conversation_follow_ups");
+            entity.HasIndex(e => new { e.OrganizationId, e.OwnerUserId, e.DueAt })
+                .HasDatabaseName("ix_conversation_followups_owner_due")
+                .HasFilter("status = 1");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.Status })
+                .HasDatabaseName("ix_conversation_followups_conversation_status");
+            entity.Property(e => e.DueAt).HasColumnType("timestamptz");
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.Note).HasMaxLength(2000);
+            entity.Property(e => e.CompletedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CancelledAt).HasColumnType("timestamptz");
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.FollowUps)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasOne(e => e.OwnerUser)
+                .WithMany()
+                .HasForeignKey(e => e.OwnerUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<ConversationWebhookEvent>(entity =>
+        {
+            entity.ToTable("conversation_webhook_events");
+            entity.HasIndex(e => e.ProviderEventId)
+                .IsUnique()
+                .HasDatabaseName("uq_conversation_webhook_events_provider_event");
+            entity.HasIndex(e => new { e.OrganizationId, e.ReceivedAt })
+                .HasDatabaseName("ix_conversation_webhook_events_org_received");
+            entity.Property(e => e.ProviderEventId).HasMaxLength(180).IsRequired();
+            entity.Property(e => e.EventType).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.ProcessingStatus).HasConversion<short>().IsRequired();
+            entity.Property(e => e.PayloadJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.FailureCode).HasMaxLength(100);
+            entity.Property(e => e.FailureMessage).HasMaxLength(1000);
+            entity.Property(e => e.ReceivedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.ProcessedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Connection)
+                .WithMany()
+                .HasForeignKey(e => e.ConnectionId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<ConversationActivity>(entity =>
+        {
+            entity.ToTable("conversation_activities");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.CreatedAt })
+                .HasDatabaseName("ix_conversation_activities_conversation_created");
+            entity.Property(e => e.Type).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.ActorType).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ActorId).HasMaxLength(160);
+            entity.Property(e => e.MetadataJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.Activities)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<MessageTemplate>(entity =>
+        {
+            entity.ToTable("conversation_message_templates");
+            entity.HasIndex(e => new { e.OrganizationId, e.Name, e.Language })
+                .IsUnique()
+                .HasDatabaseName("uq_conversation_templates_org_name_language");
+            entity.Property(e => e.Name).HasMaxLength(120).IsRequired();
+            entity.Property(e => e.Language).HasMaxLength(20).IsRequired();
+            entity.Property(e => e.Category).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.Status).HasConversion<short>().IsRequired();
+            entity.Property(e => e.ProviderTemplateId).HasMaxLength(160);
+            entity.Property(e => e.ComponentsJson).HasColumnType("jsonb").IsRequired();
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.Property(e => e.UpdatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Connection)
+                .WithMany(e => e.MessageTemplates)
+                .HasForeignKey(e => e.ConnectionId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        modelBuilder.Entity<ConversationLink>(entity =>
+        {
+            entity.ToTable("conversation_links");
+            entity.HasIndex(e => new { e.OrganizationId, e.ConversationId, e.LinkType })
+                .HasDatabaseName("ix_conversation_links_conversation_type");
+            entity.Property(e => e.LinkType).HasMaxLength(80).IsRequired();
+            entity.Property(e => e.ExternalReference).HasMaxLength(300);
+            entity.Property(e => e.CreatedAt).HasColumnType("timestamptz");
+            entity.HasOne(e => e.Conversation)
+                .WithMany(e => e.Links)
+                .HasForeignKey(e => e.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
     private void ConfigureQueryFilters(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<Organization>()
@@ -1584,6 +1880,30 @@ public sealed class AtlasDbContext(
                 && e.DeliveryJob.OrganizationId == CurrentOrganizationId);
         modelBuilder.Entity<ManualHandoff>()
             .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<WhatsAppConnection>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<Contact>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<Lead>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<Conversation>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ConversationMessage>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ConversationAssignment>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<InternalNote>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<FollowUp>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ConversationWebhookEvent>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ConversationActivity>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<MessageTemplate>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
+        modelBuilder.Entity<ConversationLink>()
+            .HasQueryFilter(e => CurrentOrganizationId.HasValue && e.OrganizationId == CurrentOrganizationId);
         modelBuilder.Entity<AnalyticsEvent>()
             .HasQueryFilter(e => e.OrganizationId == CurrentOrganizationId);
     }
@@ -1670,6 +1990,49 @@ public sealed class AtlasDbContext(
                         investorReport.CreatedAt = investorReport.CreatedAt == default ? now : investorReport.CreatedAt;
                         investorReport.UpdatedAt = now;
                         break;
+                    case WhatsAppConnection connection:
+                        connection.CreatedAt = connection.CreatedAt == default ? now : connection.CreatedAt;
+                        connection.UpdatedAt = now;
+                        break;
+                    case Contact contact:
+                        contact.CreatedAt = contact.CreatedAt == default ? now : contact.CreatedAt;
+                        contact.UpdatedAt = now;
+                        break;
+                    case Lead lead:
+                        lead.CreatedAt = lead.CreatedAt == default ? now : lead.CreatedAt;
+                        lead.UpdatedAt = now;
+                        break;
+                    case Conversation conversation:
+                        conversation.CreatedAt = conversation.CreatedAt == default ? now : conversation.CreatedAt;
+                        conversation.UpdatedAt = now;
+                        break;
+                    case ConversationMessage message:
+                        message.CreatedAt = message.CreatedAt == default ? now : message.CreatedAt;
+                        message.UpdatedAt = now;
+                        break;
+                    case ConversationAssignment assignment:
+                        assignment.AssignedAt = assignment.AssignedAt == default ? now : assignment.AssignedAt;
+                        break;
+                    case InternalNote note:
+                        note.CreatedAt = note.CreatedAt == default ? now : note.CreatedAt;
+                        break;
+                    case FollowUp followUp:
+                        followUp.CreatedAt = followUp.CreatedAt == default ? now : followUp.CreatedAt;
+                        followUp.UpdatedAt = now;
+                        break;
+                    case ConversationWebhookEvent webhookEvent:
+                        webhookEvent.ReceivedAt = webhookEvent.ReceivedAt == default ? now : webhookEvent.ReceivedAt;
+                        break;
+                    case ConversationActivity activity:
+                        activity.CreatedAt = activity.CreatedAt == default ? now : activity.CreatedAt;
+                        break;
+                    case MessageTemplate messageTemplate:
+                        messageTemplate.CreatedAt = messageTemplate.CreatedAt == default ? now : messageTemplate.CreatedAt;
+                        messageTemplate.UpdatedAt = now;
+                        break;
+                    case ConversationLink link:
+                        link.CreatedAt = link.CreatedAt == default ? now : link.CreatedAt;
+                        break;
                 }
             }
             else if (entry.State == EntityState.Modified)
@@ -1712,6 +2075,27 @@ public sealed class AtlasDbContext(
                         break;
                     case InvestorReport investorReport:
                         investorReport.UpdatedAt = now;
+                        break;
+                    case WhatsAppConnection connection:
+                        connection.UpdatedAt = now;
+                        break;
+                    case Contact contact:
+                        contact.UpdatedAt = now;
+                        break;
+                    case Lead lead:
+                        lead.UpdatedAt = now;
+                        break;
+                    case Conversation conversation:
+                        conversation.UpdatedAt = now;
+                        break;
+                    case ConversationMessage message:
+                        message.UpdatedAt = now;
+                        break;
+                    case FollowUp followUp:
+                        followUp.UpdatedAt = now;
+                        break;
+                    case MessageTemplate messageTemplate:
+                        messageTemplate.UpdatedAt = now;
                         break;
                 }
             }
